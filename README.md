@@ -307,3 +307,13 @@ npm run dev              # http://localhost:5273，数据走 api/index.ts 的本
 > 说明：旧版 `uis_login.py` 里的 `uis.fudan.edu.cn/authserver/login` 已被学校停用
 > （2026-07-01 起，见官方公告），新版 `id.fudan.edu.cn` 为前端 SPA，无法用表单 POST 复现，
 > 因此改为「内嵌登录窗 + 抓取会话」，与旧版当年做法一致。
+
+## License
+
+本项目采用 **GNU General Public License v3.0（GPL-3.0）**。
+
+- 完整协议正文见仓库根目录的 `LICENSE`；
+- 你可以自由使用、修改、分发，但**分发衍生作品时必须同样以 GPL-3.0 开源**，并保留版权声明与变更说明；
+- 本程序不提供任何担保（详见协议第 15、16 条）。
+
+Copyright (C) 2026 BellaSILVERWOOD
