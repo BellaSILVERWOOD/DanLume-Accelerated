@@ -317,3 +317,19 @@ npm run dev              # http://localhost:5273，数据走 api/index.ts 的本
 - 本程序不提供任何担保（详见协议第 15、16 条）。
 
 Copyright (C) 2026 BellaSILVERWOOD
+
+## 界面截图（最大化窗口 · 浅色模式）
+
+| 仪表板 | 日历 |
+| --- | --- |
+| ![仪表板](docs/screenshots/dashboard.png) | ![日历](docs/screenshots/calendar.png) |
+| **邮箱** | **通知** |
+| ![邮箱](docs/screenshots/mail.png) | ![通知](docs/screenshots/notices.png) |
+| **备忘** | **作业** |
+| ![备忘](docs/screenshots/memos.png) | ![作业](docs/screenshots/homework.png) |
+| **eHall** | **空教室** |
+| ![eHall](docs/screenshots/ehall.png) | ![空教室](docs/screenshots/classroom.png) |
+| **文档** | **文献库** |
+| ![文档](docs/screenshots/docs.png) | ![文献库](docs/screenshots/lit.png) |
+| **公式** | **设置** |
+| ![公式](docs/screenshots/latex.png) | ![设置](docs/screenshots/settings.png) |
