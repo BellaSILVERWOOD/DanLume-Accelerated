@@ -1,0 +1,285 @@
+/* 基础样式：无边框窗口、滚动条、通用排版（对齐旧版 theme.py 的全局样式表） */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: var(--fs-body);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  user-select: none;
+  cursor: default;
+}
+
+#app {
+  height: 100%;
+}
+
+/* ---- 无边框窗口外壳（旧版是自绘的圆角 + 阴影） ---- */
+.shell {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(
+    to bottom,
+    var(--window-top),
+    var(--window-mid) 42%,
+    var(--window-bottom)
+  );
+  border-radius: var(--radius-window);
+  border: 1px solid var(--border-soft);
+  overflow: hidden;
+}
+
+.workspace {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.main-column {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.page-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 18px 20px 22px;
+}
+
+/* ---- 滚动条（旧版是 10px 圆角把手） ---- */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-handle);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-handle-hover);
+  background-clip: padding-box;
+}
+
+/* ---- 排版类 ---- */
+.h1 {
+  font-size: var(--fs-h1);
+  font-weight: 650;
+  letter-spacing: 0.2px;
+}
+.h2 {
+  font-size: var(--fs-title);
+  font-weight: 620;
+}
+.muted {
+  color: var(--muted);
+}
+.tiny {
+  font-size: var(--fs-tiny);
+  color: var(--muted);
+}
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 12px;
+  /* 窗口变窄（同时开中栏 + 右栏）时让右侧按钮整组换到下一行，
+     而不是把标题挤到几十像素宽、中文字逐字竖排。 */
+  flex-wrap: wrap;
+}
+.page-head .titles {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  /* 标题区保底宽度：再窄也按 200px 排版，剩下的交给按钮换行 */
+  flex: 1 1 200px;
+}
+.page-head .spacer {
+  flex: 1;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.wrap {
+  flex-wrap: wrap;
+}
+
+/* 输入类控件（旧版 inputs.py 的观感：白底、1px 边、圆角 10） */
+input[type="text"],
+input[type="password"],
+input[type="search"],
+input[type="number"],
+textarea,
+select {
+  font-family: inherit;
+  font-size: var(--fs-body);
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-btn);
+  padding: 7px 11px;
+  outline: none;
+  user-select: text;
+}
+input:hover,
+textarea:hover,
+select:hover {
+  border-color: var(--input-hover-border);
+}
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--accent);
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--faint);
+}
+input:disabled {
+  background: var(--input-disabled-bg);
+  color: var(--input-disabled-text);
+}
+
+/* 列表行都是 <button>，浏览器默认 text-align:center 会把标题也居中；
+   这里统一左对齐（SoftButton 靠 flex 居中，不受影响） */
+button,
+input,
+select,
+textarea {
+  text-align: left;
+}
+
+
+/* 外观：只让**背景层**半透明（不透明度/磨砂/模糊），文字始终实心 */
+.shell {
+  position: relative;
+  isolation: isolate;
+  background: transparent;
+}
+.shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(
+    to bottom,
+    var(--window-top),
+    var(--window-mid) 42%,
+    var(--window-bottom)
+  );
+  opacity: var(--win-alpha, 1);
+  border-radius: var(--radius-window);
+}
+html[data-glass='on'] .shell::before {
+  backdrop-filter: blur(var(--win-blur, 24px)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--win-blur, 24px)) saturate(1.1);
+}
+
+/* ============================================================================
+   macOS 风格层（C1）——把材质 / 圆角 / 层次真正用到容器上
+   ========================================================================== */
+.card {
+  border-radius: var(--radius-card);
+  border: 1px solid var(--hairline, var(--border-soft));
+  box-shadow: var(--shadow-card), var(--inner-highlight);
+}
+
+.sidebar {
+  background: var(--material-sidebar);
+  -webkit-backdrop-filter: var(--material-blur);
+  backdrop-filter: var(--material-blur);
+  border-right: 1px solid var(--hairline, var(--border-soft));
+}
+
+.dock {
+  background: var(--material-dock);
+  -webkit-backdrop-filter: var(--material-blur);
+  backdrop-filter: var(--material-blur);
+  border-left: 1px solid var(--hairline, var(--border-soft));
+}
+
+.nav-item {
+  border-radius: var(--radius-control);
+  transition: background 140ms ease, color 140ms ease;
+}
+.nav-item.active {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+
+button:not(.nav-item) {
+  transition: background 140ms ease, border-color 140ms ease, transform 90ms ease;
+}
+button:not(.nav-item):active:not(:disabled) {
+  transform: scale(0.985);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--muted) 34%, transparent);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--muted) 55%, transparent);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  outline-offset: 1px;
+}
+
+/* 旧版 theme_apple_v2：设成 0 时把 macOS 那层"还原"成重构前的观感（不删代码，只覆盖变量） */
+html[data-apple="0"] {
+  --radius-window: 8px;
+  --radius-card: 14px;
+  --radius-widget: 18px;
+  --radius-btn: 10px;
+  --radius-control: 10px;
+  --shadow-card: 0 2px 8px rgba(0, 0, 0, 0.1);
+  --shadow-pop: 0 6px 20px rgba(0, 0, 0, 0.18);
+  --inner-highlight: none;
+  --hairline: var(--border-soft);
+  --material-sidebar: transparent;
+  --material-dock: transparent;
+  --material-card: var(--card);
+  --material-blur: none;
+}

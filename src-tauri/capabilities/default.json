@@ -1,0 +1,33 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "DanLume 主窗口需要的权限",
+  "windows": [
+    "main",
+    "ehall-grab-*"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-start-dragging",
+    "core:window:allow-close",
+    "core:window:allow-set-title",
+    "core:webview:allow-create-webview-window",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-message"
+  ],
+  "remote": {
+    "urls": [
+      "https://ehall.fudan.edu.cn/*",
+      "https://id.fudan.edu.cn/*",
+      "https://ecard.fudan.edu.cn/*",
+      "https://libsrs.fudan.edu.cn/*",
+      "https://zlapp.fudan.edu.cn/*",
+      "http://10.64.130.6/*"
+    ]
+  }
+}

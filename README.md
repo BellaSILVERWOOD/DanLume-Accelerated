@@ -160,6 +160,9 @@ DanLume-v2/
 
 ## 分发（都在本目录的 `release/` 下）
 
+> **国内直连下载**（GitHub 的下载 CDN 在国内常超时，这里走自己的服务器）：
+> <https://43.108.99.38.sslip.io/download/> —— 页面里带每个文件的 SHA256。
+
 | 文件 | 大小 | 内容 |
 | --- | --- | --- |
 | `release/DanLume-2.0.0-client.zip` | 4.86 MB | `DanLume.exe`（单文件 9 MB 左右，含 pdf.js）+ 图标 + README + 使用说明.txt，解压双击即可 |

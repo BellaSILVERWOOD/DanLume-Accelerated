@@ -1,0 +1,61 @@
+[package]
+name = "danlume"
+version = "1.0.0"
+description = "DanLume 重构版（Rust + Tauri + Vue）"
+authors = ["DanLume"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "danlume_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["unstable"] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# 天气 / eHall / eLearning 这些都要发 HTTP 请求，用轻量的 ureq（自带 rustls）
+ureq = { version = "2", features = ["json"] }
+# 服务器公告通道：曾尝试 tungstenite 走 WebSocket，但该依赖会让测试二进制
+# 加载失败（STATUS_ENTRYPOINT_NOT_FOUND），已回退为 5 秒轮询（见 notify.rs）。
+# 收件箱：IMAP 拉信 + MIME 解析（正文 / 内联图片 / 附件）
+imap = "2"
+mail-parser = "0.9"
+# 发件箱：SMTP 发信（默认走系统 schannel 的 TLS）
+lettre = { version = "0.11", default-features = false, features = [
+  "builder",
+  "smtp-transport",
+  "native-tls",
+] }
+native-tls = "0.2"
+# AI 工具里的 zip_extract（解压插件包 / 课件压缩包）
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# 账户审核：信封 = RSA-2048(OAEP-SHA1) 包 AES-GCM 密钥；回执 = RSA-PSS(SHA256) 签名。
+# 算法与前缀必须和旧版 adminsign.py 一致，否则两边解不开。
+rsa = { version = "0.9", features = ["sha1", "sha2"] }
+aes-gcm = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

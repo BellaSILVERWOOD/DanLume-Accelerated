@@ -1,0 +1,135 @@
+/* ============================================================================
+   设计令牌：与旧版 lumina/theme.py 一一对应（值就是从那里导出来的）
+   —— 浅色用 html[data-mode="light"]，深色用 html[data-mode="dark"]
+   ========================================================================== */
+
+:root {
+  /* 圆角 / 间距（旧版：WINDOW_RADIUS = 8，卡片 14，按钮 10） */
+  --radius-window: 8px;
+  --radius-card: 14px;
+  --radius-widget: 18px;
+  --radius-btn: 10px;
+  --radius-pill: 999px;
+
+  /* 窗口尺寸（旧版主窗口 1440×900，左栏 208，右栏 250） */
+  --sidebar-w: 208px;
+  --dock-w: 250px;
+  --titlebar-h: 46px;
+
+  /* 字体：旧版默认鸿蒙黑体，回退到系统 */
+  --font-ui: "HarmonyOS Sans SC", "HarmonyOS Sans", "PingFang SC",
+    "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+
+  /* 字号（旧版：正文 11.2pt ≈ 14.9px，标题 18~21pt） */
+  --fs-tiny: 12px;
+  --fs-small: 13px;
+  --fs-body: 15px;
+  --fs-title: 19px;
+  --fs-h1: 23px;
+  --fs-big: 40px;
+
+  /* 强调色（旧版默认 #007AFF，可在设置里换） */
+  --accent: #007aff;
+  --accent-2: #32ade6;
+  --accent-deep: #0067d8;
+}
+
+html[data-mode="light"] {
+  --card: #ffffff;
+  --card-alt: #f5f5f7;
+  --card-hover: #fafafc;
+  --border: #d3d3db;
+  --border-soft: #e4e4ea;
+  --text: #1d1d1f;
+  --text-soft: #48484d;
+  --muted: #6e6e73;
+  --faint: #a1a1a6;
+  --warning: #b25000;
+  --success: #248a3d;
+  --danger: #d70015;
+  --input-bg: #ffffff;
+  --input-disabled-bg: #f2f2f5;
+  --input-disabled-text: #aeaeb2;
+  --input-hover-border: #c7c7cc;
+  --sidebar-bg: #f1f1f4;
+  --window-top: #fbfbfd;
+  --window-mid: #f5f5f7;
+  --window-bottom: #ededf0;
+  --scroll-handle: #c7c7cc;
+  --scroll-handle-hover: #aeaeb2;
+  --slider-groove: #e5e5ea;
+  --tooltip-bg: #f7f7f9;
+  --tooltip-text: #1d1d1f;
+  --shadow-tint: #000000;
+  --shadow-alpha: 0.1;
+  --nav-active-bg: #ffffff;
+  --nav-hover-bg: #e9e9ee;
+}
+
+html[data-mode="dark"] {
+  --card: #2c2c2e;
+  --card-alt: #35353a;
+  --card-hover: #3a3a3f;
+  --border: #414147;
+  --border-soft: #38383d;
+  --text: #f5f5f7;
+  --text-soft: #d1d1d6;
+  --muted: #98989d;
+  --faint: #6e6e73;
+  --warning: #ff9f0a;
+  --success: #30d158;
+  --danger: #ff453a;
+  --input-bg: #1b1b1d;
+  --input-disabled-bg: #232326;
+  --input-disabled-text: #6e6e73;
+  --input-hover-border: #48484d;
+  --sidebar-bg: #26262a;
+  --window-top: #26262a;
+  --window-mid: #212124;
+  --window-bottom: #1a1a1c;
+  --scroll-handle: #48484d;
+  --scroll-handle-hover: #636369;
+  --slider-groove: #3a3a3e;
+  --tooltip-bg: #2c2c2e;
+  --tooltip-text: #f5f5f7;
+  --shadow-tint: #000000;
+  --shadow-alpha: 0.45;
+  --nav-active-bg: #3a3a3f;
+  --nav-hover-bg: #323236;
+}
+
+/* ============================================================================
+   macOS 风格层（C1，选 A：不改结构，只收敛圆角 / 阴影 / 材质）
+   参考 Ventura+ Big Sur 之后的取法：大窗圆角、极淡阴影 + 1px 内高光、
+   侧栏与右栏是「材质」而不是纯色、控件圆角比卡片小一档。
+   ========================================================================== */
+:root {
+  --radius-window: 12px;
+  --radius-card: 12px;
+  --radius-widget: 16px;
+  --radius-btn: 8px;
+  --radius-control: 7px;
+
+  /* 层次：macOS 几乎没有黑色重阴影，靠 1px 内高光 + 极淡外阴影 */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.05), 0 6px 18px -8px rgba(0, 0, 0, 0.12);
+  --shadow-pop: 0 8px 28px -10px rgba(0, 0, 0, 0.28);
+  --inner-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+  --hairline: rgba(0, 0, 0, 0.08);
+
+  /* 三级材质：侧栏最通透、右栏次之、卡片最实 */
+  --material-sidebar: rgba(246, 246, 248, 0.72);
+  --material-dock: rgba(246, 246, 248, 0.66);
+  --material-card: rgba(255, 255, 255, 0.82);
+  --material-blur: saturate(1.6) blur(24px);
+}
+
+html[data-mode="dark"] {
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 20px -10px rgba(0, 0, 0, 0.55);
+  --shadow-pop: 0 10px 32px -12px rgba(0, 0, 0, 0.7);
+  --inner-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  --hairline: rgba(255, 255, 255, 0.1);
+  --material-sidebar: rgba(38, 38, 41, 0.72);
+  --material-dock: rgba(38, 38, 41, 0.66);
+  --material-card: rgba(44, 44, 46, 0.84);
+}

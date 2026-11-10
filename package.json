@@ -1,0 +1,27 @@
+{
+  "name": "danlume-v2",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "DanLume v2 — Rust + Tauri + Vue 3 重构版",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-dialog": "^2.8.4",
+    "katex": "^0.19.1",
+    "pdfjs-dist": "^4.10.38",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3",
+    "vue-tsc": "^2.1.10"
+  }
+}
