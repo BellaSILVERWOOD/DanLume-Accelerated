@@ -121,7 +121,16 @@ pub fn open_with_system(path: &str) -> Result<(), String> {
             .map_err(|err| format!("打不开：{err}"))?;
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // macOS 使用 Launch Services 的 open，而不是 Linux 的 xdg-open。
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(|err| format!("打不开：{err}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         std::process::Command::new("xdg-open")
             .arg(path)
@@ -144,7 +153,16 @@ pub fn reveal_in_explorer(path: &str) -> Result<(), String> {
             .map_err(|err| format!("打不开资源管理器：{err}"))?;
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // Finder 的 -R 可以定位并选中具体文件。
+        std::process::Command::new("open")
+            .args(["-R", path])
+            .spawn()
+            .map_err(|err| format!("无法在 Finder 中定位：{err}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         open_with_system(path)
     }

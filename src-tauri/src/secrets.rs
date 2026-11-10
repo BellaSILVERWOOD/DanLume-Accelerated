@@ -93,12 +93,57 @@ pub fn unprotect(payload: &str) -> Result<String, String> {
     Ok(text)
 }
 
-#[cfg(not(windows))]
+// macOS 使用 Keychain 存储真正的凭据，SQLite 仅持有不可直接还原的随机引用。
+// 不能在 Keychain 不可用时悄悄退化为明文，否则会泄露 API Key / 邮箱密码。
+#[cfg(target_os = "macos")]
+const KEYCHAIN_PREFIX: &str = "keychain:";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "com.danlume.app";
+
+#[cfg(target_os = "macos")]
+pub fn protect(secret: &str) -> Result<String, String> {
+    if secret.is_empty() {
+        return Ok(String::new());
+    }
+    // 每次生成独立 ID，避免不同设置项之间的凭据相互覆盖。
+    let id = format!("{:032x}{:032x}", rand::random::<u128>(), rand::random::<u128>());
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &id)
+        .map_err(|err| format!("macOS Keychain 初始化失败：{err}"))?;
+    entry.set_password(secret)
+        .map_err(|err| format!("无法保存到 macOS Keychain：{err}"))?;
+    Ok(format!("{KEYCHAIN_PREFIX}{id}"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn unprotect(payload: &str) -> Result<String, String> {
+    if payload.is_empty() {
+        return Ok(String::new());
+    }
+    if let Some(id) = payload.strip_prefix(KEYCHAIN_PREFIX) {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, id)
+            .map_err(|err| format!("macOS Keychain 初始化失败：{err}"))?;
+        return entry.get_password()
+            .map_err(|err| format!("从 macOS Keychain 读取凭据失败：{err}"));
+    }
+    if let Some(encoded) = payload.strip_prefix(B64_PREFIX) {
+        // 旧版兼容：仅供读取历史数据，新的凭据一律写到 Keychain。
+        let bytes = base64_decode(encoded)?;
+        return String::from_utf8(bytes).map_err(|err| err.to_string());
+    }
+    if payload.starts_with(DPAPI_PREFIX) {
+        return Err("DPAPI 凭据与 Windows 用户绑定，不能在 Mac 解密，请重新填写".into());
+    }
+    // 仅供读取旧版已有的明文字段；不会产生新的 plain: 数据。
+    Ok(payload.strip_prefix("plain:").unwrap_or(payload).to_string())
+}
+
+// 非 macOS / 非 Windows 的行为暂维持原版，用以避免超出 Mac 移植范围。
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn protect(secret: &str) -> Result<String, String> {
     Ok(format!("plain:{secret}"))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn unprotect(payload: &str) -> Result<String, String> {
     Ok(payload.trim_start_matches("plain:").to_string())
 }

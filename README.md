@@ -1,7 +1,5 @@
 # DanLume v2 · 重构（Rust + Tauri + Vue 3）
 
-> 三端开发进度与功能矩阵：[PROGRESS.md](PROGRESS.md)（2026-11-10）
-
 这是 DanLume（原 PySide6 版本，126 个模块 / 60,530 行 Python）的重构版。
 
 **目标**：界面与功能布局与原版**逐像素对齐**，但运行时换成
@@ -161,9 +159,6 @@ DanLume-v2/
 * Rust 侧：SQLite 打开与建表、设置 KV、日程 CRUD、`upcoming_events`、DPAPI 封装
 
 ## 分发（都在本目录的 `release/` 下）
-
-> **国内直连下载**（GitHub 的下载 CDN 在国内常超时，这里走自己的服务器）：
-> <https://43.108.99.38.sslip.io/download/> —— 页面里带每个文件的 SHA256。
 
 | 文件 | 大小 | 内容 |
 | --- | --- | --- |
