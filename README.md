@@ -1,7 +1,5 @@
 # DanLume v2 · 重构（Rust + Tauri + Vue 3）
 
-> 三端开发进度与功能矩阵：[PROGRESS.md](PROGRESS.md)（2026-11-10）
-
 这是 DanLume（原 PySide6 版本，126 个模块 / 60,530 行 Python）的重构版。
 
 **目标**：界面与功能布局与原版**逐像素对齐**，但运行时换成
@@ -17,6 +15,16 @@
 
 > 为什么不继续用 C++/Qt：那等于把 PySide6 手抄一遍，收益最小；
 > 为什么不用 Electron：它自带一份 Chromium，内存和体积比 PySide6 更差。
+
+## 平台支持
+
+- **Windows 10 / 11**：本仓库维护，安装包见 [Release](https://github.com/BellaSILVERWOOD/DanLume-Accelerated/releases)；
+- **macOS**：由 [@Kimchenxu](https://github.com/Kimchenxu) 在
+  [他的 fork](https://github.com/Kimchenxu/DanLume-Accelerated) 维护（数据目录改到
+  `~/Library/Application Support`、凭据走系统 Keychain、打包成 `.app`），
+  进展见 [PR #1](https://github.com/BellaSILVERWOOD/DanLume-Accelerated/pull/1)；
+  macOS 上的问题请到他那边提 issue。
+- 两边的数据格式一致（同一个 `lumina.db` + `.dlpk` 数据包），但 **DPAPI / Keychain 凭据不能跨系统解密**，换平台后需要重新填一次口令类设置。
 
 ## 现在能跑成什么样
 
@@ -43,6 +51,17 @@
 * **设置 → AI → 工具审核**：与旧版 `ai_tools.py` 的 `_SPECS` 一一对应的 **41 个工具 / 7 组**，
   每组可全开全关，逐个可开关，带风险档（低 / 中 / 高）和说明；存储键沿用旧版
   `tool_on_<名字>` 与全局 `ai_tools_enabled`（高风险默认关，未设过取默认值）
+
+## 本次更新（2026-11-10）：补齐 Python 版最后四个功能
+
+* **AI 记忆库**：对话里说「记住……」会自动落到本地 `memories` 表；每次对话把命中的记忆拼进系统提示词
+  （格式与 4000 字符上限跟 Python 版逐字一致），右栏显示「本次注入了 N 条记忆」；设置 → AI → 「AI 记忆」可增删改查。
+* **提示词生成器**：设置 → AI 里可编辑系统提示词与场景模板（内置 5 + 2 条照搬 Python 版），
+  右栏「提示词」抽屉里写一句需求就能让模型生成一份结构化提示词，预览后保存或直接用。
+* **AI WebUI 面板**：右栏 AI 标签多了「网页版」子标签（设置 → AI → `ai_web_url` 填地址才会出现），
+  iframe 内嵌模型网页版；站点禁止被嵌入时会提示并给「在系统浏览器打开」。
+* **文献流程图**：文献库页「生成流程图」让模型把论文拆成 4–8 步，纯 CSS/SVG 画出来，按文献缓存、可重新生成/删除；
+  模型没回 JSON 时降级成步骤列表。
 
 ## 本次更新（2026-11-09）
 
