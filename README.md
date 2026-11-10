@@ -1,5 +1,7 @@
 # DanLume v2 · 重构（Rust + Tauri + Vue 3）
 
+> 三端开发进度与功能矩阵：[PROGRESS.md](PROGRESS.md)（2026-11-10）
+
 这是 DanLume（原 PySide6 版本，126 个模块 / 60,530 行 Python）的重构版。
 
 **目标**：界面与功能布局与原版**逐像素对齐**，但运行时换成
