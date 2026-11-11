@@ -1,387 +1,161 @@
-# DanLume v2 · 重构（Rust + Tauri + Vue 3）
+# DanLume（旦光）
 
-这是 DanLume（原 PySide6 版本，126 个模块 / 60,530 行 Python）的重构版。
+给复旦学生用的一体化桌面客户端：**日程 / 教务 / eLearning / 文献 / 公式 / 邮件 / AI 助手 / 学生工作**。
 
-**目标**：界面与功能布局与原版**逐像素对齐**，但运行时换成
-**Rust 内核 + Vue 3 前端 + 系统 WebView2**，以此换取：
+> 这份 README 面向「第一次拿到这个仓库的人」：它是什么、怎么跑起来、每个页面能干什么、
+> 数据存在哪里、出问题去哪儿找文档。深入细节在 `_交接说明.md`、`_待办清单.md`、`_工作日志.md`。
 
-| | 原版（PySide6） | 重构版（Tauri 2） |
+---
+
+## 1. 仓库里有什么
+
+| 目录 | 是什么 | 技术栈 |
 | --- | --- | --- |
-| 运行时 | Python 3.9 + Qt6 + Chromium（内嵌） | Rust 原生 + 系统自带 WebView2 |
-| 内存 | 250–290 MB（实测整机 546 MB） | **实测 27.7–29.5 MB** |
-| 启动 | 1.5–2.5 s | **实测 110–204 ms** |
-| 可执行体积 | 5.8 MB exe + 499 MB 依赖目录 | **5.1 MB（单文件，无依赖目录）** |
-| 富文本（邮件 / 对话 / 公式） | QTextDocument 自绘，排版受限 | 浏览器引擎，CSS 原生排版 |
+| `DanLume-v2/` | **主力桌面端（Rust 版）** | Tauri 2 + Vue 3 + TypeScript + Rust |
+| `_lumina/` | Python 桌面版（**功能基准**，历史最久） | PySide6 / Qt |
+| `DanLume-server/` | 账号服务端（注册 / 登录 / 设备 / 公告 / 后台） | FastAPI + SQLite |
+| `DanLume-Mobile/` | 手机端 | （见目录内 docs） |
+| `_build/`、`_dist/` | Python 版打包副本与分发包 | — |
 
-> 为什么不继续用 C++/Qt：那等于把 PySide6 手抄一遍，收益最小；
-> 为什么不用 Electron：它自带一份 Chromium，内存和体积比 PySide6 更差。
+线上服务端：`https://43.108.99.38.sslip.io`（管理后台 `/admin`）。
 
-## 平台支持
+---
 
-- **Windows 10 / 11**：本仓库维护，安装包见 [Release](https://github.com/BellaSILVERWOOD/DanLume-Accelerated/releases)；
-- **macOS**：由 [@Kimchenxu](https://github.com/Kimchenxu) 在
-  [他的 fork](https://github.com/Kimchenxu/DanLume-Accelerated) 维护（数据目录改到
-  `~/Library/Application Support`、凭据走系统 Keychain、打包成 `.app`），
-  进展见 [PR #1](https://github.com/BellaSILVERWOOD/DanLume-Accelerated/pull/1)；
-  macOS 上的问题请到他那边提 issue。
-- 两边的数据格式一致（同一个 `lumina.db` + `.dlpk` 数据包），但 **DPAPI / Keychain 凭据不能跨系统解密**，换平台后需要重新填一次口令类设置。
+## 2. 跑起来
 
-## 现在能跑成什么样
-
-三个页面已经跑通，并且**直接读原来的 `data/lumina.db`**（不是假数据）：
-
-| 仪表板 | 设置 | 日历 |
-| --- | --- | --- |
-| ![仪表板](docs/screenshots/dashboard.png) | ![设置](docs/screenshots/settings.png) | ![日历](docs/screenshots/calendar.png) |
-
-* 无边框窗口 + 自绘标题栏（中栏 / 右栏开关、深浅色、窗口按钮）
-* 左导航 13 项（顺序与旧版一致）+ 快捷操作 + 今天的日期卡
-* 右栏：日程 / AI / 文献 三标签 + 「最近日程」（读真实日程）
-* 仪表板：今天（含 ISO 周数「第 44 周」）/ 天气（真的去 wttr.in 取）/ 即将到来
-  （**已经开始的写「进行中」**，与旧版修复后的行为一致）/ 教务信息 / 最近作业 + ehall 卡
-* 日历：月视图（周日历格 + 日程色块 + 当天高亮）+ 周视图（行=节次、列=周一到周日）
-  + 右侧当日面板（个数 / 已完成）
-* 设置：左侧分类 + 搜索 + 20 张设置卡；外观卡是**真控件**（浅色/深色/自动、8 套强调色、
-  不透明度、模糊度，改完立刻生效并记住）
-* **文档页内置 PDF 阅读**（pdf.js 渲染到 canvas：翻页 / 缩放 / 适应宽度，整篇连续滚动），
-  不再需要丢给系统阅读器
-* **公式页文档视图**：像 Word 一样写（标题 / 粗斜体 / 下划线 / 字体颜色 / 对齐 / 无序有序列表 /
-  表格），公式以**不可编辑的小卡片**嵌在正文里；右侧可切「排版预览」（KaTeX，即时）和
-  「PDF 预览」（本机 XeLaTeX 编译后的真实排版）；随时切回 LaTeX 源码
-* **设置 → AI → 工具审核**：与旧版 `ai_tools.py` 的 `_SPECS` 一一对应的 **41 个工具 / 7 组**，
-  每组可全开全关，逐个可开关，带风险档（低 / 中 / 高）和说明；存储键沿用旧版
-  `tool_on_<名字>` 与全局 `ai_tools_enabled`（高风险默认关，未设过取默认值）
-
-## 本次更新（2026-11-10）：补齐 Python 版最后四个功能
-
-* **AI 记忆库**：对话里说「记住……」会自动落到本地 `memories` 表；每次对话把命中的记忆拼进系统提示词
-  （格式与 4000 字符上限跟 Python 版逐字一致），右栏显示「本次注入了 N 条记忆」；设置 → AI → 「AI 记忆」可增删改查。
-* **提示词生成器**：设置 → AI 里可编辑系统提示词与场景模板（内置 5 + 2 条照搬 Python 版），
-  右栏「提示词」抽屉里写一句需求就能让模型生成一份结构化提示词，预览后保存或直接用。
-* **AI WebUI 面板**：右栏 AI 标签多了「网页版」子标签（设置 → AI → `ai_web_url` 填地址才会出现），
-  iframe 内嵌模型网页版；站点禁止被嵌入时会提示并给「在系统浏览器打开」。
-* **文献流程图**：文献库页「生成流程图」让模型把论文拆成 4–8 步，纯 CSS/SVG 画出来，按文献缓存、可重新生成/删除；
-  模型没回 JSON 时降级成步骤列表。
-
-## 本次更新（2026-11-09）
-
-* **eLearning 下载按课程分文件夹**：不再全部平铺在下载根目录，改成
-  `<下载目录>/<课程名>/<文件名>`。课程名先取 Canvas 课程列表的 `name`，拿不到时用上次「诊断 Canvas」
-  记下的课程名，再不行回退 `course_<id>`；非法字符（`\ / : * ? " < > |`）统一换成 `-`，超长截断 60 字符。
-* **文档页改成可展开的目录树**：文件夹懒加载、`▸ / ▾` 折叠、按层缩进，另有「全部展开 / 全部收起」；
-  点文件夹只切换展开，点文件仍是右侧预览（PDF 直接渲染）。
-* **仪表板在窄宽度下自动降列**：同时打开中栏 + 右栏时，卡片从 4 列自动收成 2 列 / 1 列，
-  标题区的按钮也会整组换行，不再出现「中文字逐字竖排」的挤压。
-* **旧下载文件可一键迁移**：设置 → eLearning / Canvas 里的「整理旧下载文件」会把以前平铺在下载根目录的文件
-  按课程搬进对应的课程子文件夹。归属先查本地索引（`elearning_file_index`），再兜底问一次 Canvas 的课程文件列表；
-  同名同大小判为重复并去重，同名不同大小改名成 `xxx (2).pdf`；判断不出课程的文件留在原地、只报「未识别」。
-
-## 账号服务器与实时公告（2026-11-09）
-
-* **注册/登录走自家服务器**：设置 → 账户里填服务器地址（默认 `https://43.108.99.38.sslip.io`），
-  直接注册或登录，不再只能靠「邮件申请 + 管理员签发」；服务器连不上时才提示走邮件兜底。
-* **同一账号最多 10 台设备**：超限会返回设备列表，由用户自己踢掉旧设备；设置页可随时管理。
-* **管理员公告实时到客户端**：后台发一条公告，在线客户端会自动收到并弹出横幅（warning / critical 更醒目），
-  标题栏有未读徽标，「通知」页有「服务器公告」分区；断线期间错过的公告，重连后按 `since` 增量补齐。
-  **延迟说明**：Rust 版目前是 **5 秒轮询**（近实时；WebSocket 依赖在本机加载异常，已回退），
-  点「立刻检查」是瞬时；Python 版走 WebSocket，实测 1 秒内到。
-* 令牌用 Windows DPAPI 加密存本机；HTTPS 始终校验证书链与主机名，**不接受坏证书**。
-* **注册要邮箱验证码**：注册弹层里点「获取验证码」，服务器把 6 位码发到你的邮箱（10 分钟有效、最多试 5 次、60 秒冷却），
-  验证通过才建账号。当前只放行 `@fudan.edu.cn`（含 `m.fudan.edu.cn` 等子域）。
-* **数据可整包搬迁**：设置 → 其他 →「数据迁移」可以导出 `.dlpk` 数据包、在另一台电脑（或 Python 版）导入；
-  导入前自动备份、坏包一律拒绝、导入后重启生效。包会剥离 DPAPI 密钥（换机器本来也解不开），导入后按提示重填即可。
-
-## 目录结构
-
-```text
-DanLume-v2/
-├── index.html
-├── package.json                # Vue 3 + Vite + Tauri CLI
-├── vite.config.ts
-├── tsconfig.json
-├── src/                        # 前端（Vue 3 + TS）
-│   ├── main.ts
-│   ├── App.vue                 # 无边框窗口外壳：标题栏 / 左导航 / 页面 / 右栏
-│   ├── styles/
-│   │   ├── tokens.css          # 设计令牌（由旧 theme.py 逐一导出，浅/深两套）
-│   │   └── base.css
-│   ├── icons.ts                # 与旧 icons.py 对应的线性图标（内联 SVG）
-│   ├── layout/
-│   │   ├── TitleBar.vue        # 左上 Logo+标题、右上 中栏/右栏、深浅切换、窗口按钮
-│   │   ├── SideNav.vue         # 导航（13 项）+ 快捷操作 + 今天卡
-│   │   └── RightDock.vue       # 右栏：日程 / AI / 文献 三标签 + 最近日程
-│   ├── components/             # 对应旧 widgets.py / dashboard_widgets.py
-│   │   ├── Card.vue
-│   │   ├── SoftButton.vue
-│   │   ├── Pill.vue
-│   │   ├── WidgetCard.vue
-│   │   ├── HeroWidget.vue
-│   │   ├── ListWidget.vue
-│   │   ├── MetricLine.vue
-│   │   └── IconGlyph.vue
-│   ├── pages/                  # 第一阶段：仪表板 / 日历 / 设置
-│   │   ├── DashboardPage.vue
-│   │   ├── CalendarPage.vue
-│   │   ├── SettingsPage.vue
-│   │   └── Placeholder.vue     # 其余 10 页先占位，布局与旧版一致
-│   └── api/index.ts            # 所有 Rust 命令的封装（含浏览器内降级 mock）
-└── src-tauri/                  # Rust 内核
-    ├── Cargo.toml
-    ├── tauri.conf.json
-    ├── build.rs
-    ├── icons/
-    └── src/
-        ├── main.rs
-        ├── lib.rs              # 命令注册
-        ├── store.rs            # SQLite（rusqlite），schema 与旧 store.py 完全一致
-        ├── settings.rs         # 设置 KV（旧 settings 表）
-        ├── secrets.rs          # Windows DPAPI 加密（旧 secure.py）
-        ├── events.rs           # 日程 CRUD + events_on / event_index
-        ├── dashboard.rs        # 即将到来 / 天气 / 通知 / 作业（与旧 dashboard.py 对齐）
-        └── paths.rs            # 数据目录解析（LUMINA_DATA_DIR / data_dir.txt）
-```
-
-## 数据兼容
-
-新版本**直接读写原来的数据库**（`data/lumina.db`），schema 与旧版逐表一致：
-
-* 数据目录解析顺序沿用旧版：`LUMINA_DATA_DIR` → `%LOCALAPPDATA%\DanLume\data_dir.txt`
-  → exe 同级 `data/`；
-* 密码类字段仍然是 **DPAPI 密文**（`secrets.rs` 用同样的 `CryptProtectData` /
-  `CryptUnprotectData`），所以旧库里已存的 SMTP / IMAP / API Key 能直接解密使用；
-* 不会迁移、不会重写旧库结构，两个版本可以交替打开同一个库（但不要同时开）。
-
-## 迁移进度（对齐 `_ACCEPTANCE.md` 的 71 条要求）
-
-| 页面 | 状态 | 说明 |
-| --- | --- | --- |
-| 外壳（标题栏 / 左导航 / 右栏） | ✅ | 13 项导航顺序、快捷操作、今天卡、托盘位置一致 |
-| 仪表板 | ✅ | 今天（ISO 周数）/ 天气（真取 wttr.in）/ 即将到来（含「进行中」）/ 教务信息 / 最近作业 / ehall 卡 |
-| 日历 | ✅ | 月视图 + 周视图 + 当日面板，读真实 events 表 |
-| 邮箱 | ✅ | IMAP 收件（真实账户 30 封）、正文 HTML、附件打开、发件箱记录、SMTP 发信 |
-| 通知 | ✅ | 通知流 / 只看未读 / 全部标为已读 / 抓取（可配来源地址） |
-| 备忘 | ✅ | 列表 + 富文本编辑器 + 自动保存（写真实 memos 表） |
-| 作业 | ✅ | 读真实缓存：2 门课 2 个作业，`HW8.1/HW8.2` 等本地文件自动匹配，「截止写入日程」按 14:30–15:00 生成 |
-| eHall | ⚠️ | 内嵌网页窗口；仪表板那几张卡的取数走「读旧版缓存」的路子（下一轮） |
-| 空教室 | ✅ | 校区→教学楼→教室三级联动（读旧库表）+ 真实时间轴：28 间教室 × 14 节，空着 229 / 占用 61，悬停看课程 |
-| 文档 | ✅ | 目录浏览 / 文本预览 / **内置 PDF 阅读（pdf.js）** / 用系统程序打开 |
-| 文献库 | ✅ | 读真实 papers（12 篇）：项目 / 星级 / 详情 / 复制引用 |
-| 公式 | ✅ | **文档视图（Word 式编辑：标题 / 粗斜体 / 下划线 / 颜色 / 对齐 / 列表 / 表格 / 公式卡片）** + LaTeX 源码视图 + 右侧「排版预览 / PDF 预览」双标签 + **导出 PDF**（调本机 XeLaTeX，实测生成成功） |
-| AI | ✅ | 右栏真对话：Markdown + KaTeX、历史会话；后端用你的 `llm_profiles` + DPAPI Key，实测调通（回「连接成功」） |
-| 设置 | ✅ | 20 张卡读写真实 settings（含 SMTP/IMAP/代理/认证密码 DPAPI 只写不读）、AI 多套配置切换、**41 个 AI 工具的工具审核**、外观即时生效 |
-
-图例：✅ 可用（读真实数据）· ⚠️ 部分可用 · ❌ 未开始
-
-
-* 外壳：无边框窗口 + 自绘标题栏 + 左导航（13 项，顺序与旧版一致）+ 右栏三标签
-* **仪表板**：今天 / 天气 / 即将到来（含「进行中」）/ 教务信息 / 最近作业 + ehall 小组件卡网格
-* **日历**：月视图（右侧当日面板）+ 周视图切换（行=节次、列=周一到周日）
-* **设置**：左侧分类 + 搜索框 + 20 张设置卡的骨架（外观卡可直接改主题并即时生效）
-* Rust 侧：SQLite 打开与建表、设置 KV、日程 CRUD、`upcoming_events`、DPAPI 封装
-
-## 分发（都在本目录的 `release/` 下）
-
-> **国内直连下载**（GitHub 的下载 CDN 在国内常超时，这里走自己的服务器）：
-> <https://43.108.99.38.sslip.io/download/> —— 页面里带每个文件的 SHA256。
-
-| 文件 | 大小 | 内容 |
-| --- | --- | --- |
-| `release/DanLume-2.0.0-client.zip` | 4.86 MB | `DanLume.exe`（单文件 9 MB 左右，含 pdf.js）+ 图标 + README + 使用说明.txt，解压双击即可 |
-| `release/DanLume-2.0.0-client/` | — | 上面那个 zip 已解压好的目录（可直接试跑） |
-| `release/DanLume-2.0.0-client-source.zip` | 1.04 MB | `src/`、`src-tauri/src/`（不含 target）、`docs/screenshots/`、配置与 README |
-| `_验收报告.md` | — | 20 项验收结果（构建产物 / 数据 / Rust 单测 / 截图 / 启动与内存） |
-
-重跑验收与打包：
+### 2.1 桌面端（Rust）
 
 ```powershell
-python DanLume-v2\_acceptance_v2.py          # 只验收
-python DanLume-v2\_acceptance_v2.py --pack   # 验收 + 重新打包
-```
-
-## 验收结果（2026-11-01，20 / 20 通过）
-
-| 维度 | 实测 |
-| --- | --- |
-| 构建产物 | 单文件 `danlume.exe`（含内嵌前端资源与 pdf.js worker）；内嵌资源与 `dist` 完全一致 |
-| 数据 | 同一份 `data/lumina.db`：232 条日程、12 篇文献、1 个 IMAP 账户、3 套 AI 配置、作业缓存与空教室缓存都能读 |
-| 密码 | IMAP / SMTP / AI Key 都是 `dpapi:` 密文（与旧版同格式，可互解） |
-| Rust 单测 | **19 个全过**（含 41 工具清单、开关门控、真实库取数、作业缓存 / 空教室 / AI 配置 / 邮件内联图片 / XeLaTeX 实编译） |
-| 页面 | 13 页截图齐全 |
-| 启动 / 内存 | 启动 **474 ms**（冷启含 WebView2 子进程）、常驻内存合计 **76.6 MB** |
-
-## 还差什么
-
-| 阶段 | 内容 | 说明 |
-| --- | --- | --- |
-| A | 两个工具的路线与旧版不同（都已实现） | `timetable_fetch` 走 **.ics 导入**（旧版另有一条要内嵌浏览器会话的抓取路径，v2 没这个会话）；`elearning_download` 从「作业缓存」里的附件地址下载，需要重新登录 Canvas 的文件会如实计入「失败」 |
-| B | 若干设置项仍是「存得住、但还没接到行为」 | 例如部分提醒 / 静默时段 / 代理之类，值都写进库里了，具体行为按旧版逐个接 |
-| C | ehall 卡片的「全自动」刷新 | 现在提供两条可用路径（粘贴抓取 / 开窗口登录后同步）；真正的全自动需要给 ehall 页面加一段可执行脚本（例如油猴脚本把原文 POST 回来），属于外部配合 |
-
-## AI 工具（41 个，与旧版一一对应）
-
-`src-tauri/src/ai_tools.rs` + `ai_tools_net.rs`：
-
-* **清单**：41 个工具 / 7 组，名字、中文名、说明、参数、风险档、默认开关与旧版
-  `ai_tools.py` 的 `_SPECS` 逐条对齐（Rust 是唯一真值，前端只做展示）；
-* **门控**：全局 `ai_tools_enabled` + 单个 `tool_on_<名字>`；**关掉的工具根本不出现在
-  给模型的 tools 数组里**（和旧版一样），高风险（发邮件 / 改设置 / 解压 / 写文件）默认关；
-* **执行**：`ai_chat_tools` 跑 function calling 循环，**最多 6 轮**（`MAX_TOOL_ROUNDS`），
-  每轮把工具结果回填成 `role: "tool"` 消息；右栏对话里显示「用了 N 次工具」的小标签；
-* **实测**（真实模型 + 真实库）：「用工具查一下现在几点、今天有几条日程」→ 2 轮，
-  依次调用 `time_now`、`app_state`，回报「现在是 2026 年 11 月 7 日（周六）00:25，
-  今天没有日程安排，另有 8 条未读通知」；
-* **确认语义**：发邮件 / 改设置 / 解压 / 写文件 / 丢弃文件 / 下载 PDF / 导出 EndNote 这 7 个
-  工具**每次执行都要你点头**——没带 `confirm=true` 时只回一句「这件事要你确认」，
-  模型必须先问你，你同意后它再带 `confirm=true` 调一次（旧版是弹窗，语义一致）；
-* **已实现（41 / 41）**：日程 4 个（查 / 加 / 改 / 删，写同一个 `events` 表）、倒计时、专注计时、
-  `time_now` / `sys_info` / `app_state` / `usage_stats` / `tool_help` / `memo_search` /
-  `memo_append` / `flashcards_create`、**`window_list`（EnumWindows 实测枚举到 14 个真实窗口）**、
-  本地文件 5 个（目录白名单 + 防路径穿越）、网页搜索 / 读网页 / 视频 / 课件 / 资源推送、
-  arXiv / Crossref / Semantic Scholar / DOI / 三源合并 / **PDF 下载（支持按文献 id，下完把
-  `file_path` 写回文献库）** / 引用生成 / EndNote 导出 / 检索入口、`mail_send`、
-  `setting_get` / `setting_set`（白名单，密码账号一律拒绝）、`zip_extract`（防路径穿越）、
-  `elearning_courses`、**`elearning_download`（从作业缓存的附件地址下，saved/skipped/failed 三元组）**、
-  **`timetable_fetch`（导入 .ics，每周 RRULE 会展开，重复课自动跳过）**。
-
-## 课表：每天自动同步（后面几周的调课会自己纠正）
-
-* 课表来源是 `.ics`（旦夕 / 教务都能导出），默认放 `data/timetable.ics`，
-  也可以用设置 `timetable_ics_path` 指到别处；
-* 后台线程启动 20 秒后查一次，之后每 3 小时查一次，**距上次同步满 20 小时才真的同步**
-  （所以一天最多一次，不会反复写库）；
-* 同步不是「只增不改」：课程按「日期 + 开始时间 + 标题」对齐——
-  **新增**缺的、**改**时间/地点变了的、**删**课表里已经没有的（调课、停课都会跟着变），
-  没变的原样保留。导入的日程在备注末尾带 `[课表]` 标记，只动这些，不碰你自己加的日程；
-* 实测（`cargo test timetable_sync_roundtrip -- --ignored`）：
-  ```
-  第一次：新增 2 节、改时间 0 节、删掉 0 节、没变 0 节
-  第二次（没改动）：新增 0、改时间 0、删掉 0、没变 2
-  第三次（调课 + 取消一节）：新增 1 节、改时间 0 节、删掉 2 节、没变 0 节
-  ```
-* 手动入口：命令 `timetable_sync_now` / `timetable_status`；开关 `timetable_auto_sync`（默认开），
-  上次同步时间和结果存在 `timetable_synced_at` / `timetable_status` 里。
-
-其余旧版功能都已在新版里：桌面提醒弹窗（30 秒轮询、标记完成 / 稍后 10 分钟）、
-汇报邮件附件（原生文件选择）、公式导出 PDF（实测生成了 PDF）、文档页原生「打开文件」。
-
-## ehall 卡片怎么更新数据
-
-两条路，任选：
-
-1. **粘贴抓取（推荐，任何情况下都能用）**
-   在 eHall / 校园卡 / 图书馆页面里 `Ctrl+A` 全选 → `Ctrl+C`，回到仪表板点「粘贴抓取」，
-   选卡片、粘贴、点「解析并保存」。Rust 会解析余额（`¥128.50`）、在馆人数（`1234人`）等，
-   写进 `ehall_cache_<key>`，卡片立刻显示新值和时间。
-2. **同步 ehall（需要登录态）**
-   点「同步 ehall」→ 对每张填了地址的卡开一个 WebView2 窗口加载那个地址。
-   页面已登录时会直接出数；跳到统一身份认证时会明确回「请在窗口里登录一次再同步」。
-
-> 踩过的两个坑（都验证过，别再往这条路上使劲）：
-> 1. Tauri 对**远程域名**不执行 `initialization_script`，页面里的脚本拿不到 IPC；
-> 2. 即使开窗口，`WebviewWindowBuilder(WebviewUrl::External(...))` 打开校内 `http://10.64.130.6/`
->    时窗口地址一直是 `about:blank`（导航没发生），所以「开窗口自动抓」这条路当前结果不可靠。
->
-> 结论：**粘贴抓取是官方支持的路径**，卡片更新的闭环就靠它；空教室页不受影响，
-> 它读的是旧版缓存里已经解析好的表格。
-
-单测覆盖：登录跳转识别、金额/人数解析、注入脚本包含命令名、正文 → 写缓存 → 再读的端到端。
-
-## 踩过的坑（留给下一个接手的人）
-
-* **组件忘了调 `onMounted`**：`HomeworkPage` 只 import 没调用，页面一直空着——表现很像「命令挂了」。
-* **同一线程 Mutex 不重入**：`store.connection()` 拿着锁时再调 `store.setting()` 会死锁
-  （`ai::profiles()` 踩过），必须先读完放锁再算。
-* **只改前端、Rust 没变时，exe 里还是旧 JS**：Tauri 的资源和 Rust 一起编译，改完前端要先
-  「动一下 Rust 文件」或 `cargo clean -p danlume` 再 `npm run tauri build`。
-* **WebView2 会缓存旧 index.html**：换过前端后如果界面没变，删
-  `%LOCALAPPDATA%\com.danlume.app` 再启动（**别删 `%LOCALAPPDATA%\DanLume`**，那是 data_dir.txt 指针）。
-* **旧库的密文格式是 `dpapi:<base64>`**（不是裸 base64），密钥名沿用旧版
-  （`smtp_password` / `imap_password_1` / `llm_profile_key_<id>`）。
-* **vite 后台跑会因 stdin 关闭而退出**：验收用 release 版，`DANLUME_START_PAGE=xxx`
-  可以直接开在某一页（`ai` 会直接打开右栏 AI）。
-
-## 验收方式（当前阶段的）
-
-改完直接跑 release 版，用脚本按页截图 + 量指标：
-
-```powershell
-python ..\_probe_v2_page.py dashboard v2-dashboard.png   # 起始页用环境变量切
-python ..\_probe_v2_shot.py                              # 只截当前页
-```
-
-最近一次实测（2026-10-31，1440×900，DPI 125%）：
-
-| 指标 | 原版 | 重构版 |
-| --- | --- | --- |
-| 窗口出现 | 1.5–2.5 s | **110–204 ms** |
-| 常驻内存 | 546 MB（旧版进程实测） | **27.7–29.5 MB** |
-| 可执行文件 | 5.8 MB（另需 499 MB 运行库） | **5.08 MB 单文件** |
-
-## 开发
-
-```powershell
-# 一次性：Rust 装在 E:\DevTools\rust（不占 C 盘）
-$env:PATH = 'E:\DevTools\rust\cargo\bin;' + $env:PATH
-$env:CARGO_HOME = 'E:\DevTools\rust\cargo'
-$env:RUSTUP_HOME = 'E:\DevTools\rust\rustup'
-
+$env:CARGO_HOME="E:\DevTools\rust\cargo"; $env:RUSTUP_HOME="E:\DevTools\rust\rustup"
+$env:Path="E:\DevTools\rust\cargo\bin;$env:Path"
 cd DanLume-v2
 npm install
-npm run tauri dev        # 开发（热更新）
-npm run tauri build -- --no-bundle   # 打包成单文件（前端资源内嵌）
+npm run build                       # vue-tsc + vite（零错误才算过）
+npm run tauri build -- --no-bundle  # 只出 exe，3–10 分钟
+# 产物：src-tauri/target/release/danlume.exe
 ```
 
-> 注意：直接 `cargo build --release` 不会把前端资源嵌进 exe（会去连 dev server），
-> 必须走 `npm run tauri build`。编译 release 前要先关掉正在运行的 danlume.exe。
+开发模式：`npm run tauri dev`（前端 `http://localhost:5273`，Rust 侧 devUrl 指的就是它）。
 
-只调前端（不需要 Rust）：
+依赖：Node 20+ / Rust 1.77+ / Windows WebView2；**导出 PDF 需要本机装 MiKTeX（xelatex）**。
+
+### 2.2 服务端
 
 ```powershell
-npm run dev              # http://localhost:5273，数据走 api/index.ts 的本地 mock
+cd DanLume-server
+.\.venv\Scripts\python.exe -m pytest -q     # 54 passed
+python run-dev.ps1                          # 本地起在 127.0.0.1:8000
 ```
 
-> vite 会监听 stdin 的快捷键，后台跑时 stdin 一关就会退出；只想看界面的话用
-> `Start-Process -NoNewWindow` 或直接在浏览器里开 5273。
+⚠️ **uvicorn 只能单进程**：公告推送表与限流计数都在进程内存里，加 worker 会重复推送、限流失效。
 
-## 会话型功能迁移（UIS / 教务 / Canvas / eHall）
+### 2.3 Python 版
 
-旧版的"登录一次、各服务复用会话"能力已按等价方式迁移，**不再依赖浏览器 cookie 导出**：
+```powershell
+cd _lumina
+python -m compileall -q lumina
+$env:LUMINA_DATA_DIR = Join-Path $env:TEMP ("smoke_" + [guid]::NewGuid().ToString("N").Substring(0,6))
+python main.py --smoke-test                 # 用临时数据目录，别碰真实 data/
+```
 
-| 模块 | 内容 | 状态 |
-| --- | --- | --- |
-| `uis.rs` | 会话 Cookie 的 DPAPI 加密存取；`visit_with_session` 做「ID 会话 → 服务会话」第二跳 | 可用 |
-| 内嵌登录窗 | `uis_open_login` 打开 `id.fudan.edu.cn`（新版 ID 系统是 SPA，必须真实浏览器）；`uis_capture` 从窗口抓 cookie 入库 | 可用 |
-| `timetable_remote.rs` | 教务课表 `print-data` 请求 + `jwgl_probe` 诊断（解析待真实样本对齐） | 部分 |
-| `canvas.rs` | Canvas 课程 / 作业 / 文件列表 + 下载（saved/skipped/failed）；`canvas_probe` 诊断 | 可用 |
-| `ehall_remote.rs` | 六张 eHall 卡会话直连刷新，解析复用「粘贴抓取」同一套规则；校车卡支持方向筛选 | 可用 |
-| `summary.rs` | `lit_auto_summary` 文献自动概述（调当前 AI 配置，幂等写 `summary_zh`） | 可用 |
+---
 
-> 说明：旧版 `uis_login.py` 里的 `uis.fudan.edu.cn/authserver/login` 已被学校停用
-> （2026-07-01 起，见官方公告），新版 `id.fudan.edu.cn` 为前端 SPA，无法用表单 POST 复现，
-> 因此改为「内嵌登录窗 + 抓取会话」，与旧版当年做法一致。
+## 3. 功能一览
 
-## License
+### 仪表板 / 日程
+- 今天做什么一眼看完：即将到来、教务信息、最近作业、天气；eHall 卡片（校车 / 校园卡 / 体育 / 空教室）。
+- **按分钟定位的日历**：左侧时间刻度、日程块按真实时长画高度，同时段多件事自动并排；重复日程只影响某一天。
+- 提醒三按钮（知道了 / 稍后 10 分钟 / 标记完成），关窗后仍会补提醒。
 
-本项目采用 **GNU General Public License v3.0（GPL-3.0）**。
+### 教务 / eLearning / eHall / 空教室
+- **教务课表**：在登录窗口里拦截 `print-data`，票和学期都由页面自己带，解析出 14 节作息的真实课表。
+- **eLearning**：作业/截止日期、课件下载（带 Cookie 代理）、文件按课程自动归类到 `<下载目录>/<课程名>/`。
+- **eHall / eLearning / 空教室全部是内嵌网页**，遇到登录页自动 UIS 登录；空教室页只显示结果（查询在隐藏页面里跑）。
 
-- 完整协议正文见仓库根目录的 `LICENSE`；
-- 你可以自由使用、修改、分发，但**分发衍生作品时必须同样以 GPL-3.0 开源**，并保留版权声明与变更说明；
-- 本程序不提供任何担保（详见协议第 15、16 条）。
+### 邮箱
+- 收件箱本地缓存（先读本地、再增量同步新 UID），正文按需拉取；退信识别；发件箱。
+- **每封邮件顶端的 AI 摘要**：调用你自己配的接口，缓存进库（同一封只花一次 token）；
+  顺手列出「可能要加进日程的事」，勾选后右下角「添加日程」一键建日程。
 
-Copyright (C) 2026 BellaSILVERWOOD
+### 文献 / 公式
+- 文献库：arXiv + Crossref + Semantic Scholar，分页 + 总量 + 多关键词按 AND；参考文献导入/导出（BibTeX / RIS / ENW / DOI）；EndNote 安装检测。
+- 公式页：**像 Word 一样写**（文档视图 + LaTeX 源码双视图），排版预览 + 真 PDF 预览、**编辑即编译**（不弹黑窗）；
+  Word 式快捷键（Ctrl+Z/Y/B/I/U/E/L/R/J/S、Alt+=）、**选中公式可剪切粘贴**、选中内容**一键转公式**（本地换算 / 让 AI 改写并给建议）。
 
-## 界面截图（最大化窗口 · 浅色模式）
+### AI 助手（右栏）
+- 三标签：API 服务 / WebUI 对话 / 系统提示词；场景提示词、历史会话（可改名删除）、token 用量、思考过程折叠。
+- **流式输出** + **停止生成**；附件（文件卡、拖拽、粘贴）；**45+ 个工具**（日程、教务、文献、网页、文件、沙箱…）。
+- **危险工具要你点头**（发邮件 / 改设置 / 跑命令 / 写文件 / 下载），可「允许一次 / 这次会话都允许 / 拒绝」。
+- **Agent 沙箱**：AI 只能读写 `data/agent_sandbox/`，跑命令默认关闭、不限时长；**通讯录读取默认关闭**（勾选状态会记住）。
 
-| 仪表板 | 日历 |
+### 学生工作
+- **通讯录**：姓名 / 职位 / 邮箱 / 手机号 / 微信备注名 / QQ / 其它联系方式，可搜索、增改删。
+- **定时通知**：给指定的人、通过指定渠道（**邮箱** / 自定义 **webhook** / **微信**）、在指定时间发指定内容；
+  支持只发一次 / 每天 / 每周，也能「立刻发」。
+  - 微信没有可靠接口（个人号自动化属于外挂），所以是「整理好内容 + 一键复制」，你自己粘贴发送。
+
+---
+
+## 4. 账号与注册（2026-11-12 起）
+
+- **第一次使用必须先注册 DanLume 服务器账号**：为了账号管理，也为了能把更新和公告及时推给你；
+  注册页只在服务器连不上 / 连续失败时才给「先离线使用」的退路（否则服务器一宕大家软件都打不开）。
+- 邮箱目前只放行 **`fudan.edu.cn` / `m.fudan.edu.cn`**（管理员账号走后台特例）。
+- **忘记密码**：登录页「忘记密码？」→ 注册邮箱收验证码 → 设新口令
+  （服务端 `/api/v1/password/request-code` + `/password/reset`，**这两个接口还需部署到线上**）。
+- 普通用户**看不到管理员入口**；封禁 / 改口令 / 看设备都在网页后台 `/admin`（口令 + 可选 TOTP）。
+
+> 应急开关：把设置 `account_gate_skip` 写成 `1` 可以跳过注册门（服务器故障或做演示时用）。
+
+---
+
+## 5. 数据放在哪
+
+- 数据目录：`%APPDATA%\DanLume\data`（开发机上可能是 `Work\znw\Agent\data`），里面 `lumina.db`（SQLite）+ `downloads/`、`elearning/`、`agent_sandbox/`。
+- 密码类一律 **DPAPI 加密**保存，界面只给「改」不给「看」。
+- 备份：设置页可一键备份数据库；也可以整包导出 `.dlpk`（含 `memory.md`）。
+
+---
+
+## 6. 开发与验证
+
+```powershell
+# Rust：必须带 --test-threads=1（测试改进程级 LUMINA_DATA_DIR，并行会互相污染）
+cd DanLume-v2\src-tauri
+cargo test -- --test-threads=1      # 当前：168 passed / 0 failed / 28 ignored
+
+# 前端类型检查 + 构建
+cd DanLume-v2
+npm run build
+
+# 服务端
+cd DanLume-server
+.\.venv\Scripts\python.exe -m pytest -q     # 54 passed
+```
+
+- 铁律：改源码只用编辑工具（不要用 PowerShell 正则批量替换）；`App.vue`、`focus.rs` 历史上被这么改坏过。
+- GitHub 附件上传**不能用 multipart**（会写坏文件），走 REST API 原始二进制上传。
+- 子 Webview 永远在最上层：离开页面必须 `embedClose()`；`add_child` 不能在主线程调。
+
+---
+
+## 7. 文档索引
+
+| 文件 | 内容 |
 | --- | --- |
-| ![仪表板](docs/screenshots/dashboard.png) | ![日历](docs/screenshots/calendar.png) |
-| **邮箱** | **通知** |
-| ![邮箱](docs/screenshots/mail.png) | ![通知](docs/screenshots/notices.png) |
-| **备忘** | **作业** |
-| ![备忘](docs/screenshots/memos.png) | ![作业](docs/screenshots/homework.png) |
-| **eHall** | **空教室** |
-| ![eHall](docs/screenshots/ehall.png) | ![空教室](docs/screenshots/classroom.png) |
-| **文档** | **文献库** |
-| ![文档](docs/screenshots/docs.png) | ![文献库](docs/screenshots/lit.png) |
-| **公式** | **设置** |
-| ![公式](docs/screenshots/latex.png) | ![设置](docs/screenshots/settings.png) |
+| `AGENTS.md` | 给接手的人：铁律、环境、命令、用户偏好 |
+| `_交接说明.md` | 环境、构建 / 打包 / 发布、服务器信息、踩过的坑 |
+| `_待办清单.md` | 还没做什么、需要你拍板什么（当前状态以它为准） |
+| `_工作日志.md` | 每一轮做了什么、怎么验证的（只追加） |
+| `_三端进度盘点.md` | 三端功能矩阵与代码量 |
+| `_ACCEPTANCE.md` | 端到端验收清单 |
+
+---
+
+## 8. 已知限制
+
+- 空教室 / 教务 / eHall 都依赖复旦内网身份，需要先 UIS 登录；eHall 部分页面有反爬，失败会提示。
+- 微信相关能力只做到「整理内容 + 复制」（不碰个人号自动化）。
+- 服务端公告是 5 秒轮询（WebSocket 探针可用，主程序未集成）。
+- 手机端只做到「编译通过 + 签名 APK」，没做真机回归。
+- 悬浮球（看板娘）还没做完：窗口能开，但小窗页面没加载出来（见 `_待办清单.md` T2）。
