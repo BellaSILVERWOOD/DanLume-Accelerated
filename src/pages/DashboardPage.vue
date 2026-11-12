@@ -26,6 +26,18 @@ import {
   type WeatherInfo,
 } from "../api";
 
+const emit = defineEmits<{ (e: "open-page", key: string): void }>();
+
+/**
+ * 首页不显示的 ehall 卡。
+ *
+ * 用户 2026-11-11：「首页的空教室重定向到空教室卡片吧。就首页不用显示了。」
+ * —— 空教室是个要选条件才有意义的交互卡（旧版 `INTERACTIVE_CARDS`），
+ * 放在仪表板只会显示一句抓来的碎文字；现在它只出现在左导航的「空教室」页，
+ * 首页只留一个跳过去的入口。
+ */
+const HIDDEN_EHALL = new Set(["empty_room"]);
+
 const items = ref<UpcomingItem[]>([]);
 const notices = ref<NoticeRow[]>([]);
 const assignments = ref<AssignmentRow[]>([]);
@@ -79,14 +91,14 @@ async function syncEhall() {
     const result = await ehallRefreshOnline();
     if (result.need_login) {
       syncHint.value =
-        "会话失效：请在 设置 → 账户与登录 里「打开登录窗口」登录后「抓取会话」，再点同步";
+        "会话失效：请在 设置 → 统一身份认证 里「打开登录窗口」登录，再回来点「抓取会话」，然后重试同步";
       return;
     }
     if (!result.ok) {
       syncHint.value = "刷新失败：可以改用「粘贴抓取」兜底";
       return;
     }
-    ehall.value = await ehallCards();
+    await loadCards();
     syncHint.value = `已刷新 ${result.refreshed}/${result.total} 张卡`;
   } catch (err) {
     syncHint.value = `刷新出错：${String(err)}`;
@@ -110,7 +122,7 @@ async function submitPaste() {
   pasteResult.value = result.ok
     ? `已解析：${result.value || "（没找到明确数值，已存原文）"}`
     : `解析失败：${result.error}`;
-  ehall.value = await ehallCards();
+  await loadCards();
 }
 
 async function refresh() {
@@ -126,7 +138,7 @@ async function refresh() {
     assignError.value = result.ok ? "" : result.error;
     weatherInfo.value = await weather();
     weekNo.value = await weekNumber();
-    ehall.value = await ehallCards();
+    await loadCards();
   } finally {
     busy.value = false;
   }
@@ -146,8 +158,13 @@ const EHALL_CARDS = [
   { title: "图书馆人数", glyph: "CONTACT", tone: "sky", hint: "填在馆人数页面的地址" },
 ] as const;
 
-/** ehall 卡片：读旧版缓存（校园卡 / 校车 / 刷锻 / 图书馆 / ehall 通知 / 空教室） */
+/** ehall 卡片：读旧版缓存（校园卡 / 校车 / 刷锻 / 图书馆 / ehall 通知）；空教室不在首页显示 */
 const ehall = ref<EhallCard[]>([]);
+
+async function loadCards() {
+  const all = await ehallCards();
+  ehall.value = all.filter((card) => !HIDDEN_EHALL.has(card.key));
+}
 const syncHint = ref("");
 const pasteOpen = ref(false);
 const pasteKey = ref("card");
@@ -287,13 +304,19 @@ function cardMeta(card: EhallCard): string {
           :meta="work.due"
           tone="rose"
           link
+          @click="emit('open-page', 'homework')"
         />
+        <div v-if="!assignments.length" class="jump">
+          作业页里已经内嵌了 eLearning 的提交窗口，
+          <a @click="emit('open-page', 'homework')">去作业页</a>
+        </div>
       </ListWidget>
     </div>
 
     <div class="section-label">
       ehall 数据　登录一次 ehall 就能取；地址在 设置 → 仪表板 里填
       <span v-if="syncHint" class="sync-hint">{{ syncHint }}</span>
+      <a class="jump-link" @click="emit('open-page', 'classroom')">空教室 →</a>
     </div>
     <div class="grid">
       <WidgetCard
@@ -441,5 +464,21 @@ function cardMeta(card: EhallCard): string {
   display: flex;
   justify-content: flex-end;
   padding-top: 2px;
+}
+.jump {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.6;
+  padding-top: 4px;
+}
+.jump a,
+.jump-link {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.jump-link {
+  margin-left: 10px;
 }
 </style>

@@ -88,30 +88,12 @@ pub fn export_pdf(store: &crate::store::Store, body: &str, stem: &str) -> Result
 
     let mut last_output = String::new();
     for round in 1..=2 {
-        let output = Command::new(xelatex_path())
-            .current_dir(&dir)
-            .args([
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                "-file-line-error",
-                &tex_path.file_name().unwrap_or_default().to_string_lossy(),
-            ])
-            .output();
-        match output {
-            Ok(result) => {
-                let text = String::from_utf8_lossy(&result.stdout).to_string();
-                last_output = text.clone();
-                if !result.status.success() {
-                    return Err(format!(
-                        "XeLaTeX 编译失败（第 {round} 遍）：{}",
-                        tail(&text)
-                    ));
-                }
+        match run_xelatex(&dir, &name) {
+            Ok(text) => {
+                last_output = text;
             }
             Err(err) => {
-                return Err(format!(
-                    "找不到 xelatex（{err}）：公式导出需要本机装 MiKTeX 或 TeX Live"
-                ))
+                return Err(format!("XeLaTeX 编译失败（第 {round} 遍）：{err}"));
             }
         }
     }
@@ -121,6 +103,84 @@ pub fn export_pdf(store: &crate::store::Store, body: &str, stem: &str) -> Result
         Ok(pdf.display().to_string())
     } else {
         Err(format!("编译完成但没有生成 PDF：{}", tail(&last_output)))
+    }
+}
+
+/// 单次编译，带硬超时。
+///
+/// 为什么要超时：MiKTeX 发现缺宏包时会弹一个「是否安装」的对话框，进程就一直卡在那里等；
+/// 而 `latex_pdf` 以前是**同步命令**（跑在主线程上），整个窗口会一起卡死，
+/// 用户以为程序挂了就关掉了（「一编译 pdf 就退出了」）。现在：
+/// ① 命令改成 async + spawn_blocking（界面不再冻结）；
+/// ② 这里 120 秒没结束就杀掉子进程并报「可能在等宏包安装弹窗」。
+fn run_xelatex(dir: &PathBuf, name: &str) -> Result<String, String> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let file_name = format!("{name}.tex");
+    let mut command = Command::new(xelatex_path());
+    command
+        .current_dir(dir)
+        .args([
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "-file-line-error",
+            &file_name,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // **不要弹黑窗口**：Windows 上不加 CREATE_NO_WINDOW，每次编译都会闪一个 cmd 窗口
+    // （用户 2026-11-11：「改成一有改动就实时编译，并且不要跳出 MiKTeX 的 cmd 窗口」）。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("找不到 xelatex（{err}）：公式导出需要本机装 MiKTeX 或 TeX Live"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(
+                        "等了 120 秒还没编译完，已经终止。多半是 MiKTeX 在弹「是否安装宏包」的对话框：
+                         点一下允许安装后重试，或者在 MiKTeX Console 里先把宏包装好"
+                            .to_string(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(err) => return Err(format!("等待 xelatex 结束失败：{err}")),
+        }
+    };
+
+    let mut text = String::new();
+    if let Some(out) = child.stdout.as_mut() {
+        let mut buf = Vec::new();
+        let _ = out.read_to_end(&mut buf);
+        text.push_str(&String::from_utf8_lossy(&buf));
+    }
+    if let Some(err_out) = child.stderr.as_mut() {
+        let mut buf = Vec::new();
+        let _ = err_out.read_to_end(&mut buf);
+        let extra = String::from_utf8_lossy(&buf).to_string();
+        if !extra.trim().is_empty() {
+            text.push('\n');
+            text.push_str(&extra);
+        }
+    }
+    if status.success() {
+        Ok(text)
+    } else {
+        Err(tail(&text))
     }
 }
 
@@ -146,14 +206,12 @@ mod tests {
         assert!(text.contains("\\parindent}{0pt"));
     }
 
+    /// 真数据用例（默认跳过）：数据来自临时副本，见 `crate::testdata`。
     #[test]
+    #[ignore]
     fn real_xelatex_compile() {
-        std::env::set_var(
-            "LUMINA_DATA_DIR",
-            r"E:\FIles\Lena‘s Files\Work\znw\Agent\data",
-        );
         let body = "\\section*{编译测试}\n行内 $a^2+b^2=c^2$，行间：\n$$\\int_0^1 x^2\\,dx=\\frac{1}{3}$$";
-        let store = crate::store::Store::open().expect("打不开数据库");
+        let store = crate::testdata::real_store("latex_export");
         match export_pdf(&store, body, "danlume-test") {
             Ok(path) => println!("生成 PDF：{}", path),
             Err(err) => panic!("编译失败：{}", err),

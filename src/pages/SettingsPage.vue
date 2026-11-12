@@ -7,6 +7,7 @@ import SoftButton from "../components/SoftButton.vue";
 import IconBadge from "../components/IconBadge.vue";
 import AdminPanel from "../components/AdminPanel.vue";
 import AccountPanel from "../components/AccountPanel.vue";
+import ContactsPanel from "../components/ContactsPanel.vue";
 import Pill from "../components/Pill.vue";
 import {
   ACCENTS,
@@ -34,6 +35,7 @@ import {
 import {
   aiProfileDelete,
   aiProfileSave,
+  accountState,
   appRelaunch,
   backupDb,
   dataExport,
@@ -48,6 +50,12 @@ import {
   imapTest,
   mailTest,
   saveSecret,
+  memoryAdd,
+  memoryClear,
+  memoryDelete,
+  memoryList,
+  memorySearch,
+  memoryUpdate,
   settingsAll,
   settingsSave,
   uisLogin,
@@ -56,6 +64,7 @@ import {
   canvasMigrate,
   canvasProbe,
   jwglProbe,
+  jwglImport,
   uisCapture,
   uisOpenLogin,
   uisStatus,
@@ -63,6 +72,7 @@ import {
   type AiProfile,
   type AiState,
   type DataImportResult,
+  type MemoryRow,
 } from "../api";
 
 type Kind = "text" | "password" | "select" | "switch" | "note" | "textarea";
@@ -102,6 +112,20 @@ const info = ref<{
   kernel: string;
 } | null>(null);
 const aiEdit = reactive({ name: "", base_url: "", model: "" });
+// 模型名候选（用户 2026-11-11：「DeepSeek 的 API 请提供更多的模型名让用户选择」）。
+// 只做**下拉建议**，不限制手打：官方长期有效的就两个别名，其余看账号/平台支持。
+const aiModelOptions: { value: string; label: string }[] = [
+  { value: "deepseek-chat", label: "deepseek-chat · 官方通用对话（默认，长期有效）" },
+  { value: "deepseek-reasoner", label: "deepseek-reasoner · 官方带思考过程（长期有效）" },
+  { value: "deepseek-coder", label: "deepseek-coder · 早期代码模型（部分账号仍可用）" },
+  { value: "deepseek-v3", label: "deepseek-v3 · 版本快照名" },
+  { value: "deepseek-v3.1", label: "deepseek-v3.1 · 版本快照名" },
+  { value: "deepseek-v3.2", label: "deepseek-v3.2 · 版本快照名（较新）" },
+  { value: "deepseek-r1", label: "deepseek-r1 · 推理模型直连名（部分平台）" },
+  { value: "deepseek-ai/DeepSeek-V3", label: "deepseek-ai/DeepSeek-V3 · 硅基流动等聚合平台" },
+  { value: "deepseek-ai/DeepSeek-R1", label: "deepseek-ai/DeepSeek-R1 · 聚合平台的 R1" },
+  { value: "Pro/deepseek-ai/DeepSeek-R1", label: "Pro/deepseek-ai/DeepSeek-R1 · 聚合平台付费版" },
+];
 // 工具清单与旧版 ai_tools.py 的 _SPECS 一一对应（41 个工具，7 组）
 const toolsOn = ref<Record<string, boolean>>({});
 const toolsGlobal = ref(true);
@@ -115,8 +139,21 @@ const uisState = ref<{
   has_session: boolean;
   cookies: number;
   has_castgc: boolean;
+  has_service_session?: boolean;
   has_saved_password: boolean;
+  saved_at?: string;
+  remember_password?: boolean;
 } | null>(null);
+
+// AI 记忆库（Rust 侧 memory.rs，旧版是 data/memory.md）：
+// 列表 / 搜索 / 新增 / 编辑 / 删除 / 清空，全部走 memory_* 命令。
+const memories = ref<MemoryRow[]>([]);
+const memoryTotal = ref(0);
+const memoryKeyword = ref("");
+const memoryDraft = ref("");
+const memoryMsg = ref("");
+const memoryError = ref("");
+const memoryEditing = reactive({ id: 0, content: "", tags: "" });
 
 // 数据迁移（.dlpk 数据包）：导出 / 导入
 const migrate = reactive({
@@ -272,20 +309,44 @@ async function doCanvasProbe() {
   uisMsg.value = "正在诊断 Canvas…";
   try {
     const result = await canvasProbe();
+    const current = result.current;
     uisMsg.value = result.ok
-      ? `Canvas 可用：${result.courses} 门课程（${(result.names || []).join("、")}）`
+      ? `Canvas 可用：${result.courses} 门课程${
+          current ? `，默认选「${current.name}」（${current.files} 个文件）` : ""
+        }（${(result.names || []).join("、")}）`
       : String(result.error);
     if (result.ok) {
-      // 诊断会把首门课记进设置，这里只补这一个键，免得「下载课程文件」读到旧值
+      // 诊断会把课程清单和默认课程写进设置，这里补回本地值，
+      // 免得「下载课程文件」读到旧值 / 下拉框是空的
       const fresh = await settingsAll();
-      const course = fresh.values["canvas_last_course"];
-      if (course) values["canvas_last_course"] = course;
+      for (const key of ["canvas_last_course", "canvas_course_list"]) {
+        if (fresh.values[key] !== undefined) values[key] = fresh.values[key];
+      }
     }
   } catch (err) {
     uisMsg.value = String(err);
   } finally {
     uisBusy.value = false;
   }
+}
+
+/** 诊断记下的课程清单（JSON），给下拉框用 */
+const canvasCourses = computed<{ id: string; name: string }[]>(() => {
+  try {
+    const raw = values["canvas_course_list"] || "";
+    if (!raw.trim()) return [];
+    const rows = JSON.parse(raw);
+    return Array.isArray(rows) ? rows.filter((one) => one && one.id) : [];
+  } catch {
+    return [];
+  }
+});
+
+/** 换课程：立刻存进设置，「下载课程文件」用这个键 */
+function pickCanvasCourse(event: Event) {
+  const id = (event.target as HTMLSelectElement).value;
+  values["canvas_last_course"] = id;
+  settingsSave({ canvas_last_course: id });
 }
 
 async function doCanvasDownload() {
@@ -326,6 +387,12 @@ async function doCanvasMigrate() {
     let text = `迁移 ${moved.length} 个 · 去重 ${deduped.length} 个 · 未识别 ${unresolved.length} 个`;
     if (failed.length) text += ` · 失败 ${failed.length} 个`;
     if (unresolved.length) text += "（没有动这些文件，还留在下载目录根下）";
+    // 一个都没搬的时候要说清为什么，否则用户只看到「未识别 N 个」
+    if (!moved.length && !deduped.length && unresolved.length) {
+      text += uisState.value?.has_session
+        ? "。原因：Canvas 官方文件清单里对不上这些文件名（多半不是用本程序下载的）"
+        : "。原因：既没有「文件名 → 课程」的索引，也没有 Canvas 会话（拉不到官方文件清单）——先点上面的「抓取会话」，再点这里";
+    }
     if (failed.length) {
       text += `；失败：${failed.map(([name, why]) => `${name}（${why}）`).join("、")}`;
     }
@@ -342,10 +409,69 @@ async function doJwglProbe() {
   uisBusy.value = true;
   uisMsg.value = "正在诊断教务接口…";
   try {
-    const result = await jwglProbe(values["jwgl_semester"] || "");
-    uisMsg.value = result.ok
-      ? `教务接口可用：shape=${result.shape} bytes=${result.bytes} keys=${(result.top_keys || []).join(",") || "(无)"}`
-      : String(result.error);
+    // 学期号不再让用户填：留空交给后端从课表页里自动认
+    const result = await jwglProbe("");
+    if (!result.ok) {
+      uisMsg.value = String(result.error);
+      return;
+    }
+    const sem = result.semester
+      ? `学期 ${result.semester}${result.semester_sniffed ? "（自动识别）" : ""} · `
+      : "";
+    const slots = typeof result.slots === "number" ? result.slots : 0;
+    const sample = (result.sample_titles || []).join("、");
+    const monday = result.first_monday
+      ? `第一周周一 ${result.first_monday}${result.term_start ? `（教务写的学年起始：${result.term_start}）` : ""} · `
+      : "";
+    uisMsg.value = slots
+      ? `教务接口可用：${sem}${monday}能解析出 ${slots} 个课表格子（${sample}…），点「导入课表」写进日历`
+      : `教务接口可用：${sem}${monday}shape=${result.shape} bytes=${result.bytes} keys=${
+          (result.top_keys || []).join(",") || "(无)"
+        }，但没解析出课表格子`;
+    // 自动识别出来的学期号 / 第一周周一记进设置（学期号界面上不显示，只给后台复用）
+    if (result.semester) {
+      values["jwgl_semester"] = result.semester;
+      await setSetting("jwgl_semester", result.semester);
+    }
+    if (result.first_monday) {
+      values["term_start"] = result.first_monday;
+      await setSetting("term_start", result.first_monday);
+    }
+  } catch (err) {
+    uisMsg.value = String(err);
+  } finally {
+    uisBusy.value = false;
+  }
+}
+
+async function doJwglImport() {
+  const semester = (values["jwgl_semester"] || "").trim();
+  // 「学期第一周周一」不再是必填：留空时后端会用教务页面上的「学年起始日期」自动换算
+  const termStart = (values["term_start"] || "").trim();
+  uisBusy.value = true;
+  uisMsg.value = termStart
+    ? "正在导入课表…（先抓教务 print-data，再解析成日程）"
+    : "正在导入课表…（学期起始日期会自动从教务读取）";
+  try {
+    const result = await jwglImport(termStart, semester);
+    if (!result.ok) {
+      uisMsg.value = `导入失败：${result.error}`;
+      return;
+    }
+    if (result.term_start) {
+      values["term_start"] = result.term_start;
+      await setSetting("term_start", result.term_start);
+    }
+    const sem = result.semester
+      ? `学期 ${result.semester}${result.semester_sniffed ? "（自动识别）" : ""}`
+      : "";
+    uisMsg.value = `导入完成：新增 ${result.added} 条，跳过 ${result.skipped} 条（${
+      result.slots ?? 0
+    } 个课表格子${sem ? " · " + sem : ""}）。一条都没新增的话，先点「教务诊断」看返回体结构`;
+    if (result.semester) {
+      values["jwgl_semester"] = result.semester;
+      await setSetting("jwgl_semester", result.semester);
+    }
   } catch (err) {
     uisMsg.value = String(err);
   } finally {
@@ -355,9 +481,42 @@ async function doJwglProbe() {
 
 async function doUisOpen() {
   const result = await uisOpenLogin();
-  uisMsg.value = result.ok
-    ? "已打开登录窗口：在里面完成登录后，回来点「抓取会话」"
-    : String(result.error);
+  if (!result.ok) {
+    uisMsg.value = String(result.error);
+    return;
+  }
+  uisMsg.value = "已打开登录页：学号密码会自动填好并点「登录」；登录成功后会话会自动保存…";
+  // 登录成功后是后端自动抓会话的，这里轮询一下状态把结果告诉用户
+  for (let i = 0; i < 60; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await refreshUis();
+    const state = uisState.value;
+    if (state && state.has_session) {
+      uisMsg.value = `会话已保存：${state.cookies} 个 cookie${
+        state.has_service_session ? "（含业务站会话）" : "（还没拿到业务站会话，可点「重新抓取会话」）"
+      }`;
+      return;
+    }
+  }
+  uisMsg.value =
+    "还没拿到会话：确认已在窗口里完成登录（有二次验证要过一次）；" +
+    "实在不行点「重新抓取会话」手动兜底";
+}
+
+/** 「检查自动填充」：只报告账号、密码、开关与开关状态，不联网（Python 版 `uis_login.test` 的等价） */
+async function doUisCheck() {
+  await refreshUis();
+  const state = uisState.value;
+  if (!state) {
+    uisMsg.value = "读不到统一身份认证的状态";
+    return;
+  }
+  const username = state.username || "未填";
+  const password = state.has_saved_password ? "已保存" : "未保存";
+  const autofill = state.remember_password ? "开" : "关";
+  const session = state.has_session ? `已就绪（${state.cookies} 个 cookie）` : "未取得";
+  uisMsg.value = `学号 ${username} · 密码 ${password} · 自动填表 ${autofill} · 会话 ${session}` +
+    (autofill === "关" ? "；打开「网页自动填表并点登录」才会自动登录" : "");
 }
 
 async function doUisCapture() {
@@ -365,7 +524,7 @@ async function doUisCapture() {
   try {
     const result = await uisCapture();
     uisMsg.value = result.ok
-      ? `已抓取 ${result.cookies} 个 cookie：${(result.names || []).join(", ")}`
+      ? `已抓取 ${result.cookies} 个 cookie${result.verdict ? ` · ${result.verdict}` : ""}：${(result.names || []).join(", ")}`
       : String(result.error);
   } catch (err) {
     uisMsg.value = String(err);
@@ -574,16 +733,11 @@ const cards: CardDef[] = [
   {
     key: "timetable",
     title: "课表",
-    subtitle: "作息时间与教学周，用来算「第几周」和出发提醒",
+    subtitle: "从教务直接导入课表：登录一次后，学期、第一周周一、节次时间都自动读出来",
     category: "日程",
     fields: [
-      { label: "开学日期", kind: "text", key: "term_start", placeholder: "2026-09-07" },
-      { label: "一节课几分钟", kind: "text", key: "period_minutes", placeholder: "45" },
-      { label: "课间休息", kind: "text", key: "period_break", placeholder: "10" },
-      { label: "上午第一节", kind: "text", key: "morning_start", placeholder: "08:00" },
-      { label: "下午第一节", kind: "text", key: "afternoon_start", placeholder: "13:30" },
-      { label: "晚上第一节", kind: "text", key: "evening_start", placeholder: "18:30" },
-      { label: "单双周显示", kind: "switch", key: "week_parity" },
+      // 与 Python 版一致：这一项只是「显示 / 兜底」，正常情况下由教务页面上的「学年起始日期」自动换算
+      { label: "学期第一周周一（自动识别，可改）", kind: "text", key: "term_start", placeholder: "留空即可，导入时自动读" },
     ],
     actions: ["save"],
   },
@@ -646,12 +800,44 @@ const cards: CardDef[] = [
     actions: ["save", "ai-refresh"],
   },
   {
+    key: "webui",
+    title: "网页版面板",
+    subtitle: "在右栏 AI 标签里嵌一个模型网页版（和网页版对话，不新开窗口）；地址留空就不显示",
+    category: "AI",
+    fields: [
+      {
+        label: "网页版地址",
+        kind: "text",
+        key: "ai_web_url",
+        placeholder: "https://chat.deepseek.com/",
+        hint:
+          "留空 = 右栏不出现「网页版」子标签。登录态由浏览器缓存决定（应用不保存、也不上传你的账号）。" +
+          "很多站点会用 X-Frame-Options / CSP 禁止被别的页面嵌入，那种只能点面板上的「在系统浏览器打开」。",
+      },
+    ],
+    actions: ["save"],
+  },
+  {
     key: "prompts",
     title: "系统提示词",
     subtitle: "AI 的人设与规则",
     category: "AI",
     fields: [{ label: "系统提示词", kind: "textarea", key: "system_prompt" }],
     actions: ["save"],
+  },
+  {
+    key: "memory",
+    title: "AI 记忆",
+    subtitle: "让 AI 长期记住的事：每次对话自动带上（最多 4000 字）；跟它说「记住……」它自己会写",
+    category: "AI",
+    fields: [],
+  },
+  {
+    key: "contacts",
+    title: "通讯录",
+    subtitle: "学生工作用：姓名 / 职位 / 邮箱 / 手机号 / 微信备注名 / QQ / 其它联系方式（AI 读取需单独授权）",
+    category: "其他",
+    fields: [],
   },
   {
     key: "account",
@@ -665,24 +851,23 @@ const cards: CardDef[] = [
       { label: "到期后要重新输密码", kind: "switch", key: "relogin_on_expire" },
       { label: "修改密码：旧密码", kind: "password", secret: "__old_password__" },
       { label: "修改密码：新密码", kind: "password", secret: "__new_password__" },
-      { label: "UIS 学号 / 工号", kind: "text", key: "uis_username", placeholder: "如 26303050178" },
-      { label: "记住 UIS 密码（DPAPI 加密）", kind: "switch", key: "uis_autofill" },
     ],
     actions: ["save"],
   },
   {
     key: "uis",
     title: "统一身份认证",
-    subtitle: "内嵌网页跳到登录页时自动填表",
+    subtitle: "内嵌网页遇到登录页时自动填好学号密码，你点一次「登录」即可",
     category: "其他",
     fields: [
-      { label: "学号 / 账号", kind: "text", key: "uis_user" },
-      { label: "密码", kind: "password", secret: "uis_password" },
-      { label: "自动填表并登录", kind: "switch", key: "uis_autofill" },
-      { label: "登录页地址", kind: "text", key: "uis_url", placeholder: "https://id.fudan.edu.cn/ac/#/index" },
-      { label: "登录后回跳地址", kind: "text", key: "uis_redirect" },
-      { label: "验证码处理", kind: "select", key: "uis_captcha", options: ["人工（推荐）", "自动识别"] },
-      { label: "掉登录时自动重登", kind: "switch", key: "uis_relogin" },
+      { label: "学号 / 工号", kind: "text", key: "uis_username", placeholder: "如 26303050178" },
+      { label: "密码（DPAPI 加密，只能改不能看）", kind: "password", secret: "uis_password" },
+      {
+        label: "网页自动填表并点登录",
+        kind: "switch",
+        key: "uis_autofill",
+        hint: "打开 eHall / 作业页 / 教务时，如果跳到统一身份认证会自动填好",
+      },
     ],
     actions: ["save"],
   },
@@ -755,6 +940,11 @@ const modeLabel: Record<string, string> = { light: "浅色", dark: "深色", aut
 
 function setValue(field: Field, next: string) {
   if (field.key) values[field.key] = next;
+  // 用户自己改了「学期第一周周一」就不再算自动值：下次导入让教务页面的日期说了算
+  if (field.key === "term_start") {
+    values["term_start_auto"] = "0";
+    settingsSave({ term_start_auto: "0" });
+  }
 }
 
 async function load() {
@@ -843,6 +1033,97 @@ async function persistTheme() {
   }
 }
 
+// ------------------------------------------------------------ AI 记忆库
+async function refreshMemories() {
+  memoryError.value = "";
+  try {
+    const keyword = memoryKeyword.value.trim();
+    const result = keyword ? await memorySearch(keyword) : await memoryList(200);
+    memories.value = result.items;
+    memoryTotal.value = result.total;
+  } catch (err) {
+    memoryError.value = `读取记忆失败：${String(err)}`;
+  }
+}
+
+async function addMemory() {
+  const text = memoryDraft.value.trim();
+  if (!text) return;
+  memoryError.value = "";
+  try {
+    const result = await memoryAdd(text, "手动", "");
+    if (!result.ok) {
+      memoryError.value = result.error || "写不进去";
+      return;
+    }
+    memoryDraft.value = "";
+    memoryMsg.value = result.message || "已记下";
+    await refreshMemories();
+  } catch (err) {
+    memoryError.value = `写入失败：${String(err)}`;
+  }
+}
+
+function startEditMemory(row: MemoryRow) {
+  memoryEditing.id = row.id;
+  memoryEditing.content = row.content;
+  memoryEditing.tags = row.tags;
+  memoryMsg.value = "";
+}
+
+async function saveMemoryEdit() {
+  const text = memoryEditing.content.trim();
+  if (!text) {
+    memoryError.value = "内容不能为空";
+    return;
+  }
+  memoryError.value = "";
+  try {
+    const result = await memoryUpdate(memoryEditing.id, text, memoryEditing.tags);
+    if (!result.ok) {
+      memoryError.value = result.error || "改不动";
+      return;
+    }
+    memoryEditing.id = 0;
+    memoryMsg.value = "已保存";
+    await refreshMemories();
+  } catch (err) {
+    memoryError.value = `保存失败：${String(err)}`;
+  }
+}
+
+async function removeMemory(row: MemoryRow) {
+  memoryError.value = "";
+  try {
+    const result = await memoryDelete(row.id);
+    if (!result.ok) {
+      memoryError.value = result.error || "删不掉";
+      return;
+    }
+    if (memoryEditing.id === row.id) memoryEditing.id = 0;
+    memoryMsg.value = "已删除";
+    await refreshMemories();
+  } catch (err) {
+    memoryError.value = `删除失败：${String(err)}`;
+  }
+}
+
+async function clearMemories() {
+  memoryError.value = "";
+  try {
+    const result = await memoryClear();
+    if (!result.ok) {
+      memoryError.value = result.error || "清不空";
+      return;
+    }
+    memoryEditing.id = 0;
+    memoryMsg.value = `已清空 ${result.removed ?? 0} 条记忆`;
+    await refreshMemories();
+  } catch (err) {
+    memoryError.value = `清空失败：${String(err)}`;
+  }
+}
+
 async function doBackup() {
   const result = await backupDb();
   message.value = result.ok
@@ -852,8 +1133,25 @@ async function doBackup() {
 
 onMounted(async () => {
   await load();
+  await refreshMemories();
   info.value = await dataInfo();
+  void refreshAdminFlag();
 });
+
+/**
+ * 是不是管理员：只看**服务器账号**的角色（旧版那套本机「证书签发」早就名存实亡）。
+ * 普通用户不该看到「账户审核（管理员）」这个入口（用户 2026-11-11 提的）。
+ */
+const isServerAdmin = ref(false);
+
+async function refreshAdminFlag() {
+  try {
+    const state = await accountState();
+    isServerAdmin.value = !!state.is_admin;
+  } catch {
+    isServerAdmin.value = false;
+  }
+}
 </script>
 
 <template>
@@ -870,7 +1168,7 @@ onMounted(async () => {
 
     <div class="body">
       <aside class="cats">
-        <input v-model="keyword" type="search" placeholder="搜索设置（比如 vpn、字体、key）" />
+        <input v-model="keyword" type="search" placeholder="搜索设置…" />
         <button
           v-for="cat in CATEGORIES"
           :key="cat"
@@ -894,6 +1192,10 @@ onMounted(async () => {
 
           <template v-if="card.key === 'account'">
             <AccountPanel @mail-apply="openMailApply" />
+          </template>
+
+          <template v-if="card.key === 'contacts'">
+            <ContactsPanel />
           </template>
 
           <template v-if="card.key === 'data'">
@@ -1186,7 +1488,18 @@ onMounted(async () => {
             </div>
             <div class="field">
               <div class="label">模型名</div>
-              <input v-model="aiEdit.model" type="text" placeholder="deepseek-chat" />
+              <input v-model="aiEdit.model" type="text" list="ai-model-options" placeholder="deepseek-chat" />
+              <datalist id="ai-model-options">
+                <option v-for="one in aiModelOptions" :key="one.value" :value="one.value">
+                  {{ one.label }}
+                </option>
+              </datalist>
+              <div class="hint">
+                下拉里是常用名字，也可以直接手打。**长期有效**的只有官方的
+                <code>deepseek-chat</code>（通用）和 <code>deepseek-reasoner</code>（带思考过程）；
+                带版本号的（<code>deepseek-v3.2</code> 之类）与聚合平台前缀的
+                （<code>deepseek-ai/DeepSeek-V3</code>）要看你的账号或服务商支持哪个。
+              </div>
             </div>
             <div class="field">
               <div class="label">这套配置的 API Key</div>
@@ -1260,6 +1573,20 @@ onMounted(async () => {
 
           <template v-else-if="card.key === 'elearn'">
             <div class="field">
+              <div class="label">要下载的课程</div>
+              <select
+                class="course-select"
+                :value="values['canvas_last_course'] || ''"
+                @change="pickCanvasCourse"
+              >
+                <option value="">（先点「诊断 Canvas」拿课程清单）</option>
+                <option v-for="one in canvasCourses" :key="one.id" :value="String(one.id)">
+                  {{ one.name }}
+                </option>
+              </select>
+              <div class="hint">诊断会把课程清单拉下来；选中的课程就是「下载课程文件」要下的那门</div>
+            </div>
+            <div class="field">
               <div class="label">课程文件</div>
               <div class="row-actions">
                 <SoftButton :height="30" :font-size="12.5" :disabled="uisBusy" @click="doCanvasProbe">
@@ -1277,6 +1604,86 @@ onMounted(async () => {
                 下载会放进「下载目录 / 课程名 / 文件名」；「整理旧下载文件」会把以前平铺在下载目录里的旧文件
                 搬进对应课程文件夹（事先判断不出课程的文件不动）
               </div>
+            </div>
+          </template>
+
+          <template v-else-if="card.key === 'memory'">
+            <div class="field">
+              <div class="label">已有记忆（共 {{ memoryTotal }} 条）</div>
+              <div class="mem-search">
+                <input
+                  v-model="memoryKeyword"
+                  type="search"
+                  class="mem-input"
+                  placeholder="搜内容 / 标签，回车搜索"
+                  @keydown.enter="refreshMemories"
+                />
+                <SoftButton :height="28" :font-size="12" @click="refreshMemories">搜索</SoftButton>
+                <SoftButton :height="28" :font-size="12" @click="(memoryKeyword = ''), refreshMemories()">
+                  全部
+                </SoftButton>
+              </div>
+              <div class="mem-list">
+                <div v-for="row in memories" :key="row.id" class="mem-row">
+                  <template v-if="memoryEditing.id === row.id">
+                    <textarea v-model="memoryEditing.content" class="mem-edit" rows="2" />
+                    <input v-model="memoryEditing.tags" type="text" placeholder="标签，逗号分隔" />
+                    <div class="row-actions">
+                      <SoftButton variant="primary" :height="26" :font-size="11.5" @click="saveMemoryEdit">
+                        保存
+                      </SoftButton>
+                      <SoftButton :height="26" :font-size="11.5" @click="memoryEditing.id = 0">
+                        取消
+                      </SoftButton>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <div class="mem-text">{{ row.content }}</div>
+                    <div class="mem-meta">
+                      <span>{{ row.source || "手动" }}</span>
+                      <span v-if="row.tags">· {{ row.tags }}</span>
+                      <span>· {{ row.created_at.slice(0, 16) }}</span>
+                      <span v-if="row.hits">· 带进对话 {{ row.hits }} 次</span>
+                      <span class="spacer" />
+                      <button class="glink" type="button" @click="startEditMemory(row)">编辑</button>
+                      <button class="glink danger" type="button" @click="removeMemory(row)">删除</button>
+                    </div>
+                  </template>
+                </div>
+                <div v-if="!memories.length" class="hint">
+                  还没有记忆：跟 AI 说「记住……」（它会自己写），也可以在下面手动加一条。
+                </div>
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="label">新增一条记忆</div>
+              <textarea
+                v-model="memoryDraft"
+                rows="2"
+                placeholder="比如：我周三下午三点有课；不吃香菜"
+              />
+              <div class="row-actions">
+                <SoftButton
+                  variant="primary"
+                  :height="28"
+                  :font-size="12"
+                  :disabled="!memoryDraft.trim()"
+                  @click="addMemory"
+                >
+                  记下
+                </SoftButton>
+                <SoftButton :height="28" :font-size="12" @click="refreshMemories">刷新</SoftButton>
+                <SoftButton variant="danger" :height="28" :font-size="12" @click="clearMemories">
+                  清空全部
+                </SoftButton>
+              </div>
+              <div class="hint">
+                每次 AI 对话都会把记忆拼进系统提示词（放不下会截断，最多 4000 字）；
+                模型回答里单独一行写 [[记住]] 内容 时，程序会把它收进这里、并从回答里删掉。
+              </div>
+              <div v-if="memoryMsg" class="hint">{{ memoryMsg }}</div>
+              <div v-if="memoryError" class="err">{{ memoryError }}</div>
             </div>
           </template>
 
@@ -1333,11 +1740,90 @@ onMounted(async () => {
             </div>
           </template>
 
+          <!-- 课表：从教务直接导入（jwgl_import 的入口） -->
+          <div v-if="card.key === 'timetable'" class="field">
+            <div class="label">从教务导入课表</div>
+            <div class="row-actions">
+              <SoftButton :height="30" :font-size="12.5" :disabled="uisBusy" @click="doJwglProbe">
+                教务诊断
+              </SoftButton>
+              <SoftButton
+                :height="30"
+                :font-size="12.5"
+                variant="primary"
+                :disabled="uisBusy"
+                @click="doJwglImport"
+              >
+                导入课表
+              </SoftButton>
+            </div>
+            <div v-if="uisMsg" class="hint">{{ uisMsg }}</div>
+            <div class="hint">
+              导入前需要先在「统一身份认证」里「打开登录窗口」登录并「抓取会话」。
+              「教务诊断」只抓返回体、打印结构（不写数据），用来核对字段；
+              「导入课表」会把课表格子写成每周日程（会跳过已存在的同名同时间条目）。
+            </div>
+          </div>
+
+          <!-- 统一身份认证：与 Python 版同一套（内嵌网页自动填表 + 登录后自动存会话） -->
+          <div v-if="card.key === 'uis'" class="field uis-session">
+            <div class="label">登录会话</div>
+            <div class="uis-status">
+              <template v-if="uisState">
+                <span class="dot" :class="uisState.has_session ? 'ok' : 'off'" />
+                <span>
+                  {{ uisState.has_session ? "会话已就绪" : "还没有会话" }}
+                  <template v-if="uisState.has_session">
+                    · {{ uisState.cookies }} 个 cookie ·
+                    {{ uisState.has_service_session ? "已含业务站会话" : "缺业务站会话（点「重新抓取会话」走一遍 eLearning / eHall）" }}
+                    <template v-if="uisState.saved_at">· 抓取于 {{ uisState.saved_at }}</template>
+                  </template>
+                  · 学号 {{ uisState.username || "未填" }}
+                  · 自动填表 {{ uisState.remember_password ? "开" : "关" }}
+                </span>
+              </template>
+              <span v-else class="tiny">读不到会话状态</span>
+            </div>
+            <div class="row-actions">
+              <SoftButton
+                :height="30"
+                :font-size="12.5"
+                variant="primary"
+                :disabled="uisBusy"
+                @click="doUisOpen"
+              >
+                打开登录页（自动填表）
+              </SoftButton>
+              <SoftButton :height="30" :font-size="12.5" :disabled="uisBusy" @click="doUisCheck">
+                检查自动填充
+              </SoftButton>
+              <SoftButton :height="30" :font-size="12.5" :disabled="uisBusy" @click="doUisCapture">
+                重新抓取会话
+              </SoftButton>
+              <SoftButton :height="30" :font-size="12.5" :disabled="uisBusy" @click="doUisLogout">
+                退出 UIS
+              </SoftButton>
+            </div>
+            <div v-if="uisMsg" class="hint">{{ uisMsg }}</div>
+            <div class="hint">
+              和 Python 版一样：点「打开登录页」后，学号密码会**自动填好并点登录**（页面自己加密提交，
+              我们不碰密码）；需要短信 / 扫码二次验证时手动过一次。登录成功后会话会**自动存进本机**
+              （DPAPI 加密），Canvas 下载、eHall 实时刷新、教务课表都用它，不用再点「抓取会话」——
+              这个按钮只是抓不到时的兜底。
+            </div>
+          </div>
+
                     <div v-if="card.key === 'account'" class="card-foot">
-            <SoftButton :height="30" :font-size="12.5" variant="primary" @click="adminOpen = true">
-              账户审核（管理员）
-            </SoftButton>
-            <span class="tiny">批准注册申请、续期 / 停用 / 注销账户、复制回信全文</span>
+            <!-- 只有服务器账号是 admin 才给这个入口；普通用户看不到（也进不去后台） -->
+            <template v-if="isServerAdmin">
+              <SoftButton :height="30" :font-size="12.5" variant="primary" @click="adminOpen = true">
+                账户审核（管理员）
+              </SoftButton>
+              <span class="tiny">批准注册申请、续期 / 停用 / 注销账户、复制回信全文</span>
+            </template>
+            <span v-else class="tiny">
+              当前账号是普通用户：账号相关操作（封禁 / 改口令 / 看设备）由管理员在网页后台处理
+            </span>
           </div>
           <div v-if="card.actions" class="card-foot">
             <SoftButton
@@ -1504,6 +1990,10 @@ onMounted(async () => {
 .control select,
 .control textarea {
   max-width: 480px;
+}
+/* 课程下拉框：别拉满整行 */
+.course-select {
+  max-width: 420px;
 }
 .hint {
   font-size: 11.5px;
@@ -1853,9 +2343,29 @@ onMounted(async () => {
 .card-foot .tiny {
   flex-basis: 100%;
 }
+.uis-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+  padding: 2px 0 6px;
+}
+.uis-status .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--border-soft);
+  flex: 0 0 auto;
+}
+.uis-status .dot.ok {
+  background: var(--success, #2f9e63);
+}
+.uis-status .dot.off {
+  background: var(--warning, #c98a1a);
+}
 .uis-pwd {
-  width: 180px;
-  min-width: 0;
+  width: 180px;  min-width: 0;
   height: 30px;
   border-radius: 8px;
   border: 1px solid var(--border-soft);
@@ -1864,4 +2374,53 @@ onMounted(async () => {
   font-size: 12px;
   padding: 0 8px;
   text-align: left;
-}</style>
+}
+
+/* AI 记忆卡：搜索 + 条目列表（列表留一点内边距、上限高度自己滚） */
+.mem-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mem-search .mem-input {
+  flex: 1;
+  max-width: 320px;
+}
+.mem-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 2px;
+}
+.mem-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border-soft);
+  background: var(--card-alt);
+}
+.mem-text {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.mem-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--muted);
+  flex-wrap: wrap;
+}
+.mem-edit {
+  min-height: 48px;
+}
+.glink.danger {
+  color: var(--danger);
+}
+</style>

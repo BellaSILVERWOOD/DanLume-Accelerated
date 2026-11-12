@@ -491,15 +491,13 @@ pub fn approve(store: &Store, request: &Value, days: Option<i64>) -> Result<Valu
 mod tests {
     use super::*;
 
+    /// 真数据用例：数据来自临时副本（见 `crate::testdata`），不碰用户的真实库。
     fn real_store() -> Store {
-        std::env::set_var(
-            "LUMINA_DATA_DIR",
-            r"E:\FIles\Lena‘s Files\Work\znw\Agent\data",
-        );
-        Store::open().expect("打不开数据库")
+        crate::testdata::real_store("registration")
     }
 
     #[test]
+    #[ignore = "真数据用例：需要开发机上的真实数据目录（见 crate::testdata）"]
     fn registry_reads_real_rows() {
         let store = real_store();
         let rows = registry(&store);
@@ -512,6 +510,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "真数据用例：需要开发机上的真实数据目录（见 crate::testdata）"]
     fn approve_existing_user_reuses_expiry() {
         let store = real_store();
         if !adminsign::has_private_key(&store) {

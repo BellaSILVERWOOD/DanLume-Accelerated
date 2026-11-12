@@ -10,6 +10,7 @@ use imap::types::Fetch;
 use mail_parser::MimeHeaders;
 use native_tls::TlsConnector;
 
+use serde_json::json;
 use crate::store::Store;
 
 /// 收件箱里一封邮件的概要
@@ -843,12 +844,9 @@ pub fn write_debug(path: &str, data: &[u8]) {
 mod tests {
     use super::*;
 
+    /// 真数据用例：数据来自临时副本（见 `crate::testdata`），不碰用户的真实库。
     fn real_store() -> Store {
-        std::env::set_var(
-            "LUMINA_DATA_DIR",
-            r"E:\FIles\Lena‘s Files\Work\znw\Agent\data",
-        );
-        Store::open().expect("打不开数据库")
+        crate::testdata::real_store("mail")
     }
 
     #[test]
@@ -923,4 +921,515 @@ mod tests {
             println!("  附件：{}（{} 字节）", item.name, item.size);
         }
     }
+
+    /// 临时目录 + 用完恢复 `LUMINA_DATA_DIR`（测试改进程级环境变量，必须还原）
+    struct TempData {
+        previous: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+    }
+
+    impl TempData {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "danlume-mail-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let previous = std::env::var_os("LUMINA_DATA_DIR");
+            std::env::set_var("LUMINA_DATA_DIR", &dir);
+            Self { previous, dir }
+        }
+    }
+
+    impl Drop for TempData {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("LUMINA_DATA_DIR", value),
+                None => std::env::remove_var("LUMINA_DATA_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// AI 摘要那一列：老库自动补列，存进去能原样读回来，没写过的返回空串
+    #[test]
+    fn summary_column_migrates_and_round_trips() {
+        let temp = TempData::new("sum");
+        let store = crate::store::Store::open().expect("临时库");
+        ensure_inbox_schema(&store);
+        {
+            let conn = store.connection();
+            conn.execute(
+                "INSERT INTO inbox_messages (account_id, uid, subject, fetched_at)
+                 VALUES (0, 'u1', '选课通知', '2026-11-11 10:00')",
+                [],
+            )
+            .expect("插一封邮件");
+        }
+        // 没生成过 = 空串（不是 None，前端好判断）
+        assert_eq!(cached_summary(&store, "u1"), "");
+        save_summary(&store, "u1", "· 教务处通知：周五前选课\n要做：周五 17:00 前提交");
+        assert_eq!(
+            cached_summary(&store, "u1"),
+            "· 教务处通知：周五前选课\n要做：周五 17:00 前提交"
+        );
+        // 重新生成会盖掉旧的
+        save_summary(&store, "u1", "· 换了一版");
+        assert_eq!(cached_summary(&store, "u1"), "· 换了一版");
+        // 库里没有的 uid 不 panic
+        assert_eq!(cached_summary(&store, "不存在"), "");
+        drop(store);
+        drop(temp);
+    }
+
+    /// 真库副本：老库能补上 `summary_zh` 列，已有邮件一封不少，新列初始为空
+    #[test]
+    #[ignore]
+    fn real_db_gains_summary_column() {
+        /// 读表结构（照 `ensure_inbox_schema` 里的写法，避免借用活不过块尾）
+        fn columns_of(store: &Store) -> Vec<String> {
+            let conn = store.connection();
+            let mut out: Vec<String> = Vec::new();
+            if let Ok(mut stmt) = conn.prepare("PRAGMA table_info(inbox_messages)") {
+                if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) {
+                    out = rows.flatten().collect();
+                }
+            }
+            out
+        }
+
+        let store = real_store();
+        ensure_inbox_schema(&store);
+        let columns = columns_of(&store);
+        assert!(
+            columns.iter().any(|one| one == "summary_zh"),
+            "没补上摘要列：{columns:?}"
+        );
+        let rows = cached_inbox(&store, 5);
+        println!("真库副本里读到 {} 封邮件", rows.len());
+        assert!(!rows.is_empty(), "补列之后读不到邮件了");
+        for row in &rows {
+            assert_eq!(cached_summary(&store, &row.uid), "", "新列应当是空的");
+        }
+        let uid = rows[0].uid.clone();
+        save_summary(&store, &uid, "· 测试摘要");
+        assert_eq!(cached_summary(&store, &uid), "· 测试摘要");
+    }
+}
+
+// ------------------------------------------------------------------ 收件箱本地缓存
+//
+// 对应旧版 `imap_inbox.py` 的 `save_messages` / `cached_messages`：收到的邮件头（正文按需）
+// 存进 `inbox_messages`，之后进邮件页先读本地、只向上取「比本地最大 UID 更大」的增量。
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CachedMail {
+    pub uid: String,
+    pub subject: String,
+    #[serde(rename = "from")]
+    pub from_addr: String,
+    pub date: String,
+    pub unread: bool,
+    pub has_attachments: bool,
+    pub has_body: bool,
+}
+
+pub fn ensure_inbox_schema(store: &Store) {
+    let conn = store.connection();
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS inbox_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL DEFAULT 0,
+            account_name TEXT NOT NULL DEFAULT '',
+            uid TEXT NOT NULL,
+            subject TEXT NOT NULL DEFAULT '',
+            sender TEXT NOT NULL DEFAULT '',
+            date TEXT NOT NULL DEFAULT '',
+            snippet TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            body_text TEXT NOT NULL DEFAULT '',
+            links TEXT NOT NULL DEFAULT '',
+            unread INTEGER NOT NULL DEFAULT 0,
+            has_attachments INTEGER NOT NULL DEFAULT 0,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(account_id, uid)
+        )",
+        [],
+    );
+    // 老库（Python 建的）没有这两列，补上；补不了就算了，读的时候有默认值
+    let columns: Vec<String> = {
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = conn.prepare("PRAGMA table_info(inbox_messages)") {
+            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) {
+                out = rows.flatten().collect();
+            }
+        }
+        out
+    };
+    if !columns.iter().any(|one| one == "unread") {
+        let _ = conn.execute(
+            "ALTER TABLE inbox_messages ADD COLUMN unread INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+    }
+    if !columns.iter().any(|one| one == "has_attachments") {
+        let _ = conn.execute(
+            "ALTER TABLE inbox_messages ADD COLUMN has_attachments INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+    }
+    // 正文分 html / 纯文本两份存：以前合成一份，读回来只能猜，纯文本邮件就退化成 <pre> 等宽字体
+    if !columns.iter().any(|one| one == "body_text") {
+        let _ = conn.execute(
+            "ALTER TABLE inbox_messages ADD COLUMN body_text TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+    }
+    // AI 摘要（用户 2026-11-11：每封邮件配一个 AI 摘要，放在邮件上端）。
+    // 存下来就不会每开一次邮件就调一次接口。
+    if !columns.iter().any(|one| one == "summary_zh") {
+        let _ = conn.execute(
+            "ALTER TABLE inbox_messages ADD COLUMN summary_zh TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+    }
+    // 附件清单（只有名字 / 大小，**不存内容**）：摘要里要写「带了什么附件」，
+    // 用户明确说过「附件内容不用上传，只上传名称和格式」。
+    if !columns.iter().any(|one| one == "attachments_json") {
+        let _ = conn.execute(
+            "ALTER TABLE inbox_messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+    }
+    // 摘要里「可能需要加进日程的事」：JSON 数组；`events_at` 非空表示已经抽过了
+    // （抽过但确实是空的也要记下来，不然每次开这封邮件都要再问一次模型）
+    if !columns.iter().any(|one| one == "events_json") {
+        let _ = conn.execute(
+            "ALTER TABLE inbox_messages ADD COLUMN events_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+    }
+    if !columns.iter().any(|one| one == "events_at") {
+        let _ = conn.execute(
+            "ALTER TABLE inbox_messages ADD COLUMN events_at TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+    }
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_inbox_date ON inbox_messages(date)",
+        [],
+    );
+}
+
+/// 把某封邮件的 AI 摘要存进缓存
+pub fn save_summary(store: &Store, uid: &str, text: &str) {
+    ensure_inbox_schema(store);
+    let conn = store.connection();
+    let _ = conn.execute(
+        "UPDATE inbox_messages SET summary_zh = ?1 WHERE uid = ?2",
+        rusqlite::params![text, uid],
+    );
+}
+
+/// 缓存里的 AI 摘要（没有就是空串）
+pub fn cached_summary(store: &Store, uid: &str) -> String {
+    ensure_inbox_schema(store);
+    let conn = store.connection();
+    conn.query_row(
+        "SELECT summary_zh FROM inbox_messages WHERE uid = ?1 LIMIT 1",
+        [uid],
+        |row| row.get::<_, String>(0),
+    )
+    .unwrap_or_default()
+}
+
+fn account_tag(store: &Store) -> String {
+    store.setting("imap_user").unwrap_or_default()
+}
+
+/// 把拉到的邮件头写进本地库（同 uid 覆盖；正文保留）
+pub fn save_summaries(store: &Store, rows: &[MailSummary]) -> usize {
+    ensure_inbox_schema(store);
+    let account = account_tag(store);
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let conn = store.connection();
+    let mut saved = 0usize;
+    for row in rows {
+        if row.uid.trim().is_empty() {
+            continue;
+        }
+        let ok = conn.execute(
+            "INSERT INTO inbox_messages(account_id, account_name, uid, subject, sender,
+                date, fetched_at, unread, has_attachments)
+             VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(account_id, uid) DO UPDATE SET
+                subject = excluded.subject,
+                sender = excluded.sender,
+                date = excluded.date,
+                fetched_at = excluded.fetched_at,
+                unread = excluded.unread,
+                has_attachments = excluded.has_attachments",
+            rusqlite::params![
+                account,
+                row.uid,
+                row.subject,
+                row.from,
+                row.date,
+                stamp,
+                row.unread as i64,
+                row.has_attachments as i64,
+            ],
+        );
+        if ok.is_ok() {
+            saved += 1;
+        }
+    }
+    saved
+}
+
+/// 本地缓存的邮件头（按日期倒序）
+pub fn cached_inbox(store: &Store, limit: usize) -> Vec<CachedMail> {
+    ensure_inbox_schema(store);
+    let conn = store.connection();
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT uid, subject, sender, date, unread, has_attachments,
+                length(COALESCE(body, '')) AS body_len
+         FROM inbox_messages ORDER BY date DESC, id DESC LIMIT ?1",
+    ) else {
+        return out;
+    };
+    if let Ok(rows) = stmt.query_map([limit as i64], |row| {
+        Ok(CachedMail {
+            uid: row.get::<_, String>("uid").unwrap_or_default(),
+            subject: row.get::<_, String>("subject").unwrap_or_default(),
+            from_addr: row.get::<_, String>("sender").unwrap_or_default(),
+            date: row.get::<_, String>("date").unwrap_or_default(),
+            unread: row.get::<_, i64>("unread").unwrap_or(0) != 0,
+            has_attachments: row.get::<_, i64>("has_attachments").unwrap_or(0) != 0,
+            has_body: row.get::<_, i64>("body_len").unwrap_or(0) > 0,
+        })
+    }) {
+        out = rows.flatten().collect();
+    }
+    out
+}
+
+/// 本地缓存了多少封
+pub fn cached_count(store: &Store) -> usize {
+    ensure_inbox_schema(store);
+    let conn = store.connection();
+    conn.query_row("SELECT COUNT(*) FROM inbox_messages", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .unwrap_or(0) as usize
+}
+
+/// 缓存里最大的 UID（数字比较；没有缓存返回 0）
+pub fn max_cached_uid(store: &Store) -> u64 {
+    ensure_inbox_schema(store);
+    let conn = store.connection();
+    let mut best = 0u64;
+    if let Ok(mut stmt) = conn.prepare("SELECT uid FROM inbox_messages") {
+        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+            for text in rows.flatten() {
+                best = best.max(numeric(&text));
+            }
+        }
+    }
+    best
+}
+
+/// 正文缓存：点开过的邮件不再联网
+pub fn save_body(store: &Store, uid: &str, html: &str, text: &str) {
+    ensure_inbox_schema(store);
+    if html.trim().is_empty() && text.trim().is_empty() {
+        return;
+    }
+    let conn = store.connection();
+    let _ = conn.execute(
+        "UPDATE inbox_messages SET body = ?1, body_text = ?2 WHERE uid = ?3",
+        rusqlite::params![html, text, uid],
+    );
+}
+
+/// 把附件清单（**只有名字和大小，不存内容**）记在邮件头上，摘要要用
+pub fn save_attachments(store: &Store, uid: &str, attachments: &[serde_json::Value]) {
+    ensure_inbox_schema(store);
+    let text = serde_json::Value::Array(attachments.to_vec()).to_string();
+    let conn = store.connection();
+    let _ = conn.execute(
+        "UPDATE inbox_messages SET attachments_json = ?1 WHERE uid = ?2",
+        rusqlite::params![text, uid],
+    );
+}
+
+/// 缓存里的附件清单：`[{name, size}]`；没存过就是空数组
+pub fn cached_attachments(store: &Store, uid: &str) -> Vec<serde_json::Value> {
+    ensure_inbox_schema(store);
+    let conn = store.connection();
+    let raw: String = conn
+        .query_row(
+            "SELECT attachments_json FROM inbox_messages WHERE uid = ?1 LIMIT 1",
+            [uid],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default();
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// 把「可能要做的事」存进缓存（JSON 数组），同时打上「抽过了」的时间戳
+pub fn save_events(store: &Store, uid: &str, items: &[serde_json::Value]) {
+    ensure_inbox_schema(store);
+    let text = serde_json::Value::Array(items.to_vec()).to_string();
+    let conn = store.connection();
+    let _ = conn.execute(
+        "UPDATE inbox_messages SET events_json = ?1, events_at = ?2 WHERE uid = ?3",
+        rusqlite::params![text, crate::now_str(), uid],
+    );
+}
+
+/// 抽取逻辑的版本号：提示词 / 解析规则一改就要 +1
+///
+/// 为什么需要：抽出来的结果缓存在 `events_at` 里，改了规则也不会重抽，
+/// 用户看到的一直是老结果（2026-11-11 用户两次报「怎么少一个」，就是老缓存没失效）。
+/// 版本号对不上时把所有邮件的 `events_at` 清空，下次打开会按新规则重抽一次。
+pub const EVENTS_VERSION: u32 = 2;
+
+/// 版本变了就清一遍「抽过了」标记（每个进程只做一次）
+pub fn invalidate_old_event_cache(store: &Store) {
+    ensure_inbox_schema(store);
+    let current = store
+        .setting("mail_events_version")
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    if current == EVENTS_VERSION {
+        return;
+    }
+    let conn = store.connection();
+    let _ = conn.execute("UPDATE inbox_messages SET events_at = ''", []);
+    drop(conn);
+    let _ = store.set_setting("mail_events_version", &EVENTS_VERSION.to_string());
+}
+
+/// 缓存里的「可能要做的事」：`(items, 是否已经抽过)`
+///
+/// 第二个值很关键：抽过但结果为空也要记住，不然每次打开这封邮件都会再问一次模型。
+pub fn cached_events(store: &Store, uid: &str) -> (Vec<serde_json::Value>, bool) {
+    ensure_inbox_schema(store);
+    let conn = store.connection();
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT events_json, events_at FROM inbox_messages WHERE uid = ?1 LIMIT 1",
+            [uid],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, String>(1).unwrap_or_default(),
+                ))
+            },
+        )
+        .ok();
+    let (raw, at) = row.unwrap_or_default();
+    let items = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    (items, !at.trim().is_empty())
+}
+
+/// 缓存里的正文 + 邮件头：`(html, text, subject, from, date)`
+pub fn cached_body(store: &Store, uid: &str) -> Option<(String, String, String, String, String)> {
+    ensure_inbox_schema(store);
+    let conn = store.connection();
+    conn.query_row(
+        "SELECT body, body_text, subject, sender, date FROM inbox_messages WHERE uid = ?1 LIMIT 1",
+        [uid],
+        |row| {
+            Ok((
+                row.get::<_, String>(0).unwrap_or_default(),
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, String>(2).unwrap_or_default(),
+                row.get::<_, String>(3).unwrap_or_default(),
+                row.get::<_, String>(4).unwrap_or_default(),
+            ))
+        },
+    )
+    .ok()
+    .filter(|(html, text, _, _, _)| !html.trim().is_empty() || !text.trim().is_empty())
+}
+
+/// 增量同步：只取服务器上「UID 比本地最大 UID 更大」的邮件；本地空缓存时取最近 `limit` 封。
+pub fn sync_inbox(store: &Store, limit: usize) -> Result<serde_json::Value, String> {
+    let config = config(store)?;
+    let before = cached_count(store);
+    let max_uid = max_cached_uid(store);
+    let mut session = connect(&config)?;
+    session
+        .select("INBOX")
+        .map_err(|err| format!("打开收件箱失败：{err}"))?;
+    // 增量：`UID (max+1):*`；服务器不支持该写法时会返回全部，我们再用 UID 过滤兜底
+    let query = format!("UID {}:*", max_uid + 1);
+    let uids = session
+        .uid_search(&query)
+        .map_err(|err| format!("查询新邮件失败：{err}"))?;
+    let mut wanted: Vec<u32> = uids
+        .into_iter()
+        .filter(|uid| (*uid as u64) > max_uid)
+        .collect();
+    wanted.sort_unstable();
+    if wanted.len() > limit {
+        wanted = wanted[wanted.len() - limit..].to_vec();
+    }
+    if wanted.is_empty() {
+        let _ = session.logout();
+        return Ok(json!({ "ok": true, "added": 0, "cached": before, "fetched": 0 }));
+    }
+    let set = wanted
+        .iter()
+        .map(|uid| uid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let fetches = session
+        .uid_fetch(&set, "(UID FLAGS BODY.PEEK[HEADER])")
+        .map_err(|err| format!("取邮件头失败：{err}"))?;
+    let mut rows: Vec<MailSummary> = Vec::new();
+    for fetch in fetches.iter() {
+        let Some(body) = fetch.header() else { continue };
+        let Some(message) = mail_parser::MessageParser::default().parse(body) else {
+            continue;
+        };
+        let uid = fetch
+            .uid
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let flags = format!("{:?}", fetch.flags());
+        let subject = subject_text(&message);
+        let content_type = header_text(&message, "Content-Type");
+        rows.push(MailSummary {
+            uid,
+            subject: if subject.is_empty() {
+                "（无主题）".to_string()
+            } else {
+                subject
+            },
+            from: from_text(&message),
+            date: header_text(&message, "Date"),
+            unread: !flags.contains("Seen"),
+            has_attachments: content_type.to_lowercase().contains("multipart"),
+        });
+    }
+    let _ = session.logout();
+    let fetched = rows.len();
+    let added = save_summaries(store, &rows);
+    Ok(json!({
+        "ok": true,
+        "added": added,
+        "fetched": fetched,
+        "cached": cached_count(store),
+    }))
 }

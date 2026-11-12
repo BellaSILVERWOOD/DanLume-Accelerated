@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 左导航：与旧版 main_window._nav_items 完全一致的 13 项 + 快捷操作 + 今天卡
 import IconGlyph from "../components/IconGlyph.vue";
 import SoftButton from "../components/SoftButton.vue";
@@ -16,6 +16,7 @@ export type PageKey =
   | "docs"
   | "lit"
   | "latex"
+  | "student"
   | "settings";
 
 const props = defineProps<{
@@ -23,6 +24,8 @@ const props = defineProps<{
   /** 右栏停在哪一页（AI / 文献 / 日程）——用来把左侧对应项也点亮 */
   dockTab?: "日程" | "AI" | "文献";
   dockVisible?: boolean;
+  /** 中栏（页面内容）是否显示：关掉时左侧**不应该**再高亮任何页面 */
+  middleVisible?: boolean;
   today: { day: string; week: string; month: string; done: number; total: number };
 }>();
 const emit = defineEmits<{
@@ -31,6 +34,7 @@ const emit = defineEmits<{
   (e: "new-event"): void;
   (e: "new-mail"): void;
   (e: "focus"): void;
+  (e: "mascot"): void;
 }>();
 
 const NAV: { key: PageKey | "ai"; label: string; glyph: GlyphName }[] = [
@@ -45,6 +49,7 @@ const NAV: { key: PageKey | "ai"; label: string; glyph: GlyphName }[] = [
   { key: "docs", label: "文档", glyph: "DOCUMENT" },
   { key: "lit", label: "文献库", glyph: "FOLDER" },
   { key: "latex", label: "公式", glyph: "EDIT" },
+  { key: "student", label: "学生工作", glyph: "CONTACT" },
   { key: "ai", label: "AI", glyph: "INFO" },
   { key: "settings", label: "设置", glyph: "SETTINGS" },
 ];
@@ -57,6 +62,9 @@ function go(item: { key: PageKey | "ai" }) {
 /** AI 项不是页面：右栏打开且停在 AI 标签时算「选中」 */
 function isActive(item: { key: PageKey | "ai" }): boolean {
   if (item.key === "ai") return Boolean(props.dockVisible) && props.dockTab === "AI";
+  // 中栏关掉时页面根本没在显示，左侧就不该硬点着一项
+  // （用户 2026-11-11：同时开过页面和 AI 卡之后，把中栏一关，那一项还亮着）
+  if (props.middleVisible === false) return false;
   return props.current === item.key;
 }
 </script>
@@ -84,6 +92,8 @@ function isActive(item: { key: PageKey | "ai" }): boolean {
       </SoftButton>
       <SoftButton glyph="MAIL" :height="38" @click="emit('new-mail')">新邮件</SoftButton>
       <SoftButton glyph="CLOCK" :height="38" @click="emit('focus')">专注模式</SoftButton>
+      <!-- T2 看板娘悬浮球：桌面置顶小窗，把文件拖进去就直接发给 AI -->
+      <SoftButton glyph="INFO" :height="38" @click="emit('mascot')">看板娘</SoftButton>
     </div>
 
     <div class="spacer" />

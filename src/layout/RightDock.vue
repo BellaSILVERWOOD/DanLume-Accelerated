@@ -1,22 +1,10 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 右栏：日程 / AI / 文献 三个标签（旧版 right_dock.py）
-// AI 标签是真对话：Markdown + KaTeX 渲染，走 Rust 侧的 OpenAI 兼容接口。
-import { computed, nextTick, onMounted, ref, watch } from "vue";
-import IconGlyph from "../components/IconGlyph.vue";
-import SoftButton from "../components/SoftButton.vue";
-import Pill from "../components/Pill.vue";
-import { renderMarkdown } from "../markdown";
-import {
-  aiChatTools,
-  aiSaveSession,
-  aiSessions,
-  aiState,
-  type AiState,
-  type ChatMessage,
-  type ChatSession,
-  type ToolLogEntry,
-  type UpcomingItem,
-} from "../api";
+// AI 标签整块交给 `components/AiPanel.vue`（照旧版 ai_panel.py / ai_api_panel.py 重做：
+// 场景提示词、⋯ 菜单、附件、用量、历史会话、WebUI 内嵌、系统提示词）。
+import { ref, watch } from "vue";
+import AiPanel from "../components/AiPanel.vue";
+import type { UpcomingItem } from "../api";
 
 const props = withDefaults(
   defineProps<{ items: UpcomingItem[]; initialTab?: "日程" | "AI" | "文献" }>(),
@@ -40,133 +28,16 @@ watch(
 
 watch(active, (value) => emit("tab", value));
 
-const messages = ref<{
-  role: "user" | "assistant";
-  text: string;
-  tools?: ToolLogEntry[];
-}[]>([]);
-const draft = ref("");
-const busy = ref(false);
-const error = ref("");
-const state = ref<AiState | null>(null);
-const history = ref<ChatSession[]>([]);
 // AI 全屏：把右栏展开成覆盖整个内容区（用户要求「AI 要能全屏」）
 const wide = ref(localStorage.getItem("danlume.aiWide") === "1");
 function toggleWide() {
   wide.value = !wide.value;
   localStorage.setItem("danlume.aiWide", wide.value ? "1" : "0");
-  void scrollDown();
 }
-const showHistory = ref(false);
-const scroller = ref<HTMLElement | null>(null);
-
-const modelLabel = computed(() => {
-  const value = state.value;
-  if (!value) return "AI";
-  return value.has_key ? value.model || value.name || "AI" : "未配置";
-});
-
-async function refreshState() {
-  try {
-    state.value = await aiState();
-    error.value = state.value.ok ? "" : state.value.error;
-  } catch (err) {
-    error.value = String(err);
-  }
-}
-
-async function loadHistory() {
-  history.value = await aiSessions(30);
-}
-
-async function scrollDown() {
-  await nextTick();
-  if (scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight;
-}
-
-async function send() {
-  const text = draft.value.trim();
-  if (!text || busy.value) return;
-  messages.value.push({ role: "user", text });
-  draft.value = "";
-  busy.value = true;
-  error.value = "";
-  await scrollDown();
-  try {
-    const payload: ChatMessage[] = messages.value.map((one) => ({
-      role: one.role,
-      content: one.text,
-    }));
-    const result = await aiChatTools(payload);
-    messages.value.push({
-      role: "assistant",
-      text: result.text,
-      tools: result.log || [],
-    });
-    try {
-      await aiSaveSession(
-        text.slice(0, 30),
-        state.value?.model || "",
-        JSON.stringify(messages.value),
-      );
-    } catch {
-      // 存历史失败不影响对话
-    }
-  } catch (err) {
-    error.value = String(err);
-  } finally {
-    busy.value = false;
-    await scrollDown();
-  }
-}
-
-function newChat() {
-  messages.value = [];
-  error.value = "";
-  draft.value = "";
-}
-
-function restore(session: ChatSession) {
-  try {
-    const rows = JSON.parse(session.payload || "[]");
-    if (Array.isArray(rows)) {
-      messages.value = rows
-        .filter((one) => one && (one.role === "user" || one.role === "assistant"))
-        .map((one) => ({
-          role: one.role as "user" | "assistant",
-          text: String(one.text ?? one.content ?? ""),
-        }));
-    }
-    showHistory.value = false;
-    scrollDown();
-  } catch {
-    error.value = "这条历史读不出来";
-  }
-}
-
-function onKeydown(event: KeyboardEvent) {
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
-    send();
-  }
-}
-
-onMounted(async () => {
-  await refreshState();
-  await loadHistory();
-});
-
-// 从左侧「AI」切过来时，顺手把配置状态和历史刷新一遍（可能刚在设置里改过 Key）
-watch(active, async (value) => {
-  if (value !== "AI") return;
-  await refreshState();
-  await loadHistory();
-  await scrollDown();
-});
 </script>
 
 <template>
-  <aside class="dock">
+  <aside class="dock" :class="{ wide }">
     <header>
       <div class="tabs">
         <button
@@ -180,16 +51,6 @@ watch(active, async (value) => {
         </button>
       </div>
       <button class="wide-btn" :title="wide ? '还原宽度' : '全屏展开'" @click="toggleWide">{{ wide ? '⤡' : '⤢' }}</button>
-      <span class="spacer" />
-      <button class="icon" title="新对话" @click="newChat">
-        <IconGlyph name="ADD" :size="13" />
-      </button>
-      <button class="icon" title="历史会话" @click="(showHistory = !showHistory), loadHistory()">
-        <IconGlyph name="CLOCK" :size="13" />
-      </button>
-      <button class="icon" title="刷新 AI 配置" @click="refreshState">
-        <IconGlyph name="REFRESH" :size="13" />
-      </button>
     </header>
 
     <div class="body">
@@ -208,72 +69,8 @@ watch(active, async (value) => {
       </template>
 
       <template v-else-if="active === 'AI'">
-        <div class="ai-head">
-          <Pill :text="modelLabel" :font-size="11" />
-          <span class="spacer" />
-          <span v-if="messages.length" class="tiny">{{ messages.length }} 条</span>
-        </div>
-
-        <div v-if="showHistory" class="history">
-          <div class="section-title">历史会话</div>
-          <button
-            v-for="session in history"
-            :key="session.id"
-            class="history-row"
-            @click="restore(session)"
-          >
-            <span class="name">{{ session.title || "（未命名）" }}</span>
-            <span class="meta">{{ session.model }} · {{ session.updated_at.slice(5, 16) }}</span>
-          </button>
-          <div v-if="!history.length" class="empty">还没有历史会话</div>
-        </div>
-
-        <div ref="scroller" class="chat">
-          <div v-if="!messages.length" class="empty">
-            问点什么吧。支持 Markdown 和 LaTeX 公式；Enter 发送，Shift+Enter 换行。
-          </div>
-          <div v-for="(message, index) in messages" :key="index" class="bubble" :class="message.role">
-            <div
-              v-if="message.role === 'assistant'"
-              class="md"
-              v-html="renderMarkdown(message.text)"
-            />
-            <div v-else class="plain">{{ message.text }}</div>
-            <div v-if="message.tools && message.tools.length" class="tools-used">
-              <span class="tool-head">用了 {{ message.tools.length }} 次工具</span>
-              <span
-                v-for="(tool, index2) in message.tools"
-                :key="index2"
-                class="tool-chip"
-                :class="{ bad: !tool.ok }"
-                :title="tool.summary"
-              >
-                {{ tool.name }}
-              </span>
-            </div>
-          </div>
-          <div v-if="busy" class="bubble assistant">
-            <div class="typing">正在思考…</div>
-          </div>
-          <div v-if="error" class="error">{{ error }}</div>
-        </div>
-
-        <div class="composer">
-          <textarea
-            v-model="draft"
-            class="input"
-            rows="3"
-            placeholder="问点什么…（Enter 发送 / Shift+Enter 换行）"
-            @keydown="onKeydown"
-          />
-          <div class="composer-row">
-            <span class="tiny">{{ state?.has_key ? state.base_url : "还没配好 AI" }}</span>
-            <span class="spacer" />
-            <SoftButton variant="primary" :height="28" :font-size="12" :disabled="busy" @click="send">
-              发送
-            </SoftButton>
-          </div>
-        </div>
+        <!-- AI 面板：照旧版 ai_panel.py / ai_api_panel.py 重做（API 服务 / WebUI / 提示词） -->
+        <AiPanel />
       </template>
 
       <template v-else>
@@ -392,6 +189,108 @@ header {
   align-items: center;
   gap: 6px;
   padding: 2px 2px 4px;
+}
+/* ---- AI 里的「对话 / 网页版」子标签 ---- */
+.sub-tabs {
+  flex: none;
+  display: flex;
+  gap: 3px;
+  padding: 2px;
+  border-radius: var(--radius-pill);
+  background: var(--card-alt);
+  align-self: flex-start;
+}
+.sub-tab {
+  height: 22px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.sub-tab.on {
+  background: var(--card);
+  color: var(--text);
+  font-weight: 600;
+}
+.web-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.web-tip {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+.web-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.web-url {
+  flex: 1;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.web-btn {
+  flex: none;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border-soft);
+  background: var(--card);
+  color: var(--text-soft);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.web-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.web-btn.primary {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--card));
+}
+.web-warn {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+.web-frame {
+  flex: 1;
+  min-height: 220px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  background: #fff;
+}
+.web-iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+  background: #fff;
+}
+.web-foot {
+  font-size: 10.5px;
+  color: var(--faint);
+  line-height: 1.6;
 }
 .history {
   display: flex;
@@ -550,6 +449,14 @@ header {
   color: var(--danger);
   border: 1px solid var(--danger);
   background: transparent;
+}
+/* 「本次注入了 N 条记忆」：回答底下的一行小字（memory.rs 注入的回执） */
+.mem-note {
+  margin-top: 5px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border-soft);
+  font-size: 10.5px;
+  color: var(--muted);
 }
 
 /* AI 全屏：占满中间内容区（左导航右侧到底），可再点一次还原 */

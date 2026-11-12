@@ -4,10 +4,11 @@
 // 树的做法：不递归挂组件，而是把「当前展开状态」展平成一串可见行（rows），
 // 每行带 depth 做缩进。展开状态、已加载的子项都按绝对路径存在两个 Record 里，
 // 所以同一个目录只会挂一次、也只会请求一次，天然不会递归套自己。
-import { computed, onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
 import SoftButton from "../components/SoftButton.vue";
 import IconBadge from "../components/IconBadge.vue";
 import PdfViewer from "../components/PdfViewer.vue";
+import { usePanelFullscreen } from "../layout/fullscreen";
 import {
   defaultDocsDir,
   listDir,
@@ -34,6 +35,40 @@ const preview = ref("");
 const message = ref("");
 const busy = ref(false);
 const shortcuts = ref<{ label: string; path: string }[]>([]);
+
+// 全屏阅读（旧版 page_docs.toggle_fullscreen）：收起标题行 / 目录树，让阅读区铺满，
+// 同时 App.vue 会把标题栏 / 左导航 / 右栏藏起来；Esc 退出。
+const { active: fullscreen, toggle: toggleFullscreen } = usePanelFullscreen();
+const viewer = ref<any>(null);
+
+/**
+ * 全屏样式写成**内联样式**：以前用 `.page.full .body { display: block }` 这类选择器，
+ * 实测没生效（阅读区被挤成 200px，全是换行的字），内联样式优先级最高、不会再被别处覆盖。
+ */
+const overlayStyle = computed(() =>
+  fullscreen.value
+    ? {
+        position: "fixed" as const,
+        inset: "0",
+        zIndex: 55,
+        padding: "14px 16px 12px",
+        background: "var(--card)",
+        height: "auto",
+      }
+    : undefined,
+);
+const bodyStyle = computed(() => (fullscreen.value ? { display: "block" } : undefined));
+const previewStyle = computed(() =>
+  fullscreen.value ? { width: "100%", minWidth: "0", height: "100%" } : undefined,
+);
+
+// 进出全屏后阅读区宽度变了：让 PDF 按新宽度重新排一次（否则还是按旧宽度画的窄页）
+watch(fullscreen, async () => {
+  await nextTick();
+  window.setTimeout(() => {
+    viewer.value?.repaint?.();
+  }, 80);
+});
 
 /** 展平之后的一行：真实条目 + 缩进层级；placeholder 是“空目录”占位 */
 type TreeRow = {
@@ -128,6 +163,8 @@ async function openDir(path: string) {
     message.value = "";
     selected.value = null;
     preview.value = "";
+    // 进了别的目录就别继续全屏了，不然退出全屏按钮在标题栏里（被藏了）找不着
+    if (fullscreen.value) toggleFullscreen();
   } catch (err) {
     message.value = String(err);
   } finally {
@@ -268,8 +305,8 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="page">
-    <div class="page-head">
+  <div class="page" :class="{ full: fullscreen }" :style="overlayStyle">
+    <div v-show="!fullscreen" class="page-head">
       <div class="titles">
         <h1 class="h1">文档</h1>
         <div class="muted">PDF / Word / PPT / Excel 文件都能直接看</div>
@@ -284,11 +321,13 @@ onMounted(async () => {
       <SoftButton :height="32" :font-size="12.5" @click="selected && openPath(selected.path)">
         用系统程序打开
       </SoftButton>
-      <SoftButton :height="32" :font-size="12.5" glyph="MAXIMIZE">全屏</SoftButton>
+      <SoftButton :height="32" :font-size="12.5" glyph="MAXIMIZE" @click="toggleFullscreen">
+        {{ fullscreen ? "退出全屏" : "全屏" }}
+      </SoftButton>
     </div>
 
-    <div class="body">
-      <div class="side">
+    <div class="body" :style="bodyStyle">
+      <div v-show="!fullscreen" class="side">
         <div class="side-title">分类 / 最近目录</div>
         <button
           v-for="item in shortcuts"
@@ -304,7 +343,7 @@ onMounted(async () => {
         </div>
       </div>
 
-      <div class="list">
+      <div v-show="!fullscreen" class="list">
         <div class="list-head">
           <button class="up" :disabled="!parentPath" @click="openDir(parentPath)">
             ↑ 上一层
@@ -362,10 +401,19 @@ onMounted(async () => {
         </div>
       </div>
 
-      <div class="preview">
+      <div class="preview" :style="previewStyle">
         <div class="preview-head">
           <span class="name">{{ selected ? selected.name : "预览" }}</span>
           <span class="spacer" />
+          <span v-if="fullscreen" class="tiny">Esc 退出全屏</span>
+          <SoftButton
+            v-if="fullscreen"
+            :height="26"
+            :font-size="11.5"
+            @click="toggleFullscreen"
+          >
+            退出全屏
+          </SoftButton>
           <SoftButton
             v-if="selected"
             :height="26"
@@ -379,6 +427,7 @@ onMounted(async () => {
           <template v-if="selected">
             <PdfViewer
               v-if="isPdf"
+              ref="viewer"
               class="pdf-host"
               :path="selected.path"
               mode="multi"
@@ -411,6 +460,26 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  height: 100%;
+}
+/* 全屏阅读：目录树 / 标题行都藏了，预览区铺满整个窗口。
+   用 position:fixed 盖住窗口，不再依赖父容器的宽度（实测在 flex 里只剩一个孩子时
+   宽度会被算成内容宽度、阅读区被挤成 110px）。 */
+.page.full {
+  gap: 0;
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+  padding: 14px 16px 12px;
+  background: var(--card);
+}
+.page.full .body {
+  display: block;
+  min-height: 0;
+}
+.page.full .preview {
+  width: auto;
+  min-width: 0;
   height: 100%;
 }
 .body {

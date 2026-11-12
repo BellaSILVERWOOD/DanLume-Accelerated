@@ -23,6 +23,43 @@ const unread = ref(0);
 const onlyUnread = ref(false);
 const busy = ref(false);
 const message = ref("");
+// 旧版 page_notices 的两个筛选：按来源多选 + 关键词搜索
+const keyword = ref("");
+const pickedSources = ref<string[]>([]);
+
+/** 当前列表里出现过的来源（去重、按出现顺序） */
+const sources = computed(() => {
+  const out: string[] = [];
+  for (const item of items.value) {
+    const name = item.source || "通知";
+    if (!out.includes(name)) out.push(name);
+  }
+  return out;
+});
+
+/** 过滤后的列表：来源（空=全部） ∧ 关键词（标题/链接） */
+const visible = computed(() => {
+  const text = keyword.value.trim().toLowerCase();
+  return items.value.filter((item) => {
+    const source = item.source || "通知";
+    if (pickedSources.value.length && !pickedSources.value.includes(source)) return false;
+    if (!text) return true;
+    return (
+      (item.title || "").toLowerCase().includes(text) ||
+      (item.url || "").toLowerCase().includes(text)
+    );
+  });
+});
+
+function toggleSource(name: string) {
+  const at = pickedSources.value.indexOf(name);
+  if (at >= 0) pickedSources.value.splice(at, 1);
+  else pickedSources.value.push(name);
+}
+
+function clearSources() {
+  pickedSources.value = [];
+}
 
 // ---- 服务器公告
 const serverItems = ref<ServerAnnouncement[]>([]);
@@ -157,6 +194,22 @@ onUnmounted(() => {
         <input v-model="onlyUnread" type="checkbox" @change="load" />
         只看未读
       </label>
+      <input v-model="keyword" class="search" type="search" placeholder="搜索标题 / 链接…" />
+      <div class="chips">
+        <button class="chip" :class="{ on: !pickedSources.length }" @click="clearSources">全部来源</button>
+        <button
+          v-for="name in sources"
+          :key="name"
+          class="chip"
+          :class="{ on: pickedSources.includes(name) }"
+          @click="toggleSource(name)"
+        >
+          {{ name }}
+        </button>
+      </div>
+      <span v-if="visible.length !== items.length" class="muted">
+        筛出 {{ visible.length }} / {{ items.length }} 条
+      </span>
       <span v-if="message" class="muted">{{ message }}</span>
     </div>
 
@@ -222,8 +275,11 @@ onUnmounted(() => {
       <div v-if="!items.length" class="empty">
         还没有抓到通知，点右上角「刷新抓取」（先在 设置 → 仪表板 里填通知来源地址）
       </div>
+      <div v-else-if="!visible.length" class="empty">
+        当前筛选下没有通知（{{ pickedSources.join("、") || "全部来源" }}{{ keyword ? ` · 关键词「${keyword}」` : "" }}）
+      </div>
       <button
-        v-for="item in items"
+        v-for="item in visible"
         :key="item.id"
         class="row"
         :class="{ unread: !item.read_at }"
@@ -261,6 +317,36 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+/* 来源筛选：搜索框 + 来源 chip（旧版 page_notices 的多选筛选） */
+.filter {
+  flex-wrap: wrap;
+}
+.filter .search {
+  width: 200px;
+  font-size: 12px;
+  padding: 5px 9px;
+}
+.chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.chip {
+  border: 1px solid var(--border-soft);
+  background: var(--card);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.chip.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 /* ---- 服务器公告分区 ---- */
 .server {

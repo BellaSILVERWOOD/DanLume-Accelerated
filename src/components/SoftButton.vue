@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 对应旧 widgets.SoftButton：primary / ghost / subtle 三种，可带图标、可设高度
 import IconGlyph from "./IconGlyph.vue";
 import type { GlyphName } from "../icons";
@@ -114,13 +114,15 @@ defineEmits<{ (e: "click"): void }>();
 .soft:active:not(:disabled) {
   transform: translateY(0.5px);
 }
-/* macOS 风格层：轻微内高光 + hover 只提亮不位移（Ventura 的按钮不跳） */
+/* 平面按钮：**不要光泽**（用户 2026-11-11：「整个软件里面所有这种按钮都不要做光泽」）。
+   以前这里有 `inset 0 1px 0 rgba(255,255,255,.6)` 的顶部内高光，在深色主按钮上就是一道亮边，
+   hover 时还会换成一层投影，看起来像玻璃反光。现在统一去掉，只留 1px 描边本身。 */
 .soft {
-  box-shadow: var(--inner-highlight, none), 0 1px 1px rgba(0, 0, 0, 0.04);
-  transition: background 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+  box-shadow: none;
+  transition: background 140ms ease, border-color 140ms ease;
 }
 .soft:hover:not(:disabled) {
-  box-shadow: var(--shadow-card, none);
+  box-shadow: none;
 }
 .soft.primary {
   border: 1px solid color-mix(in srgb, var(--accent) 70%, #000 12%);

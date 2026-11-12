@@ -419,6 +419,10 @@ fn apply_session(store: &Store, value: &Value) -> Result<(), ApiError> {
         if let Some(name) = account.get("username").and_then(|one| one.as_str()) {
             let _ = store.set_setting("server_username", name);
         }
+        // 角色（user / admin）：登录响应里可能没有，没有就等 `/me` 补上
+        if let Some(role) = account.get("role").and_then(|one| one.as_str()) {
+            let _ = store.set_setting("server_role", role);
+        }
         if let Some(id) = account.get("id") {
             let text = id
                 .as_i64()
@@ -545,6 +549,52 @@ pub fn request_email_code(email: &str) -> Result<Value, ApiError> {
     }))
 }
 
+/// 忘记密码第一步：请求重置验证码（`purpose=reset` 那套，和注册码互不干扰）
+pub fn request_reset_code(email: &str) -> Result<Value, ApiError> {
+    let email = email.trim();
+    if email.is_empty() {
+        return Err(ApiError::config("邮箱不能为空"));
+    }
+    if !email_looks_valid(email) {
+        return Err(ApiError::config("邮箱格式不对"));
+    }
+    let store = crate::get_store();
+    let url = endpoint(&store, "/api/v1/password/request-code")?;
+    let value = request_json("POST", &url, Some(&json!({ "email": email })), None)?;
+    Ok(json!({
+        "ok": true,
+        "email": email,
+        "message": value.get("message").and_then(|one| one.as_str()).unwrap_or(""),
+        "expires_in": value.get("expires_in").and_then(|one| one.as_i64()).unwrap_or(600),
+        "cooldown": value.get("cooldown").and_then(|one| one.as_i64()).unwrap_or(60),
+        "raw": value,
+    }))
+}
+
+/// 忘记密码第二步：验证码 + 新口令，成功后用新口令登录
+pub fn reset_password(email: &str, code: &str, password: &str) -> Result<Value, ApiError> {
+    let email = email.trim();
+    let code = code.trim();
+    if email.is_empty() || code.is_empty() || password.is_empty() {
+        return Err(ApiError::config("邮箱、验证码、新口令都要填"));
+    }
+    if password.chars().count() < 8 {
+        return Err(ApiError::config("新口令至少 8 位"));
+    }
+    let store = crate::get_store();
+    let url = endpoint(&store, "/api/v1/password/reset")?;
+    let value = request_json(
+        "POST",
+        &url,
+        Some(&json!({ "email": email, "code": code, "password": password })),
+        None,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "message": value.get("message").and_then(|one| one.as_str()).unwrap_or("密码已重置"),
+    }))
+}
+
 /// 拼 `/register` 的请求体。`invite_code` / `code` 传 None 或空白都不带这个字段
 /// （老服务器不认识 `code`，但空着传也不会出错；这里干净一点）。
 fn register_body(
@@ -655,7 +705,28 @@ pub fn logout() -> Value {
 
 pub fn me() -> Result<Value, ApiError> {
     let store = crate::get_store();
-    authed(&store, "GET", "/api/v1/me", None)
+    let value = authed(&store, "GET", "/api/v1/me", None)?;
+    // 顺手把角色记下来：客户端要靠它决定「管理员入口」显不显示
+    if let Some(account) = value.get("account").or_else(|| value.get("user")) {
+        if let Some(role) = account.get("role").and_then(|one| one.as_str()) {
+            let _ = store.set_setting("server_role", role);
+        }
+        if let Some(name) = account.get("username").and_then(|one| one.as_str()) {
+            let _ = store.set_setting("server_username", name);
+        }
+    } else if let Some(role) = value.get("role").and_then(|one| one.as_str()) {
+        let _ = store.set_setting("server_role", role);
+    }
+    Ok(value)
+}
+
+/// 这台机器上登录的服务器账号是不是管理员（`/me` 里那个 role；没登录就是普通用户）
+pub fn is_admin(store: &Store) -> bool {
+    logged_in(store)
+        && store
+            .setting("server_role")
+            .map(|text| text.trim().eq_ignore_ascii_case("admin"))
+            .unwrap_or(false)
 }
 
 pub fn devices() -> Result<Value, ApiError> {
@@ -710,6 +781,8 @@ pub fn state() -> Value {
         "enabled": server_enabled(&store),
         "logged_in": logged_in(&store),
         "username": store.setting("server_username").unwrap_or_default(),
+        "role": store.setting("server_role").unwrap_or_default(),
+        "is_admin": is_admin(&store),
         "account_id": store.setting("server_account_id").unwrap_or_default(),
         "device_fingerprint": device_fingerprint(&store),
         "token_expires_at": store.setting("server_token_expires_at").unwrap_or_default(),

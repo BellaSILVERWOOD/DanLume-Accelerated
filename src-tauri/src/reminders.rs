@@ -1,4 +1,4 @@
-﻿//! 「该出发了」提醒（对应旧版 `reminders.py::check_departure`）。
+//! 「该出发了」提醒（对应旧版 `reminders.py::check_departure`）。
 //!
 //! 旧版靠 `geo` 模块算距离（地点坐标 + 步行/骑车速度）；v2 还没有地点库，
 //! 所以这里用同一批设置键做**时间估算**：
@@ -177,19 +177,111 @@ mod tests {
 }
 
 /// 旧版 `auto_done_enabled`：把过去日期还没勾完成的日程自动标成已完成
+///
+/// ⚠ 重复日程（`repeat` 非空）必须跳过：母事件代表整条系列，把它标成已完成会让
+/// 展开出来的**每一次**（包括以后每一周）都显示为已完成——用户反馈的第二个问题。
+/// 重复日程的每一次要不要自动完成，见 `auto_done_occurrences`。
 pub fn auto_done(store: &Store) -> usize {
+    // 默认值与旧版一致：`main_window.refresh_all` 用的是 get_setting(..., "1")
     let enabled = store
         .setting("auto_done_enabled")
         .map(|text| text.trim() != "0")
-        .unwrap_or(false);
+        .unwrap_or(true);
     if !enabled {
         return 0;
     }
-    let today = Local::now().format("%Y-%m-%d").to_string();
-    let conn = store.connection();
-    conn.execute(
-        "UPDATE events SET done = 1, updated_at = ?1 WHERE done = 0 AND date < ?2",
-        rusqlite::params![crate::now_str(), today],
-    )
-    .unwrap_or(0)
+    let now = Local::now();
+    let today = now.format("%Y-%m-%d").to_string();
+    // **今天已经结束的也要勾**：旧版 `store.auto_complete_past` 的条件是
+    // `date < today OR (date = today AND end_time <= now)`。
+    // 这里以前只判 `date < today`，所以「08:00–09:40 的课 09:45 还挂着未完成」。
+    let hhmm = now.format("%H:%M").to_string();
+    let changed = {
+        // 连接（MutexGuard）必须在自己的块里用完就放，不然下面 auto_done_occurrences
+        // 再拿一次连接会自己等自己（标准库 Mutex 不可重入）
+        let conn = store.connection();
+        conn.execute(
+            "UPDATE events SET done = 1, updated_at = ?1
+             WHERE done = 0 AND (repeat IS NULL OR repeat = '')
+               AND (
+                 date < ?2
+                 OR (date = ?2 AND COALESCE(NULLIF(end_time, ''), '23:59') <= ?3)
+               )",
+            rusqlite::params![crate::now_str(), today, hhmm],
+        )
+        .unwrap_or(0)
+    };
+    changed + auto_done_occurrences(store, &today)
+}
+
+/// 重复日程：把**已经过去的那几次**记进 `done_dates`，母事件不动。
+///
+/// 只处理到「今天之前」为止，今天这一次还在进行中，不替用户勾。
+fn auto_done_occurrences(store: &Store, today: &str) -> usize {
+    let masters: Vec<(i64, String, String, String, String)> = {
+        let conn = store.connection();
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT id, date, repeat, repeat_skip, done_dates FROM events
+             WHERE repeat IS NOT NULL AND repeat <> '' AND date < ?1",
+        ) {
+            if let Ok(mapped) = stmt.query_map(rusqlite::params![today], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3).unwrap_or_default(),
+                    row.get::<_, String>(4).unwrap_or_default(),
+                ))
+            }) {
+                for one in mapped.flatten() {
+                    out.push(one);
+                }
+            }
+        }
+        out
+    };
+    let mut touched = 0usize;
+    let yesterday = (Local::now().date_naive() - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    for (id, start_date, rule, skip, done_dates) in masters {
+        let days = crate::store::recurrence_days(&start_date, &rule, &start_date, &yesterday);
+        if days.is_empty() {
+            continue;
+        }
+        let skipped: Vec<String> = skip
+            .split(',')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect();
+        let mut marked: Vec<String> = done_dates
+            .split(',')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect();
+        let mut changed = false;
+        for day in days {
+            if skipped.iter().any(|one| one == &day) || marked.iter().any(|one| one == &day) {
+                continue;
+            }
+            marked.push(day);
+            changed = true;
+        }
+        if !changed {
+            continue;
+        }
+        marked.sort();
+        let conn = store.connection();
+        if conn
+            .execute(
+                "UPDATE events SET done_dates = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![marked.join(","), crate::now_str(), id],
+            )
+            .is_ok()
+        {
+            touched += 1;
+        }
+    }
+    touched
 }

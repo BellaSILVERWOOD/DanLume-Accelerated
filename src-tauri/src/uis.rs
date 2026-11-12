@@ -67,12 +67,24 @@ impl Jar {
         self.pairs.is_empty()
     }
 
+    /// 把另一个 jar 并进来（同名以对方为准）。抓会话时按站点分批收集，最后合并成一份。
+    pub fn extend_from(&mut self, other: &Jar) {
+        for (name, value) in &other.pairs {
+            self.set(name, value);
+        }
+    }
+
     pub fn count(&self) -> usize {
         self.pairs.len()
     }
 
     pub fn names(&self) -> Vec<String> {
         self.pairs.iter().map(|(name, _)| name.clone()).collect()
+    }
+
+    /// 只读浏览（诊断日志用：打印名字和值的前几位）
+    pub fn entries(&self) -> &[(String, String)] {
+        &self.pairs
     }
 
     pub fn to_header(&self) -> String {
@@ -171,28 +183,61 @@ pub fn clear_session(store: &Store) {
 
 pub fn status(store: &Store) -> Value {
     let jar = load_session(store);
+    let names: Vec<String> = jar.as_ref().map(|one| one.names()).unwrap_or_default();
+    // 新 ID 系统（id.fudan.edu.cn）不发 CASTGC；会话有没有用要看业务站的 cookie
+    let has_service_session = names.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "CASTGC"
+                | "_normandy_session"
+                | "_legacy_normandy_session"
+                | "log_session_id"
+                | "SESS_ID"
+        )
+    });
     json!({
         "username": store.setting(USER_KEY).unwrap_or_default(),
         "has_session": jar.is_some(),
         "cookies": jar.as_ref().map(|one| one.pairs.len()).unwrap_or(0),
         "has_castgc": jar.as_ref().and_then(|one| one.get("CASTGC")).is_some(),
+        "has_service_session": has_service_session,
+        "session_names": names,
         "remember_password": store
             .setting("uis_autofill")
-            .map(|text| text.trim() == "1")
-            .unwrap_or(false),
+            .map(|text| text.trim() != "0")
+            .unwrap_or(true),
         "has_saved_password": store
             .setting(PASS_KEY)
             .map(|text| !text.trim().is_empty())
             .unwrap_or(false),
+        // 会话是什么时候抓的（界面显示「抓取时间」用；解不开就当空）
+        "saved_at": session_saved_at(store),
     })
+}
+
+/// 会话里记的抓取时间（`save_session` 写进去的 `at`）；没有会话时返回空串。
+pub fn session_saved_at(store: &Store) -> String {
+    let Some(encrypted) = store.setting(SESSION_KEY) else {
+        return String::new();
+    };
+    if encrypted.trim().is_empty() {
+        return String::new();
+    }
+    let Ok(raw) = crate::secrets::unprotect(&encrypted) else {
+        return String::new();
+    };
+    serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|value| value.get("at").and_then(|one| one.as_str()).map(|one| one.to_string()))
+        .unwrap_or_default()
 }
 
 /// 密码：默认不落库；只有用户开了 uis_autofill 才 DPAPI 保存
 pub fn remember_password(store: &Store, password: &str) -> Result<(), String> {
     let on = store
         .setting("uis_autofill")
-        .map(|text| text.trim() == "1")
-        .unwrap_or(false);
+        .map(|text| text.trim() != "0")
+        .unwrap_or(true);
     if !on || password.is_empty() {
         return Ok(());
     }
@@ -385,11 +430,7 @@ mod tests {
     #[test]
     #[ignore]
     fn uis_real_login() {
-        std::env::set_var(
-            "LUMINA_DATA_DIR",
-            r"E:\FIles\Lena‘s Files\Work\znw\Agent\data",
-        );
-        let store = Store::open().expect("打不开数据库");
+        let store = crate::testdata::real_store("uis");
         let user = store.setting(USER_KEY).unwrap_or_default();
         let pwd = saved_password(&store);
         println!("学号 = {user}，密码长度 = {}", pwd.len());

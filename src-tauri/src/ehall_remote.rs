@@ -1,4 +1,4 @@
-﻿//! eHall 卡片"会话直连"刷新（对应旧版 `ehall_bridge.py`）。
+//! eHall 卡片"会话直连"刷新（对应旧版 `ehall_bridge.py`）。
 //!
 //! 与粘贴抓取的关系：解析逻辑完全复用 `ehall_grab::store_cache`（同一套正则/字段），
 //! 这里只负责"带着 UIS 会话把页面取回来"。取不到就报错并保留原有缓存，不清空。
@@ -58,6 +58,12 @@ pub fn refresh_all(store: &Store) -> Value {
     let mut results: Vec<Value> = Vec::new();
     let mut need_login = false;
     for (key, title, source_key) in CARDS {
+        // 空教室是「交互卡」：得先在空教室页里选好校区/教学楼再看结果，批量同步替不了它，
+        // 而且通用解析会把结构化缓存（`rooms`）覆盖成一段碎文字。
+        // 旧版 `ehall_bridge.INTERACTIVE_CARDS` 同样是跳过，不是抓。
+        if key == "empty_room" {
+            continue;
+        }
         let url = card_url(store, source_key);
         if url.is_empty() {
             results.push(json!({ "key": key, "title": title, "ok": false, "error": "没填地址" }));

@@ -1,16 +1,258 @@
 <script setup lang="ts">
 // 文献库：读旧库 papers 表，项目 / 星级 / 搜索筛选，右侧详情 + 引用
-import { computed, onMounted, ref } from "vue";
+// 另外接上了「方法流程图」（对齐旧版 lit_flow.py）：让模型把论文拆成步骤，
+// 前端用 CSS + SVG 自己画节点图（不引第三方图库），也能降级成纯文本步骤列表。
+import { computed, onMounted, ref, watch } from "vue";
 import SoftButton from "../components/SoftButton.vue";
 import Pill from "../components/Pill.vue";
 import IconBadge from "../components/IconBadge.vue";
 import {
+  aiState,
+  endnoteDetect,
+  endnoteOpen,
+  litFlowDelete,
+  litFlowGenerate,
+  litFlowLoad,
   openPath,
   paperCitation,
   paperUpdate,
+  papersDownload,
   papersList,
+  pickFiles,
+  papersAdd,
+  papersSearch,
+  refsAddDoi,
+  refsDelete,
+  refsExport,
+  refsImport,
+  refsList,
+  revealPath,
+  type LitFlow,
   type Paper,
+  type PaperSearchHitWithCoverage,
+  type RefEntry,
 } from "../api";
+
+// ---- 在线检索（arXiv + Crossref），旧版 lit.search_all —— Rust 以前没有
+//
+// 两个用户反馈：
+// * 「（搜 MRI）怎么可能只有 20 条啊」→ 以前固定 10 条/来源、没有翻页；现在每页 20 条/来源 + 「再看 20 条」+ 总量；
+// * 「检索结果和 crossfield 疑似没有任何关系」→ 多个关键词现在**按 AND 搜**，结果里每个词都必须出现
+//   （arXiv 检索式用 `all:"A" AND all:"B"`，Crossref 的结果再过滤一遍）。
+const PAGE = 20;
+const searchOpen = ref(false);
+const searchText = ref("");
+const searchHits = ref<PaperSearchHitWithCoverage[]>([]);
+const searchBusy = ref(false);
+const searchMoreBusy = ref(false);
+const searchMsg = ref("");
+const searchOffset = ref(0);
+const searchMore = ref(false);
+const searchTotals = ref<{ arxiv?: number; crossref?: number; semantic?: number }>({});
+const searchTerms = ref<string[]>([]);
+const searchRelaxed = ref(false);
+
+const searchTotalText = computed(() => {
+  const crossref = searchTotals.value.crossref || 0;
+  const arxiv = searchTotals.value.arxiv || 0;
+  const semantic = searchTotals.value.semantic || 0;
+  const parts: string[] = [];
+  // 多关键词时 Crossref 报的「总量」是**未过滤**的模糊命中数（几十万条跟关键词只有一半关系），
+  // 摆出来只会误导，所以只在单词检索时显示它。
+  if (arxiv > 0) parts.push(`arXiv 约 ${arxiv.toLocaleString()} 条`);
+  if (crossref > 0 && searchTerms.value.length <= 1) {
+    parts.push(`Crossref 约 ${crossref.toLocaleString()} 条`);
+  }
+  if (semantic > 0 && searchTerms.value.length <= 1) {
+    parts.push(`Semantic Scholar 约 ${semantic.toLocaleString()} 条`);
+  }
+  return parts.join(" · ");
+});
+
+async function searchOnline() {
+  const query = searchText.value.trim();
+  if (!query) {
+    searchMsg.value = "先写个关键词（比如 transformer reasoning）";
+    return;
+  }
+  searchBusy.value = true;
+  searchHits.value = [];
+  searchOffset.value = 0;
+  searchMore.value = false;
+  searchTotals.value = {};
+  searchTerms.value = [];
+  searchRelaxed.value = false;
+  searchMsg.value = "正在搜 arXiv / Crossref / Semantic Scholar…";
+  try {
+    const result = await papersSearch(query, PAGE, 0);
+    searchHits.value = result.results || [];
+    searchTotals.value = result.totals || {};
+    searchTerms.value = result.terms || [];
+    searchRelaxed.value = !!result.relaxed;
+    searchMore.value = !!result.more;
+    searchOffset.value = PAGE;
+    searchMsg.value = result.ok
+      ? describeSearch(result)
+      : (result.errors || []).join("；") || "检索失败";
+  } catch (err) {
+    searchMsg.value = `检索失败：${String(err)}`;
+  } finally {
+    searchBusy.value = false;
+  }
+}
+
+function describeSearch(result: {
+  counts?: { arxiv: number; crossref: number; semantic?: number };
+  totals?: { arxiv?: number; crossref?: number; semantic?: number };
+  errors?: string[];
+}): string {
+  const counts = result.counts || { arxiv: 0, crossref: 0, semantic: 0 };
+  const terms = searchTerms.value;
+  const errors = (result.errors || []).length ? `（${(result.errors || []).join("；")}）` : "";
+  if (!searchHits.value.length) {
+    const why = terms.length > 1
+      ? `没有同时包含「${terms.join("」「")}」的文献——可以少写一个关键词，或者换个更常见的说法`
+      : "没搜到文献";
+    return `${why}${errors}`;
+  }
+  if (searchRelaxed.value) {
+    // 严格匹配为空、自动放宽：说清楚，并且每条会标「命中 2/3 个词」
+    return `没有同时包含「${terms.join("」「")}」的文献；下面是含其中一部分的（按命中词数排序，每条标了「命中 N/${terms.length} 个词」）${errors}`;
+  }
+  const rule = terms.length > 1 ? `（要求「${terms.join("」「")}」都出现）` : "";
+  const semantic = counts.semantic || 0;
+  const head = `这一页 ${searchHits.value.length} 条（arXiv ${counts.arxiv} + Crossref ${counts.crossref}` +
+    `${semantic ? ` + Semantic Scholar ${semantic}` : ""}，已去重）${rule}`;
+  const totals = searchTotalText.value ? `；库里的总量：${searchTotalText.value}` : "";
+  const more = searchMore.value ? "；点「再看 20 条」继续翻" : "";
+  return `${head}${totals}${more}${errors}`;
+}
+
+/** 再看下一页（每个来源都往后翻一页，结果追加在后面） */
+async function searchMoreResults() {
+  const query = searchText.value.trim();
+  if (!query || searchMoreBusy.value) return;
+  searchMoreBusy.value = true;
+  searchMsg.value = "正在读下一页…";
+  try {
+    const result = await papersSearch(query, PAGE, searchOffset.value);
+    const known = new Set(
+      searchHits.value.map((one) => (one.doi || one.title || "").toLowerCase()),
+    );
+    const fresh = (result.results || []).filter(
+      (one) => !known.has((one.doi || one.title || "").toLowerCase()),
+    );
+    searchHits.value = [...searchHits.value, ...fresh];
+    searchTotals.value = result.totals || searchTotals.value;
+    searchMore.value = !!result.more && fresh.length > 0;
+    searchOffset.value += PAGE;
+    searchMsg.value = `又加了 ${fresh.length} 条，现在共 ${searchHits.value.length} 条` +
+      (searchTotalText.value ? `；库里总量：${searchTotalText.value}` : "");
+  } catch (err) {
+    searchMsg.value = `读取下一页失败：${String(err)}`;
+  } finally {
+    searchMoreBusy.value = false;
+  }
+}
+
+async function addHit(hit: PaperSearchHitWithCoverage) {
+  const result = await papersAdd(hit, project.value || "");
+  searchMsg.value = result.ok ? `已加入文献库：${hit.title.slice(0, 40)}` : `加入失败：${result.error}`;
+  if (result.ok) await load();
+}
+
+// ---- 参考文献层（旧版 refs.py）
+const refsOpen = ref(false);
+const refsItems = ref<RefEntry[]>([]);
+const refsBusy = ref(false);
+const refsMsg = ref("");
+const doiInput = ref("");
+
+async function loadRefs() {
+  const result = await refsList(300);
+  refsItems.value = result.items || [];
+}
+
+async function openRefs() {
+  refsOpen.value = !refsOpen.value;
+  if (refsOpen.value) await loadRefs();
+}
+
+async function importRefs() {
+  const picked = await pickFiles(
+    [{ name: "BibTeX / RIS", extensions: ["bib", "bibtex", "ris", "txt"] }],
+    false,
+  );
+  if (!picked.length) return;
+  refsBusy.value = true;
+  refsMsg.value = "正在导入…";
+  try {
+    const result = await refsImport({ path: picked[0] });
+    refsMsg.value = result.ok
+      ? `导入完成：解析 ${result.parsed} 条，新增 ${result.added} 条（重复 ${result.skipped} 条）`
+      : `导入失败：${result.error}`;
+    await loadRefs();
+  } finally {
+    refsBusy.value = false;
+  }
+}
+
+async function addDoi() {
+  const doi = doiInput.value.trim();
+  if (!doi) {
+    refsMsg.value = "先粘一个 DOI（如 10.1145/3531146）";
+    return;
+  }
+  refsBusy.value = true;
+  refsMsg.value = "正在问 Crossref…";
+  try {
+    const result = await refsAddDoi(doi);
+    refsMsg.value = result.ok
+      ? result.added
+        ? `已加入：${result.entry?.title || doi}`
+        : "这条已经在库里了"
+      : `加失败：${result.error}`;
+    if (result.ok) doiInput.value = "";
+    await loadRefs();
+  } finally {
+    refsBusy.value = false;
+  }
+}
+
+async function exportRefs(format: "ris" | "bibtex" | "enw") {
+  refsBusy.value = true;
+  try {
+    const result = await refsExport(format);
+    refsMsg.value = result.ok ? `已导出到 ${result.path}` : `导出失败：${result.error}`;
+    if (result.ok && result.path) {
+      lastExport.value = result.path;
+      void revealPath(result.path);
+    }
+  } finally {
+    refsBusy.value = false;
+  }
+}
+
+// EndNote 检测（旧版 endnote.detect）：装了就直接拿它打开导出的文件，没装就给一句话说明
+const endnote = ref<{ found: boolean; path: string; summary: string } | null>(null);
+const lastExport = ref("");
+const endnoteNote = ref("");
+
+async function openInEndnote() {
+  if (!lastExport.value) return;
+  endnoteNote.value = "正在叫 EndNote…";
+  try {
+    const result = await endnoteOpen(lastExport.value);
+    endnoteNote.value = result.ok ? "已经在 EndNote 里打开" : result.error;
+  } catch (err) {
+    endnoteNote.value = `打不开：${String(err)}`;
+  }
+}
+
+async function removeRef(id: number) {
+  await refsDelete(id);
+  await loadRefs();
+}
 
 const items = ref<Paper[]>([]);
 const projects = ref<{ name: string; total: number }[]>([]);
@@ -23,6 +265,15 @@ const selected = computed(
   () => items.value.find((item) => item.id === selectedId.value) || items.value[0] || null,
 );
 
+// ---- 流程图 ----
+const flow = ref<LitFlow | null>(null);
+const flowOpen = ref(false);
+const flowBusy = ref(false);
+const flowMsg = ref("");
+const flowMode = ref<"graph" | "list">("graph");
+const aiReady = ref(true);
+const flowNodes = computed(() => flow.value?.nodes || []);
+
 async function load() {
   const result = await papersList(project.value, starsMin.value, keyword.value);
   items.value = result.items || [];
@@ -31,6 +282,124 @@ async function load() {
     selectedId.value = items.value.length ? items.value[0].id : null;
   }
   message.value = items.value.length ? "" : "还没有文献（旧版里读过 / 下载过的会出现在这里）";
+}
+
+async function refreshAiReady() {
+  try {
+    const state = await aiState();
+    aiReady.value = !!state?.has_key;
+  } catch {
+    aiReady.value = false;
+  }
+}
+
+// ---- 下载 PDF（J1-2，对应旧版 lit.download_pdf）----
+const downloadBusy = ref(false);
+const downloadMsg = ref("");
+
+async function downloadPaper() {
+  const paper = selected.value;
+  if (!paper || downloadBusy.value) return;
+  downloadBusy.value = true;
+  downloadMsg.value = "正在下载…";
+  try {
+    const result = await papersDownload(paper.id);
+    downloadMsg.value = result.summary || (result.ok ? "下载完成" : "下载失败");
+    if (result.ok) await load();
+  } catch (err) {
+    downloadMsg.value = `下载失败：${String(err)}`;
+  } finally {
+    downloadBusy.value = false;
+  }
+}
+
+/** 切文献时看一下这篇之前有没有存过流程图（存在 data/lit_flows/flow-<id>.json） */
+async function loadFlowForSelected() {
+  const paper = selected.value;
+  flowMsg.value = "";
+  if (!paper) {
+    flow.value = null;
+    return;
+  }
+  try {
+    const result = await litFlowLoad(paper.id);
+    flow.value = result.ok ? result : null;
+  } catch {
+    flow.value = null;
+  }
+}
+
+async function generateFlow(force = false) {
+  const paper = selected.value;
+  if (!paper || flowBusy.value) return;
+  flowBusy.value = true;
+  flowMsg.value = "";
+  try {
+    const result = await litFlowGenerate(paper.id, {
+      force,
+      title: paper.title,
+      text: paper.abstract || "",
+    });
+    if (!result.ok) {
+      flow.value = null;
+      flowMsg.value = result.need_key
+        ? "还没有可用的模型：去 设置 → AI（API 服务）里填好接口地址和 API Key，再回来点一次"
+        : result.error || "生成失败，再试一次";
+      return;
+    }
+    flow.value = result;
+    flowMode.value = result.fallback ? "list" : "graph";
+    flowOpen.value = true;
+    flowMsg.value = result.fallback
+      ? "模型这次没按 JSON 回，已降级成「纯文本步骤列表」（可以点「重新生成」再试一次）"
+      : result.cached
+        ? "这是上次存下来的流程图；想重做一次就点「重新生成」"
+        : "";
+  } catch (err) {
+    flowMsg.value = `生成失败：${String(err)}`;
+  } finally {
+    flowBusy.value = false;
+  }
+}
+
+async function removeFlow() {
+  const paper = selected.value;
+  if (!paper) return;
+  try {
+    const result = await litFlowDelete(paper.id);
+    if (!result.ok) {
+      flowMsg.value = result.error || "删除失败";
+      return;
+    }
+    flow.value = null;
+    flowOpen.value = false;
+    flowMsg.value = "已删除这篇文献存下来的流程图";
+  } catch (err) {
+    flowMsg.value = `删除失败：${String(err)}`;
+  }
+}
+
+/** 相邻两个节点之间有没有带说明的边（模型给的 label 画在箭头旁边） */
+function edgeLabel(from: string, to: string): string {
+  const found = (flow.value?.edges || []).find((edge) => edge.from === from && edge.to === to);
+  return found?.label || "";
+}
+
+function flowText(): string {
+  return flowNodes.value
+    .map((node, index) => `${index + 1}. ${node.label}${node.detail ? `（${node.detail}）` : ""}`)
+    .join("\n");
+}
+
+async function copyFlowSteps() {
+  const text = flowText();
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    flowMsg.value = "已复制步骤";
+  } catch {
+    flowMsg.value = text;
+  }
 }
 
 async function toggleStar(paper: Paper, star: number) {
@@ -56,7 +425,21 @@ async function copyCitation() {
 
 const stars = [1, 2, 3, 4, 5];
 
-onMounted(load);
+watch(selectedId, () => {
+  flowOpen.value = false;
+  loadFlowForSelected();
+});
+
+onMounted(async () => {
+  await load();
+  await refreshAiReady();
+  await loadFlowForSelected();
+  try {
+    endnote.value = await endnoteDetect();
+  } catch {
+    endnote.value = null;
+  }
+});
 </script>
 
 <template>
@@ -71,6 +454,115 @@ onMounted(load);
       <SoftButton :height="32" :font-size="12.5" glyph="FOLDER" @click="openPath('')">
         打开文献库目录
       </SoftButton>
+      <SoftButton :height="32" :font-size="12.5" glyph="ADD" @click="openRefs">
+        {{ refsOpen ? "收起参考文献" : "参考文献" }}
+      </SoftButton>
+    </div>
+
+    <!-- 在线检索：arXiv + Crossref（旧版 lit.search_all） -->
+    <div class="refs-card">
+      <div class="refs-head">
+        <b>在线检索</b>
+        <input
+          v-model="searchText"
+          class="search-input"
+          type="search"
+          placeholder="关键词，比如 transformer reasoning"
+          @keydown.enter="searchOnline"
+        />
+        <SoftButton :height="28" :font-size="12" :disabled="searchBusy" @click="searchOnline">
+          {{ searchBusy ? "搜索中…" : "搜 arXiv / Crossref / S2" }}
+        </SoftButton>
+      </div>
+      <div v-if="searchMsg" class="hint">{{ searchMsg }}</div>
+      <div v-for="hit in searchHits" :key="`${hit.source}-${hit.source_id}`" class="ref-row">
+        <div class="ref-main">
+          <b>{{ hit.title }}</b>
+          <span class="ref-meta">
+            {{ hit.authors || "（无作者）" }}{{ hit.year ? ` · ${hit.year}` : "" }}{{
+              hit.venue ? ` · ${hit.venue}` : ""
+            }}
+          </span>
+        </div>
+        <span
+          v-if="searchRelaxed && hit.total_terms"
+          class="coverage"
+          :class="{ full: (hit.matched_terms || 0) >= hit.total_terms }"
+        >
+          命中 {{ hit.matched_terms }}/{{ hit.total_terms }} 个词
+        </span>
+        <span class="ref-doi">{{ hit.source }}</span>
+        <SoftButton :height="26" :font-size="11.5" @click="addHit(hit)">加入文献库</SoftButton>
+      </div>
+      <div v-if="searchHits.length" class="search-more">
+        <span class="tiny">{{ searchTotalText ? `库里总量：${searchTotalText}` : "" }}</span>
+        <span class="spacer" />
+        <SoftButton
+          :height="28"
+          :font-size="12"
+          :disabled="searchMoreBusy || !searchMore"
+          @click="searchMoreResults"
+        >
+          {{ searchMoreBusy ? "读取中…" : searchMore ? "再看 20 条" : "没有更多了" }}
+        </SoftButton>
+      </div>
+    </div>
+
+    <!-- 参考文献层（旧版 refs.py）：BibTeX / RIS / DOI 导入，导出成 EndNote 能吃的格式 -->
+    <div v-if="refsOpen" class="refs-card">
+      <div class="refs-head">
+        <b>参考文献（{{ refsItems.length }} 条）</b>
+        <span class="spacer" />
+        <SoftButton :height="28" :font-size="12" :disabled="refsBusy" @click="importRefs">
+          导入 BibTeX / RIS
+        </SoftButton>
+        <SoftButton :height="28" :font-size="12" :disabled="refsBusy" @click="exportRefs('ris')">
+          导出 RIS
+        </SoftButton>
+        <SoftButton :height="28" :font-size="12" :disabled="refsBusy" @click="exportRefs('bibtex')">
+          导出 BibTeX
+        </SoftButton>
+        <SoftButton :height="28" :font-size="12" :disabled="refsBusy" @click="exportRefs('enw')">
+          导出 EndNote
+        </SoftButton>
+      </div>
+      <div class="refs-add">
+        <input v-model="doiInput" type="text" placeholder="粘一个 DOI，回车就加进来（走 Crossref）" @keydown.enter="addDoi" />
+        <SoftButton :height="28" :font-size="12" :disabled="refsBusy" @click="addDoi">加 DOI</SoftButton>
+      </div>
+      <div v-if="refsMsg" class="hint">{{ refsMsg }}</div>
+      <!-- EndNote：装了就能一键打开刚导出的文件；没装就说清楚该去哪儿装 -->
+      <div v-if="endnote" class="endnote-line">
+        <template v-if="endnote.found">
+          <Pill text="装了 EndNote" color="var(--success)" :font-size="11" />
+          <span class="endnote-path" :title="endnote.path">{{ endnote.path }}</span>
+          <SoftButton
+            v-if="lastExport"
+            :height="24"
+            :font-size="11.5"
+            @click="openInEndnote"
+          >
+            用 EndNote 打开刚导出的文件
+          </SoftButton>
+        </template>
+        <span v-else class="endnote-hint">{{ endnote.summary }}</span>
+        <span v-if="endnoteNote" class="tiny">{{ endnoteNote }}</span>
+      </div>
+      <div v-if="!refsItems.length" class="muted tiny">
+        还没有参考文献。可以导入 .bib / .ris，或者粘一个 DOI。
+      </div>
+      <div v-for="ref in refsItems" :key="ref.id" class="ref-row">
+        <div class="ref-main">
+          <b>{{ ref.title || "（无标题）" }}</b>
+          <span class="ref-meta">
+            {{ ref.authors || "（无作者）" }}{{ ref.year ? ` · ${ref.year}` : "" }}{{
+              ref.venue ? ` · ${ref.venue}` : ""
+            }}
+          </span>
+        </div>
+        <span v-if="ref.doi" class="ref-doi">{{ ref.doi }}</span>
+        <button class="ref-del" title="删掉这条" @click="removeRef(ref.id)">×</button>
+      </div>
     </div>
 
     <div class="bar">
@@ -145,6 +637,15 @@ onMounted(load);
           <div class="detail-foot">
             <Pill :text="`${selected.stars} 星`" :font-size="11.5" />
             <SoftButton :height="28" :font-size="12" @click="copyCitation">复制引用</SoftButton>
+            <!-- 下载到文献库：library/<项目>/<年份>/<标题>.pdf（旧版 lit.download_pdf） -->
+            <SoftButton
+              :height="28"
+              :font-size="12"
+              :disabled="downloadBusy || !!selected.file_path"
+              @click="downloadPaper"
+            >
+              {{ selected.file_path ? "已下载" : downloadBusy ? "下载中…" : "下载 PDF" }}
+            </SoftButton>
             <SoftButton
               :height="28"
               :font-size="12"
@@ -154,8 +655,123 @@ onMounted(load);
               打开 PDF
             </SoftButton>
           </div>
+          <div v-if="downloadMsg" class="detail-foot">
+            <span class="tiny">{{ downloadMsg }}</span>
+          </div>
+          <div class="detail-foot flow-actions">
+            <SoftButton
+              variant="primary"
+              :height="28"
+              :font-size="12"
+              :disabled="flowBusy || !aiReady"
+              @click="generateFlow(!!flow)"
+            >
+              {{ flowBusy ? "生成中…" : flow ? "重新生成" : "生成流程图" }}
+            </SoftButton>
+            <SoftButton v-if="flow" :height="28" :font-size="12" @click="flowOpen = true">
+              查看流程图
+            </SoftButton>
+            <span v-if="!aiReady" class="hint">
+              没配 API Key：去 设置 → AI（API 服务）填好接口地址和 Key，再回来点这里
+            </span>
+            <span v-else-if="flowMsg" class="hint">{{ flowMsg }}</span>
+          </div>
         </template>
         <div v-else class="empty">选左边一篇文献</div>
+      </div>
+    </div>
+
+    <!-- 流程图：节点卡片 + SVG 竖线箭头，纯 CSS/SVG，不引第三方图库 -->
+    <div v-if="flowOpen && flow" class="flow-mask" @click.self="flowOpen = false">
+      <div class="flow-card">
+        <div class="flow-head">
+          <div class="flow-titles">
+            <div class="h2">{{ flow.title || "方法流程图" }}</div>
+            <div class="tiny">
+              共 {{ flowNodes.length }} 步 ·
+              {{ flow.fallback ? "纯文本降级" : "结构化节点图" }}
+              <template v-if="flow.generated_at"> · {{ flow.generated_at }}</template>
+              <template v-if="flow.cached"> · 上次的结果</template>
+            </div>
+          </div>
+          <div class="spacer" />
+          <div class="mode-switch">
+            <button :class="{ on: flowMode === 'graph' }" @click="flowMode = 'graph'">流程图</button>
+            <button :class="{ on: flowMode === 'list' }" @click="flowMode = 'list'">步骤列表</button>
+          </div>
+          <SoftButton :height="28" :font-size="12" @click="copyFlowSteps">复制步骤</SoftButton>
+          <SoftButton :height="28" :font-size="12" :disabled="flowBusy" @click="generateFlow(true)">
+            {{ flowBusy ? "生成中…" : "重新生成" }}
+          </SoftButton>
+          <SoftButton variant="danger" :height="28" :font-size="12" @click="removeFlow">
+            删除
+          </SoftButton>
+          <SoftButton :height="28" :font-size="12" @click="flowOpen = false">关闭</SoftButton>
+        </div>
+        <div v-if="flowMsg" class="flow-msg">{{ flowMsg }}</div>
+        <div class="flow-body">
+          <!-- 箭头形状只定义一次，下面每一段连线都用 marker-end 引用 -->
+          <svg class="flow-defs" width="0" height="0" aria-hidden="true">
+            <defs>
+              <marker
+                id="lit-flow-arrow"
+                viewBox="0 0 8 8"
+                refX="4"
+                refY="4"
+                markerWidth="7"
+                markerHeight="7"
+                orient="auto"
+              >
+                <path d="M0,0 L8,4 L0,8 z" fill="var(--accent)" />
+              </marker>
+            </defs>
+          </svg>
+
+          <template v-if="flowMode === 'graph'">
+            <div class="flow-canvas">
+              <template v-for="(node, index) in flowNodes" :key="node.id || index">
+                <div class="flow-node" :class="{ head: index === 0 }">
+                  <span class="flow-index">{{ index + 1 }}</span>
+                  <span class="flow-text">
+                    <b>{{ node.label }}</b>
+                    <span v-if="node.detail" class="flow-detail">{{ node.detail }}</span>
+                  </span>
+                </div>
+                <div v-if="index < flowNodes.length - 1" class="flow-gap">
+                  <svg width="100%" height="26">
+                    <line
+                      x1="50%"
+                      y1="0"
+                      x2="50%"
+                      y2="18"
+                      stroke="var(--accent)"
+                      stroke-width="1.6"
+                      marker-end="url(#lit-flow-arrow)"
+                    />
+                  </svg>
+                  <span v-if="edgeLabel(node.id, flowNodes[index + 1].id)" class="flow-edge-label">
+                    {{ edgeLabel(node.id, flowNodes[index + 1].id) }}
+                  </span>
+                </div>
+              </template>
+            </div>
+          </template>
+          <template v-else>
+            <ol class="flow-list">
+              <li v-for="(node, index) in flowNodes" :key="node.id || index">
+                <b>{{ node.label }}</b>
+                <span v-if="node.detail" class="flow-detail">{{ node.detail }}</span>
+              </li>
+            </ol>
+          </template>
+          <div v-if="!flowNodes.length" class="empty">
+            模型没给出能用的步骤，点「重新生成」再试一次
+          </div>
+          <div v-if="flow.fallback && flow.raw" class="flow-raw">
+            <div class="label">模型原话（没能解析成 JSON，下面是原文）</div>
+            <pre>{{ flow.raw }}</pre>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -336,5 +952,334 @@ onMounted(load);
 .list .row,
 .list .row > span {
   text-align: left;
+}
+
+/* ------------------------------------------------------------ 流程图 */
+.flow-actions {
+  flex-wrap: wrap;
+  row-gap: 4px;
+  /* 上一行 detail-foot 已经有分隔线了，这里不重复画 */
+  border-top: none;
+  padding-top: 2px;
+}
+.flow-actions .hint {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.flow-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.32);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px;
+}
+.flow-card {
+  width: min(720px, 100%);
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 18px 18px;
+  border-radius: var(--radius-card);
+  border: 1px solid var(--hairline, var(--border-soft));
+  background: var(--card);
+  box-shadow: var(--shadow-pop);
+}
+.flow-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.flow-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.mode-switch {
+  display: flex;
+  gap: 3px;
+  padding: 2px;
+  border-radius: var(--radius-pill);
+  background: var(--card-alt);
+}
+.mode-switch button {
+  height: 22px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.mode-switch button.on {
+  background: var(--card);
+  color: var(--text);
+  font-weight: 600;
+}
+.flow-msg {
+  font-size: 11.5px;
+  color: var(--muted);
+  background: var(--card-alt);
+  border-radius: 8px;
+  padding: 6px 9px;
+  line-height: 1.6;
+}
+.flow-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 2px;
+}
+.flow-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+/* 节点卡片竖排：浅色边框 + 第一颗用强调色淡底（对应旧版第一颗高亮） */
+.flow-canvas {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+}
+.flow-node {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px 12px;
+  border-radius: var(--radius-card);
+  border: 1px solid var(--border-soft);
+  background: var(--card-alt);
+  color: var(--text);
+}
+.flow-node.head {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 9%, var(--card));
+}
+.flow-index {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 14%, var(--card));
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 640;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.flow-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.flow-text b {
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.flow-detail {
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+/* 连线：一段 26px 高的槽，里面是 SVG 竖线 + 箭头（marker-end） */
+.flow-gap {
+  position: relative;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.flow-gap svg {
+  display: block;
+  width: 100%;
+  height: 26px;
+}
+.flow-edge-label {
+  position: absolute;
+  left: calc(50% + 14px);
+  max-width: 46%;
+  font-size: 10.5px;
+  color: var(--muted);
+  background: var(--card);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 0 7px;
+  line-height: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 降级展示：纯文本步骤列表 */
+.flow-list {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 13px;
+  color: var(--text);
+  user-select: text;
+}
+.flow-list li {
+  line-height: 1.65;
+}
+.flow-list b {
+  font-weight: 600;
+}
+.flow-list .flow-detail {
+  display: block;
+}
+.flow-raw .label {
+  font-size: 11px;
+  color: var(--faint);
+  margin: 10px 0 4px;
+}
+.flow-raw pre {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--card-alt);
+  color: var(--text-soft);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+/* 参考文献层（BibTeX / RIS / DOI） */
+.refs-card {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border-soft);
+  background: var(--card);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow: auto;
+}
+.refs-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+}
+.refs-add {
+  display: flex;
+  gap: 6px;
+}
+/* EndNote 那一行：装了显示路径 + 打开按钮，没装就一句话说明 */
+.endnote-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.endnote-path {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-soft);
+}
+.endnote-hint {
+  line-height: 1.6;
+}
+.search-more {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-soft);
+}
+.coverage {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+}
+.coverage.full {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.refs-head .search-input {
+  flex: 1;
+  min-width: 160px;
+  font-size: 12px;
+  padding: 5px 9px;
+}
+.refs-add input {
+  flex: 1;
+  font-size: 12px;
+  padding: 5px 9px;
+}
+.ref-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px;
+  border-top: 1px solid var(--border-soft);
+  font-size: 12px;
+}
+.ref-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+}
+.ref-main b {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ref-meta {
+  font-size: 10.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ref-doi {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+.ref-del {
+  flex: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.ref-del:hover {
+  color: var(--danger);
 }
 </style>

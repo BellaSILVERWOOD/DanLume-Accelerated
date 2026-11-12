@@ -134,13 +134,31 @@ body {
   flex-wrap: wrap;
 }
 
-/* 输入类控件（旧版 inputs.py 的观感：白底、1px 边、圆角 10） */
+/* 输入类控件（旧版 inputs.py 的观感：白底、1px 边、圆角 10）
+ *
+ * 注意：单行控件（input / select）**只给左右 padding，高度靠 height**。
+ * 以前是 padding: 7px 11px + 高度自适应，一旦页面里写了固定 height（26/28/30px），
+ * 内容框就只剩十几像素，中文字被切掉上半截或下半截（2026-11-11 用户报的
+ * 「这里的字也只有一半？」，AI 面板的场景下拉、空教室的筛选下拉都是这么被切坏的）。
+ */
 input[type="text"],
 input[type="password"],
 input[type="search"],
 input[type="number"],
-textarea,
 select {
+  font-family: inherit;
+  font-size: var(--fs-body);
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-btn);
+  height: 34px;
+  padding: 0 11px;
+  outline: none;
+  user-select: text;
+}
+/* 多行框还是靠上下 padding 撑，不设固定高度 */
+textarea {
   font-family: inherit;
   font-size: var(--fs-body);
   color: var(--text);

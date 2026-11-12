@@ -15,5 +15,12 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     sourcemap: false,
+    rollupOptions: {
+      // 两个页面：主界面 + 看板娘悬浮球小窗（单独 entry，避免 hash 被 asset 协议吞掉）
+      input: {
+        main: "index.html",
+        mascot: "mascot.html",
+      },
+    },
   },
 });

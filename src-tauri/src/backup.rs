@@ -35,6 +35,26 @@ pub const APP: &str = "rust";
 const MANIFEST_ENTRY: &str = "manifest.json";
 const DB_ENTRY: &str = "lumina.db";
 const README_ENTRY: &str = "README.txt";
+/// 旧版（Python）把 AI 记忆存在数据目录的纯文本里，新版存在 memories 表。
+/// 包里带上这一份，两边就都能看到对方的记忆。
+const MEMORY_ENTRY: &str = "memory.md";
+
+/// 生成的 memory.md 头部（与 Python 版 `lumina/memory.py` 的 `_HEADER` 一致）
+const MEMORY_MD_HEADER: &str = "# DanLume 记忆\n\n\
+> 这里的内容会随每次 AI 对话带给模型（有长度上限）。\n\
+> 想让 AI 做什么/记住什么，直接跟它说「记住：……」即可；也可以手动编辑这个文件。\n";
+
+/// 包里没有 memories 表时，按这一份建（与 `store.rs` 的 SCHEMA 一致）
+const MEMORY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    hits INTEGER NOT NULL DEFAULT 0,
+    last_used_at TEXT
+);";
 
 /// DPAPI 密文前缀（与 `secrets.rs` 一致）
 pub const SECRET_PREFIX: &str = "dpapi:";
@@ -165,6 +185,7 @@ pub fn export(db_path: &Path, out: &Path) -> Result<Value, String> {
             )
             .map_err(|err| format!("剥离密钥失败：{err}"))?;
         let tables = table_counts(&conn);
+        let (memory_md, memory_count) = memory_file_from(&conn);
         let integrity: String = conn
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .map_err(|err| format!("快照自检失败：{err}"))?;
@@ -183,10 +204,12 @@ pub fn export(db_path: &Path, out: &Path) -> Result<Value, String> {
             "tables": tables.clone(),
             "secrets_stripped": stripped_rows > 0,
             "stripped_keys": stripped_keys.clone(),
+            "memory_included": memory_md.is_some(),
+            "memory_entries": memory_count,
         });
 
-        // ③ 快照 + manifest + README 打进 zip
-        write_package(out, &manifest, &snapshot)?;
+        // ③ 快照 + manifest + README（+ memory.md）打进 zip
+        write_package(out, &manifest, &snapshot, memory_md.as_deref())?;
         let bytes = std::fs::metadata(out).map(|meta| meta.len()).unwrap_or(0);
         Ok(json!({
             "ok": true,
@@ -195,6 +218,7 @@ pub fn export(db_path: &Path, out: &Path) -> Result<Value, String> {
             "manifest": manifest,
             "tables": tables,
             "stripped_keys": stripped_keys,
+            "memory_entries": memory_count,
             "error": "",
         }))
     })();
@@ -203,7 +227,12 @@ pub fn export(db_path: &Path, out: &Path) -> Result<Value, String> {
     outcome
 }
 
-fn write_package(out: &Path, manifest: &Value, db_file: &Path) -> Result<(), String> {
+fn write_package(
+    out: &Path,
+    manifest: &Value,
+    db_file: &Path,
+    memory_md: Option<&str>,
+) -> Result<(), String> {
     let file = File::create(out).map_err(|err| format!("建不了数据包：{err}"))?;
     let mut writer = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
@@ -231,11 +260,103 @@ fn write_package(out: &Path, manifest: &Value, db_file: &Path) -> Result<(), Str
     let mut source = File::open(db_file).map_err(|err| format!("读快照失败：{err}"))?;
     std::io::copy(&mut source, &mut writer).map_err(|err| format!("写数据库失败：{err}"))?;
 
+    // 记忆单独再存一份纯文本：Python 版读的是 data/memory.md，不看数据库
+    if let Some(text) = memory_md {
+        writer
+            .start_file(MEMORY_ENTRY, options)
+            .map_err(|err| format!("写 memory.md 失败：{err}"))?;
+        writer
+            .write_all(text.as_bytes())
+            .map_err(|err| format!("写 memory.md 失败：{err}"))?;
+    }
+
     let file = writer
         .finish()
         .map_err(|err| format!("收尾数据包失败：{err}"))?;
     file.sync_all().map_err(|err| format!("数据包落盘失败：{err}"))?;
     Ok(())
+}
+
+/// 把 memories 表导出成 Python 版能读的 memory.md（没有记忆时返回 None）。
+fn memory_file_from(conn: &Connection) -> (Option<String>, i64) {
+    let mut items: Vec<String> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT content FROM memories ORDER BY created_at ASC, id ASC")
+    {
+        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+            for text in rows.flatten() {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    items.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    if items.is_empty() {
+        return (None, 0);
+    }
+    let count = items.len() as i64;
+    let mut text = String::from(MEMORY_MD_HEADER);
+    for item in items {
+        text.push_str("- ");
+        text.push_str(&item);
+        text.push('\n');
+    }
+    (Some(text), count)
+}
+
+/// 去掉 Python 版追加在条目末尾的「（2026-11-10 13:00）」时间戳。
+fn strip_memory_timestamp(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Some(pos) = trimmed.rfind('（') {
+        let tail = &trimmed[pos..];
+        if tail.ends_with('）') {
+            let inner = &tail['（'.len_utf8()..tail.len() - '）'.len_utf8()];
+            let looks_like_time = inner.chars().count() >= 10
+                && inner
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '-' || c == ':' || c == ' ');
+            if looks_like_time {
+                return trimmed[..pos].trim().to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+/// 把 memory.md 里的「- 条目」灌进 memories 表（按内容去重），返回新增条数。
+fn ingest_memory_md(conn: &Connection, text: &str) -> rusqlite::Result<usize> {
+    conn.execute_batch(MEMORY_SCHEMA)?;
+    let now = crate::now_str();
+    let mut added = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let body = if let Some(rest) = trimmed.strip_prefix("- ") {
+            rest
+        } else if let Some(rest) = trimmed.strip_prefix("* ") {
+            rest
+        } else {
+            continue;
+        };
+        let content = strip_memory_timestamp(body);
+        if content.is_empty() {
+            continue;
+        }
+        let existing: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE content = ?1",
+            rusqlite::params![content],
+            |row| row.get(0),
+        )?;
+        if existing > 0 {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO memories(content, source, tags, created_at, updated_at, hits)
+             VALUES (?1, 'import', '', ?2, ?2, 0)",
+            rusqlite::params![content, now],
+        )?;
+        added += 1;
+    }
+    Ok(added)
 }
 
 /// 包里那张给人看的一页说明（两版内容可以不同，都是人读的）
@@ -349,7 +470,16 @@ pub fn import(db_path: &Path, pkg: &Path, data_dir: &Path) -> Result<Value, Stri
         ));
     }
 
-    // ② lumina.db 必须在，先解到数据目录里的临时文件
+    // ② memory.md（可选条目）：Python 版把记忆存成纯文本，包里带了就灌进 memories 表
+    let memory_text: Option<String> = if archive.file_names().any(|name| name == MEMORY_ENTRY) {
+        read_entry(&mut archive, MEMORY_ENTRY)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+    } else {
+        None
+    };
+
+    // ③ lumina.db 必须在，先解到数据目录里的临时文件
     if archive.file_names().all(|name| name != DB_ENTRY) {
         return Err("数据包里缺少 lumina.db（包不完整，可能拷贝时中断了）".to_string());
     }
@@ -439,11 +569,16 @@ pub fn import(db_path: &Path, pkg: &Path, data_dir: &Path) -> Result<Value, Stri
 
     // ⑥ 写标记：导入后的库（下次启动就是它）和当前库各写一份，
     //    当前库那份重启换库后就随旧库一起没了；导入库那份换库后会被 apply_pending 清掉。
+    //    顺手把包里的 memory.md 灌进导入库的 memories 表（Python 版旧记忆就是这么带过来的）。
     let pkg_text = pkg.display().to_string();
+    let mut memory_added = 0usize;
     let marker = (|| -> rusqlite::Result<()> {
         let conn = Connection::open(&imported)?;
         put_setting(&conn, PENDING_KEY, "1")?;
         put_setting(&conn, PENDING_FROM_KEY, &pkg_text)?;
+        if let Some(text) = memory_text.as_deref() {
+            memory_added = ingest_memory_md(&conn, text)?;
+        }
         Ok(())
     })();
     if let Err(err) = marker {
@@ -477,6 +612,7 @@ pub fn import(db_path: &Path, pkg: &Path, data_dir: &Path) -> Result<Value, Stri
         "app": manifest["app"].clone(),
         "app_version": manifest["app_version"].clone(),
         "exported_at": manifest["exported_at"].clone(),
+        "memory_imported": memory_added,
         "error": "",
     }))
 }
@@ -970,5 +1106,117 @@ mod tests {
             writer.write_all(body).unwrap();
         }
         writer.finish().unwrap();
+    }
+
+    /// Python 版会往记忆条目末尾追加「（2026-11-10 13:00）」，导入时要去掉。
+    #[test]
+    fn memory_md_timestamp_is_stripped() {
+        assert_eq!(
+            strip_memory_timestamp("我不喜欢用分号（2026-11-10 13:00）"),
+            "我不喜欢用分号"
+        );
+        assert_eq!(
+            strip_memory_timestamp("原文里有（括号）但不像时间"),
+            "原文里有（括号）但不像时间"
+        );
+        assert_eq!(strip_memory_timestamp("  前后空格  "), "前后空格");
+    }
+
+    /// A5：导出包里带 memory.md（Python 版读的是纯文本），导入时再灌回 memories 表。
+    #[test]
+    fn export_carries_memory_md_and_import_reads_it_back() {
+        let dir = temp_dir("memory-md");
+        let data = dir.join("data");
+        let db = seed(&data);
+        {
+            let conn = Connection::open(&db).unwrap();
+            for (text, at) in [
+                ("我不喜欢用分号", "2026-11-01 09:00:00"),
+                ("专业课是高等代数", "2026-11-02 09:00:00"),
+            ] {
+                conn.execute(
+                    "INSERT INTO memories(content, source, tags, created_at, updated_at, hits)
+                     VALUES (?1, 'manual', '', ?2, ?2, 0)",
+                    params![text, at],
+                )
+                .unwrap();
+            }
+        }
+
+        let pkg = dir.join("with-memory.dlpk");
+        let result = export(&db, &pkg).expect("导出应当成功");
+        assert_eq!(result["memory_entries"], 2, "{result}");
+
+        // 包里确实有 memory.md，且是 Python 版认识的那种「- 」条目
+        let mut archive = zip::ZipArchive::new(File::open(&pkg).unwrap()).unwrap();
+        let names: Vec<String> = archive.file_names().map(|name| name.to_string()).collect();
+        assert!(names.iter().any(|name| name == MEMORY_ENTRY), "{names:?}");
+        let text = String::from_utf8(read_entry(&mut archive, MEMORY_ENTRY).unwrap()).unwrap();
+        assert!(text.starts_with("# DanLume 记忆"), "{text}");
+        assert!(text.contains("- 我不喜欢用分号"), "{text}");
+        drop(archive);
+
+        // 导入到另一个库：包里的记忆以 source='import' 进了 memories 表
+        let target_dir = temp_dir("memory-md-target");
+        let target_data = target_dir.join("data");
+        let target_db = seed(&target_data);
+        let outcome = import(&target_db, &pkg, &target_data).expect("导入应当成功");
+        assert_eq!(outcome["memory_imported"], 0, "库里本来就有的内容不该重复计入：{outcome}");
+        let imported = target_data.join(IMPORTED_SUFFIX);
+        assert!(imported.is_file(), "没有生成 lumina.db.imported");
+        let conn = Connection::open(&imported).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "memory.md 的条目没有进 memories 表");
+        drop(conn);
+
+        // 单独再造一个「只有 manifest + lumina.db + memory.md」的包，验证纯文本来源也能灌进去
+        let plain = dir.join("plain.dlpk");
+        let manifest: Value = serde_json::from_slice(
+            &read_entry(
+                &mut zip::ZipArchive::new(File::open(&pkg).unwrap()).unwrap(),
+                MANIFEST_ENTRY,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let db_bytes = {
+            let mut archive = zip::ZipArchive::new(File::open(&pkg).unwrap()).unwrap();
+            read_entry(&mut archive, DB_ENTRY).unwrap()
+        };
+        let memory_md = "# DanLume 记忆\n\n\
+- 我不喜欢用分号（2026-11-10 13:00）\n\
+- 周末练琴\n\
+- 常驻图书馆（2026-11-10 13:00）\n"
+            .to_string();
+        write_zip_for_test(
+            &plain,
+            &[
+                (MANIFEST_ENTRY, serde_json::to_vec(&manifest).unwrap().as_slice()),
+                (DB_ENTRY, db_bytes.as_slice()),
+                (MEMORY_ENTRY, memory_md.as_bytes()),
+            ],
+        );
+        let fresh_dir = temp_dir("memory-md-plain");
+        let fresh_data = fresh_dir.join("data");
+        let fresh_db = seed(&fresh_data);
+        // 先把库里已有的记忆清掉，确保统计的是 memory.md 灌进来的
+        {
+            let conn = Connection::open(&fresh_db).unwrap();
+            conn.execute("DELETE FROM memories", []).unwrap();
+        }
+        let outcome = import(&fresh_db, &plain, &fresh_data).expect("导入应当成功");
+        // 包里库里已经有「我不喜欢用分号」，所以只该新增「周末练琴」「常驻图书馆」两条
+        assert_eq!(outcome["memory_imported"], 2, "{outcome}");
+        let conn = Connection::open(fresh_data.join(IMPORTED_SUFFIX)).unwrap();
+        let contents: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT content FROM memories ORDER BY id").unwrap();
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+            rows.flatten().collect()
+        };
+        assert!(contents.iter().any(|one| one == "我不喜欢用分号"), "{contents:?}");
+        assert!(contents.iter().any(|one| one == "常驻图书馆"), "{contents:?}");
+        assert!(!contents.iter().any(|one| one.contains("2026-11-10")), "时间戳没去掉：{contents:?}");
     }
 }

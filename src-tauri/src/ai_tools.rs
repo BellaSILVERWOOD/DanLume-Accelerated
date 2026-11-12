@@ -159,6 +159,35 @@ pub fn catalog() -> Vec<Value> {
         spec("fs_discard", "丢弃文件（改名）",
              "把文件「丢弃」：不会真的删除，而是把文件名改成 `[discarded] 原名`。", "mid", false,
              json!({ "path": p("string", "要丢弃的文件路径（必填）") }), &["path"]),
+        // ---------------- Agent 沙箱（只能在自己目录里动手） ----------------
+        spec("sandbox_list", "看沙箱",
+             "列出 Agent 沙箱目录里的文件。做「整理资料 / 生成文件」这类事之前先看一眼。",
+             "low", true,
+             json!({ "path": p("string", "相对沙箱的目录，留空=根目录") }), &[]),
+        spec("sandbox_read", "读沙箱文件",
+             "读沙箱里的一个文本文件（相对路径）。",
+             "low", true,
+             json!({ "path": p("string", "相对沙箱的文件路径，例如 notes.md") }), &["path"]),
+        spec("sandbox_write", "写沙箱文件",
+             "在沙箱里写一个文本文件（会建目录、覆盖同名文件）。只能写沙箱里，不能碰磁盘其它地方。",
+             "low", true,
+             json!({
+                 "path": p("string", "相对沙箱的文件路径，例如 out/summary.md"),
+                 "content": p("string", "文件内容"),
+             }), &["path", "content"]),
+        spec("sandbox_run", "沙箱里跑命令",
+
+             "在沙箱目录里执行一条 shell 命令（Windows 上走 cmd /C），输出会截断；默认不限时长，跑到命令自己结束。默认是关的：只有用户本人在面板里打开开关后才会执行，每次调用还会再问用户一次。",
+             "high", false,
+             json!({ "command": p("string", "要执行的命令，工作目录就是沙箱") }), &["command"]),
+
+        // ---------------- 通讯录（要用户明确授权才给） ----------------
+        spec("contacts_search", "查通讯录",
+             "按姓名 / 职位 / 邮箱 / 微信备注名 / 手机号在用户的通讯录里找人，返回联系方式。只有用户在 AI 页面打开「允许读取通讯录」后才会出现在这里。",
+             "low", true,
+             json!({ "keyword": p("string", "姓名或关键词，留空则列前 10 人"),
+                     "limit": p("integer", "最多返回几人，默认 10") }), &[]),
+
         // ---------------- 只读信息 ----------------
         spec("time_now", "看时间", "返回精确日期/时间/星期/时区（只读）。", "low", true, json!({}), &[]),
         spec("sys_info", "看电脑状况",
@@ -351,6 +380,10 @@ pub fn definitions(store: &Store) -> Vec<Value> {
         .into_iter()
         .filter(|one| {
             let name = one["name"].as_str().unwrap_or_default().to_string();
+            // 通讯录：用户没在 AI 页面打开「允许读取通讯录」时，这个工具根本不给模型
+            if name == "contacts_search" && !crate::student::ai_allowed(store) {
+                return false;
+            }
             tool_on(store, &name)
         })
         .map(|one| {
@@ -409,8 +442,48 @@ fn arg_ids(args: &Value) -> Vec<i64> {
         .unwrap_or_default()
 }
 
-/// 执行一个工具。返回结构固定为 `{ok, summary, …}`。
+/// 需要用户点头才能跑的工具（对齐旧版 `HIGH_RISK_NAMES` + `_ALWAYS_CONFIRM`）
+///
+/// 以前这里是让**模型自己**带 `confirm=true` 再调一次——模型当然会自己点头，
+/// 等于没有审核。现在改成真的问用户（J8-3）。
+pub fn confirm_reason(name: &str, _args: &Value) -> Option<String> {
+    let reason = match name {
+        "mail_send" => "会真的把邮件发出去",
+        "setting_set" => "会改你的设置",
+        "sandbox_run" => "会在这台电脑上执行命令",
+        "zip_extract" => "会解压文件到磁盘上",
+        "fs_write" | "fs_discard" => "会动你电脑上的文件",
+        "elearning_download" | "pdf_download" => "会联网下载文件并写到磁盘",
+        "endnote_export" => "会往磁盘写参考文献文件",
+        "resource_push" => "会把资源推送出去",
+        _ => return None,
+    };
+    Some(reason.to_string())
+}
+
+/// 执行一个工具（不经过用户审核；给「自己点工具」这类明确操作和单测用）
 pub fn dispatch(store: &Store, name: &str, args: &Value) -> Value {
+    dispatch_inner(store, name, args, None)
+}
+
+/// 执行一个工具，动手前先问用户一句；`allow` 返回 false 就不执行
+///
+/// AI 对话循环走这条（旧版 `ai_tools.set_confirm_handler` 的位置）。
+pub fn dispatch_approved(
+    store: &Store,
+    name: &str,
+    args: &Value,
+    allow: &mut dyn FnMut(&str, &Value) -> bool,
+) -> Value {
+    dispatch_inner(store, name, args, Some(allow))
+}
+
+fn dispatch_inner(
+    store: &Store,
+    name: &str,
+    args: &Value,
+    allow: Option<&mut dyn FnMut(&str, &Value) -> bool>,
+) -> Value {
     if !globally_on(store) {
         return fail("AI 工具被全局关掉了（设置 → AI → 工具审核）");
     }
@@ -418,15 +491,32 @@ pub fn dispatch(store: &Store, name: &str, args: &Value) -> Value {
         return fail(format!("工具「{name}」是关着的（设置 → AI → 工具审核）"));
     }
     let args = if args.is_null() { json!({}) } else { args.clone() };
-    if NEEDS_CONFIRM.contains(&name) && !arg_bool(&args, "confirm", false) {
-        return json!({
-            "ok": false,
-            "needs_confirm": true,
-            "summary": format!(
-                "「{name}」会真的改动数据 / 发出去，要用户明确同意。\
-                 先用一句话问清楚；用户同意后带上 confirm=true 再调用一次"
-            ),
-        });
+    if let Some(reason) = confirm_reason(name, &args) {
+        match allow {
+            Some(callback) => {
+                if !callback(name, &args) {
+                    return json!({
+                        "ok": false,
+                        "denied": true,
+                        "summary": format!("用户没同意「{name}」（{reason}），这次没执行。\
+                                            换个办法，或者先跟用户说清楚再问一次"),
+                    });
+                }
+            }
+            None => {
+                // 没人可问（单测 / 明确点工具）：保留旧约定，要模型自己带 confirm=true
+                if NEEDS_CONFIRM.contains(&name) && !arg_bool(&args, "confirm", false) {
+                    return json!({
+                        "ok": false,
+                        "needs_confirm": true,
+                        "summary": format!(
+                            "「{name}」会真的改动数据 / 发出去，要用户明确同意。\
+                             先用一句话问清楚；用户同意后带上 confirm=true 再调用一次"
+                        ),
+                    });
+                }
+            }
+        }
     }
     let result = match name {
         // ---------- 日程 ----------
@@ -452,6 +542,12 @@ pub fn dispatch(store: &Store, name: &str, args: &Value) -> Value {
         "fs_search" => fs_search(store, &args),
         "fs_write" => fs_write(store, &args),
         "fs_discard" => fs_discard(store, &args),
+        // ---------- Agent 沙箱 ----------
+        "sandbox_list" => sandbox_list(&args),
+        "sandbox_read" => sandbox_read(&args),
+        "sandbox_write" => sandbox_write(&args),
+        "sandbox_run" => sandbox_run(store, &args),
+        "contacts_search" => contacts_search(store, &args),
         // ---------- 网络 / 文献 ----------
         "web_search" => crate::ai_tools_net::web_search(&args),
         "web_fetch" => crate::ai_tools_net::web_fetch(&args),
@@ -499,30 +595,26 @@ fn schedule_list(store: &Store, args: &Value) -> Value {
         }
     };
     let keyword = arg_str(args, "keyword");
-    let rows: Vec<Value> = {
-        let conn = store.connection();
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT id, title, description, date, start_time, end_time, done, color
-             FROM events WHERE date >= ?1 AND date <= ?2 ORDER BY date, start_time",
-        ) else {
-            return fail("数据库读不了");
-        };
-        let mapped = stmt.query_map([&from, &to], |row| {
-            Ok(json!({
-                "id": row.get::<_, i64>(0)?,
-                "title": row.get::<_, String>(1)?,
-                "description": row.get::<_, String>(2)?,
-                "date": row.get::<_, String>(3)?,
-                "start_time": row.get::<_, String>(4)?,
-                "end_time": row.get::<_, String>(5)?,
-                "done": row.get::<_, i64>(6)? != 0,
-                "color": row.get::<_, String>(7)?,
-            }))
-        });
-        match mapped {
-            Ok(items) => items.flatten().collect(),
-            Err(_) => return fail("查询日程失败"),
-        }
+    // 走 events_between：重复日程要按规则展开，AI 才能看到「每周三那节课」的每一次
+    let rows: Vec<Value> = match store.events_between(&from, &to) {
+        Ok(items) => items
+            .into_iter()
+            .map(|one| {
+                json!({
+                    "id": one.id,
+                    "title": one.title,
+                    "description": one.description,
+                    "date": one.date,
+                    "start_time": one.start_time,
+                    "end_time": one.end_time,
+                    "done": one.done,
+                    "color": one.color,
+                    "repeat": one.repeat,
+                    "repeat_of": one.repeat_of,
+                })
+            })
+            .collect(),
+        Err(_) => return fail("查询日程失败"),
     };
     let filtered: Vec<Value> = if keyword.is_empty() {
         rows
@@ -827,6 +919,15 @@ fn usage_stats(store: &Store) -> Value {
         format!("历史会话 {sessions} 条，已开启工具 {on} 个"),
         json!({ "sessions": sessions, "tools_on": on, "tools_total": catalog().len() }),
     )
+}
+
+/// 工具的中文名（确认框里显示「发邮件」，而不是 `mail_send`）
+pub fn label_of(name: &str) -> String {
+    catalog()
+        .into_iter()
+        .find(|one| one["name"].as_str() == Some(name))
+        .and_then(|one| one["label"].as_str().map(|text| text.to_string()))
+        .unwrap_or_else(|| name.to_string())
 }
 
 fn tool_help(store: &Store) -> Value {
@@ -1294,24 +1395,112 @@ fn timetable_fetch(store: &Store, args: &Value) -> Value {
 }
 
 // ------------------------------------------------------------------ 测试
+// ---------------------------------------------------------------- Agent 沙箱
+
+fn sandbox_list(args: &Value) -> Value {
+    let path = arg_str(args, "path");
+    match crate::sandbox::list(&path) {
+        Ok(value) => {
+            let count = value
+                .get("entries")
+                .and_then(|one| one.as_array())
+                .map(|one| one.len())
+                .unwrap_or(0);
+            json!({ "ok": true, "summary": format!("沙箱里有 {count} 项"), "entries": value.get("entries").cloned().unwrap_or(json!([])) })
+        }
+        Err(err) => fail(err),
+    }
+}
+
+/// 查通讯录（**必须先被用户授权**：`ai_contacts_allowed`）
+fn contacts_search(store: &Store, args: &Value) -> Value {
+    if !crate::student::ai_allowed(store) {
+        return fail("用户没有允许读取通讯录（AI 页面里的「允许读取通讯录」默认是关的）");
+    }
+    let keyword = arg_str(args, "keyword");
+    let limit = arg_i64(args, "limit", 10).clamp(1, 50) as usize;
+    let rows = crate::student::search_for_ai(store, &keyword, limit);
+    if rows.is_empty() {
+        return with_items(
+            if keyword.trim().is_empty() {
+                "通讯录里还没有人".to_string()
+            } else {
+                format!("通讯录里没找到「{keyword}」")
+            },
+            json!([]),
+        );
+    }
+    let summary = format!("找到 {} 人", rows.len());
+    with_items(summary, json!(rows))
+}
+
+fn sandbox_read(args: &Value) -> Value {
+    let path = arg_str(args, "path");
+    match crate::sandbox::read(&path) {
+        Ok(value) => {
+            let text = value.get("text").and_then(|one| one.as_str()).unwrap_or("");
+            json!({ "ok": true, "summary": format!("读了 {path}（{} 字）", text.chars().count()), "text": text })
+        }
+        Err(err) => fail(err),
+    }
+}
+
+fn sandbox_write(args: &Value) -> Value {
+    let path = arg_str(args, "path");
+    let content = arg_str(args, "content");
+    match crate::sandbox::write(&path, &content) {
+        Ok(value) => json!({
+            "ok": true,
+            "summary": format!("写到沙箱 {path}（{} 字）", content.chars().count()),
+            "where": value.get("where").cloned().unwrap_or(json!("")),
+        }),
+        Err(err) => fail(err),
+    }
+}
+
+fn sandbox_run(store: &Store, args: &Value) -> Value {
+    let command = arg_str(args, "command");
+    match crate::sandbox::run(store, &command) {
+        Ok(value) if value.get("ok") == Some(&json!(true)) => {
+            let output = value.get("output").and_then(|one| one.as_str()).unwrap_or("");
+            json!({ "ok": true, "summary": format!("命令跑完了（{} 字输出）", output.chars().count()), "output": output })
+        }
+        Ok(value) => {
+            let error = value
+                .get("error")
+                .and_then(|one| one.as_str())
+                .unwrap_or("命令没有成功");
+            fail(error.to_string())
+        }
+        Err(err) => fail(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 真数据用例：数据来自临时副本（见 `crate::testdata`），不碰用户的真实库。
     fn real_store() -> Store {
-        std::env::set_var(
-            "LUMINA_DATA_DIR",
-            r"E:\FIles\Lena‘s Files\Work\znw\Agent\data",
-        );
-        Store::open().expect("打不开数据库")
+        crate::testdata::real_store("ai_tools")
     }
 
     #[test]
     fn catalog_has_all_41_tools() {
         let all = catalog();
         println!("工具数：{}", all.len());
-        assert_eq!(all.len(), 41, "工具数量要和旧版一致");
-        for name in ["schedule_list", "web_search", "zip_extract", "mail_send"] {
+        // 旧版 41 个 + 本版新增的 4 个 Agent 沙箱工具 + 1 个通讯录工具
+        assert_eq!(all.len(), 46, "工具数量 = 旧版 41 + 沙箱 4 + 通讯录 1");
+        for name in [
+            "schedule_list",
+            "web_search",
+            "zip_extract",
+            "mail_send",
+            "sandbox_list",
+            "sandbox_read",
+            "sandbox_write",
+            "sandbox_run",
+        ] {
             assert!(all.iter().any(|one| one["name"] == name), "缺工具 {name}");
         }
     }
@@ -1324,7 +1513,62 @@ mod tests {
         }
     }
 
+    /// 危险工具要真的问用户；拒绝之后确实不执行（用户 2026-11-11 的 J8-3）
     #[test]
+    fn approved_tools_ask_the_user_and_respect_denial() {
+        let previous = std::env::var_os("LUMINA_DATA_DIR");
+        let dir = std::env::temp_dir().join(format!("danlume-tool-ask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LUMINA_DATA_DIR", &dir);
+        let store = Store::open().expect("临时库");
+        // 高风险工具默认是关的，先打开，才轮到「问用户」这一步
+        let _ = store.set_setting("tool_on_setting_set", "1");
+
+        // 1) 用户拒绝 → 不执行，库里也没变
+        let mut asked: Vec<String> = Vec::new();
+        let denied = dispatch_approved(
+            &store,
+            "setting_set",
+            &json!({ "key": "weather_city", "value": "北京" }),
+            &mut |name, _args| {
+                asked.push(name.to_string());
+                false
+            },
+        );
+        assert_eq!(asked, vec!["setting_set".to_string()], "危险工具必须先问一次");
+        assert_eq!(denied["denied"], json!(true));
+        assert_eq!(denied["ok"], json!(false));
+        assert!(denied["summary"].as_str().unwrap_or("").contains("没同意"));
+
+        // 2) 用户允许 → 这次真的执行
+        let allowed = dispatch_approved(
+            &store,
+            "setting_set",
+            &json!({ "key": "weather_city", "value": "北京" }),
+            &mut |_name, _args| true,
+        );
+        assert_eq!(allowed["ok"], json!(true));
+        assert_eq!(store.setting("weather_city").unwrap_or_default(), "北京");
+
+        // 3) 不需要审核的工具根本不打扰用户
+        let mut count = 0;
+        let _ = dispatch_approved(&store, "time_now", &json!({}), &mut |_name, _args| {
+            count += 1;
+            true
+        });
+        assert_eq!(count, 0, "只读工具不该弹审核");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+        match previous {
+            Some(value) => std::env::set_var("LUMINA_DATA_DIR", value),
+            None => std::env::remove_var("LUMINA_DATA_DIR"),
+        }
+    }
+
+    #[test]
+    #[ignore = "真数据用例：需要开发机上的真实数据目录（见 crate::testdata）"]
     fn definitions_respect_switches() {
         let store = real_store();
         let defs = definitions(&store);
@@ -1344,6 +1588,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "真数据用例：需要开发机上的真实数据目录（见 crate::testdata）"]
     fn dispatch_reads_real_data() {
         let store = real_store();
         let state = dispatch(&store, "app_state", &json!({}));
@@ -1375,6 +1620,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "真数据用例：需要开发机上的真实数据目录（见 crate::testdata）"]
     fn risky_tools_need_confirm() {
         let store = real_store();
         // pdf_download 默认就是开着的，用它测确认门，避免别的测试同时改开关
@@ -1389,6 +1635,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "真数据用例：需要开发机上的真实数据目录（见 crate::testdata）"]
     fn disabled_tool_is_refused() {
         let store = real_store();
         if tool_on(&store, "zip_extract") {

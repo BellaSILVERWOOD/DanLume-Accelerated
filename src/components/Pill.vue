@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 对应旧 widgets.Pill：一个小圆角标签（「11 门课 · 43 个作业」这种）
 withDefaults(
   defineProps<{
@@ -34,8 +34,8 @@ withDefaults(
   line-height: 1.35;
   white-space: nowrap;
 }
-/* macOS 风格层：标签更像系统胶囊（更小、更淡的描边） */
+/* macOS 风格层：标签更像系统胶囊（更小、更淡的描边）；不要内高光（见 SoftButton 的说明） */
 .pill {
   border: 1px solid var(--hairline, transparent);
-  box-shadow: var(--inner-highlight, none);
+  box-shadow: none;
 }</style>

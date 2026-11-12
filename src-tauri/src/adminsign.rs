@@ -270,15 +270,13 @@ pub fn verify_receipt(store: &Store, token: &str) -> SignResult<Value> {
 mod tests {
     use super::*;
 
+    /// 真数据用例：数据来自临时副本（见 `crate::testdata`），不碰用户的真实库。
     fn real_store() -> Store {
-        std::env::set_var(
-            "LUMINA_DATA_DIR",
-            r"E:\FIles\Lena‘s Files\Work\znw\Agent\data",
-        );
-        Store::open().expect("打不开数据库")
+        crate::testdata::real_store("adminsign")
     }
 
     #[test]
+    #[ignore = "真数据用例：需要开发机上的真实数据目录（见 crate::testdata）"]
     fn seal_roundtrip_with_real_keys() {
         let store = real_store();
         let pem = public_pem(&store);
@@ -333,6 +331,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "真数据用例：需要开发机上的真实数据目录（见 crate::testdata）"]
     fn receipt_roundtrip() {
         let store = real_store();
         if !has_private_key(&store) {

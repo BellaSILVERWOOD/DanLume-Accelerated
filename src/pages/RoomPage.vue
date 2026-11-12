@@ -1,181 +1,277 @@
 <script setup lang="ts">
-// 空教室 / eHall：真数据来自旧版抓好的缓存（ehall_cache_empty_room + 校区/教学楼/教室表），
-// 渲染成「一行一间教室、一列一个节次」的时间轴；网页放在内嵌窗口里打开。
+// 空教室（对应旧版 page_classroom.py）：选教学楼 →（可选）教室 → 查询 → 画时间轴。
+//
+// 用户 2026-11-11：「空教室页面就是空教室。ehall 的网页只要放在 ehall 页面里面就可以了。」
+// 所以这里**不显示**学校网页：查询时把「空闲教室查询」页开在窗口之外（看不见），
+// 由 Rust 在页面里选好校区/教学楼/教室、点「查询」，再把表格读回来画成时间轴。
+// 旧版 `classroom_show_web=0` 时也是这个效果（网页收起来，抓取照样跑）。
 import { computed, onMounted, ref } from "vue";
+import Card from "../components/Card.vue";
 import SoftButton from "../components/SoftButton.vue";
 import Pill from "../components/Pill.vue";
-import { classroomView, openWebWindow, type ClassroomView } from "../api";
+import {
+  classroomQuery,
+  classroomScrape,
+  classroomView,
+  settingsAll,
+  settingsSave,
+  type ClassroomRoom,
+  type ClassroomView,
+} from "../api";
 
-const props = defineProps<{ mode: "classroom" | "ehall" }>();
+const EHALL_HOME = "https://ehall.fudan.edu.cn/";
+const URL_KEY = "ehall_empty_room_url";
 
 const view = ref<ClassroomView | null>(null);
+const rooms = ref<ClassroomRoom[]>([]);
+const periods = ref<string[]>([]);
 const campus = ref("");
 const building = ref("");
 const room = ref("");
 const message = ref("");
 const busy = ref(false);
-
-const EHALL_URL = "https://ehall.fudan.edu.cn/";
-const CLASSROOM_URL = "https://ehall.fudan.edu.cn/";
-
-const title = computed(() => (props.mode === "ehall" ? "eHall" : "空教室"));
-const subtitle = computed(() =>
-  props.mode === "ehall"
-    ? "内嵌 eHall 网页，登录状态持久化"
-    : "选教学楼 →（可选）教室 → 点「查看」，右边画出每间教室的占用情况",
-);
+const url = ref(EHALL_HOME);
+const urlDraft = ref(EHALL_HOME);
 
 const campuses = computed(() => Object.keys(view.value?.maps || {}));
 const buildings = computed(() => view.value?.maps?.[campus.value] || []);
-const rooms = computed(() => view.value?.rooms?.[building.value] || []);
+const roomOptions = computed(() => view.value?.rooms?.[building.value] || []);
 
-/** 表头去掉「教室」「座」，只留节次；后端没给就用固定的 14 节 */
-const FALLBACK_SLOTS = [
-  "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
-  "十一", "十二", "十三", "十四",
-];
-const slots = computed(() => {
-  const fromCache = (view.value?.headers || []).filter((one) => /[一二三四五六七八九十]/.test(one));
-  return fromCache.length ? fromCache : FALLBACK_SLOTS;
+/** 表头：节次名（后端没给就用「第 N 节」） */
+const slotLabels = computed(() => {
+  const fromCache = (periods.value || []).filter((one) => one && one.trim());
+  if (fromCache.length) return fromCache;
+  const headers = (view.value?.headers || []).filter((one) => /[一二三四五六七八九十\d]/.test(one));
+  if (headers.length) return headers;
+  return Array.from({ length: 14 }, (_, index) => `第 ${index + 1} 节`);
 });
 
-const rows = computed(() => {
-  const all = view.value?.rows || [];
-  const filterBuilding = building.value;
-  return all
-    .filter((row) => {
-      if (room.value) return row[0] === room.value;
-      if (!filterBuilding) return true;
-      // 教室名前缀跟楼对得上（H3xxx 属于三教…）时只显示这一栋
-      return row[0].length > 1;
-    })
-    .slice(0, 60);
+/** 表头只写「窄得下」的那一段：`08:00-08:45` → `08:00`，`第 3 节` 原样 */
+function slotHead(label: string): string {
+  const text = (label || "").trim();
+  if (!text) return "";
+  const dash = text.search(/[-–—~]/);
+  if (dash > 0) return text.slice(0, dash).trim();
+  return text;
+}
+
+/** 只显示选中的那间教室 */
+const shown = computed(() => {
+  if (!rooms.value.length) return [];
+  if (room.value) {
+    const hit = rooms.value.filter((one) => one.name === room.value);
+    if (hit.length) return hit;
+  }
+  return rooms.value;
 });
 
 const stats = computed(() => {
-  const cells = rows.value.flatMap((row) => row.slice(2, 2 + slots.value.length));
-  const busyCells = cells.filter((cell) => (cell || "").trim()).length;
-  return { rooms: rows.value.length, busyCells, free: cells.length - busyCells };
+  let busyCells = 0;
+  let free = 0;
+  for (const one of shown.value) {
+    for (const cell of one.cells || []) {
+      if (cell.occupied) busyCells += 1;
+      else free += 1;
+    }
+  }
+  return { rooms: shown.value.length, busyCells, free };
 });
 
-function cellTitle(cell: string): string {
-  return (cell || "").trim() || "空着";
+function cellText(cell: { label?: string; raw?: string; occupied?: boolean }): string {
+  if (!cell?.occupied) return "空";
+  return (cell.label || cell.raw || "占用").slice(0, 24);
+}
+
+function applyRadio(data: ClassroomView) {
+  const cachedBuilding = data.building || "";
+  const preferred = Object.keys(data.maps || {}).find((name) =>
+    (data.maps?.[name] || []).includes(cachedBuilding),
+  );
+  if (!campus.value) campus.value = preferred || Object.keys(data.maps || {})[0] || "";
+  if (!building.value) building.value = cachedBuilding || buildings.value[0] || "";
 }
 
 async function load() {
   busy.value = true;
   try {
-    view.value = await classroomView();
-    // 默认选中「最近抓取那栋楼」所在的校区
-    const cachedBuilding = view.value.building || "";
-    const preferred = Object.keys(view.value.maps || {}).find((name) =>
-      (view.value?.maps?.[name] || []).includes(cachedBuilding),
-    );
-    campus.value = preferred || Object.keys(view.value.maps || {})[0] || "";
-    if (!buildings.value.includes(building.value)) {
-      building.value = cachedBuilding && buildings.value.includes(cachedBuilding)
-        ? cachedBuilding
-        : buildings.value[0] || "";
+    const data = await classroomView();
+    view.value = data;
+    rooms.value = data.grid || [];
+    periods.value = data.periods || [];
+    applyRadio(data);
+    if (data.ok) {
+      message.value = `最近一次查询：${data.value || ""}${
+        data.building ? " · " + data.building : ""
+      }${data.room ? " · " + data.room : ""}`;
+    } else {
+      message.value = "还没有空教室数据：选好校区/教学楼后点「查询」";
     }
-    message.value = view.value.ok
-      ? `最近一次抓取：${view.value.value || ""} · ${view.value.building || ""}${
-          view.value.room ? " · " + view.value.room : ""
-        }`
-      : "还没有空教室数据：先在旧版里查一次（或在内嵌网页里查一次），这里会显示最近一次的结果";
   } finally {
     busy.value = false;
   }
 }
 
-async function openSite() {
-  await openWebWindow(
-    props.mode === "ehall" ? "ehall" : "classroom-web",
-    props.mode === "ehall" ? EHALL_URL : CLASSROOM_URL,
-    props.mode === "ehall" ? "eHall" : "空闲教室查询",
-  );
+async function loadSettings() {
+  try {
+    const all = await settingsAll();
+    const values: Record<string, string> = all.values || {};
+    // 地址优先级与旧版一致：手填的查询页 → 仪表板「空教室」卡的取数地址（旧版
+    // `ehall_bridge._source_url("empty_room")` 就是它）→ eHall 首页
+    const stored = (values[URL_KEY] || values["ehall_json_empty_room"] || "").trim();
+    url.value = stored || EHALL_HOME;
+    urlDraft.value = url.value;
+  } catch {
+    url.value = EHALL_HOME;
+    urlDraft.value = EHALL_HOME;
+  }
 }
 
-function query() {
-  message.value = view.value?.ok
-    ? `显示最近一次抓取的结果（${view.value.value || ""}）。刷新抓取要在内嵌网页里查一次。`
-    : "还没有数据可显示";
+async function saveHome() {
+  const current = (urlDraft.value || "").trim() || url.value;
+  if (!current) return;
+  url.value = current;
+  await settingsSave({ [URL_KEY]: current, ehall_json_empty_room: current });
+  message.value = "已记住这个查询页地址，下次直接用它查";
 }
 
-onMounted(load);
+/** 查询：后台页面选条件 → 点「查询」→ 读表格 */
+async function query() {
+  if (busy.value) return;
+  if (!building.value && !campuses.value.length) {
+    message.value = "还没读到校区/教学楼：先点「设为首页」填查询页地址，再查一次";
+    return;
+  }
+  busy.value = true;
+  message.value = `正在查询 ${campus.value || ""} ${building.value || ""}${
+    room.value ? " " + room.value : ""
+  }…`;
+  try {
+    const result = await classroomQuery(campus.value, building.value, room.value, url.value);
+    if (result.ok && result.rooms?.length) {
+      rooms.value = result.rooms;
+      periods.value = result.periods || [];
+      message.value = `${result.value || "查到结果"}（${result.building || campus.value || "全部"}）`;
+      // 顺手刷新下拉（第一次查询后才知道有哪些楼/教室）
+      view.value = await classroomView();
+      applyRadio(view.value);
+    } else {
+      message.value = result.error || "没查到教室表：确认查询页地址、并在网页里登录 eHall";
+    }
+  } catch (err) {
+    message.value = `查询失败：${String(err)}`;
+  } finally {
+    busy.value = false;
+  }
+}
+
+/** 只重新读一次当前后台页面（不重新选条件） */
+async function scrape() {
+  if (busy.value) return;
+  busy.value = true;
+  message.value = "正在读页面…";
+  try {
+    const result = await classroomScrape(building.value, room.value);
+    if (result.ok && result.rooms?.length) {
+      rooms.value = result.rooms;
+      periods.value = result.periods || [];
+      message.value = `${result.value || "抓到结果"}（${result.building || "全部教学楼"}）`;
+    } else {
+      message.value = result.error || "页面上没找到教室表";
+    }
+  } catch (err) {
+    message.value = `抓取失败：${String(err)}`;
+  } finally {
+    busy.value = false;
+  }
+}
+
+onMounted(async () => {
+  await loadSettings();
+  await load();
+});
 </script>
 
 <template>
   <div class="page">
     <div class="page-head">
       <div class="titles">
-        <h1 class="h1">{{ title }}</h1>
-        <div class="muted">{{ subtitle }}</div>
+        <h1 class="h1">空教室</h1>
+        <div class="muted">
+          {{ message || "选校区 → 教学楼 →（可选）教室 → 点「查询」，右边画出每间教室的占用情况" }}
+        </div>
       </div>
       <div class="spacer" />
-      <Pill v-if="campuses.length" :text="`${campuses.length} 个校区`" :font-size="11.5" />
-      <SoftButton :height="32" :font-size="12.5" glyph="REFRESH" :disabled="busy" @click="load">
-        刷新
+      <Pill v-if="rooms.length" :text="`${rooms.length} 间教室`" :font-size="11.5" />
+      <SoftButton :height="32" :font-size="12.5" :disabled="busy" @click="scrape">重新读取</SoftButton>
+      <SoftButton :height="32" :font-size="12.5" @click="saveHome">设为首页</SoftButton>
+      <SoftButton :height="32" :font-size="12.5" :disabled="busy" @click="load">刷新</SoftButton>
+      <SoftButton variant="primary" :height="32" :font-size="12.5" :disabled="busy" @click="query">
+        查询
       </SoftButton>
-      <SoftButton :height="32" :font-size="12.5" glyph="FOLDER" @click="openSite">打开网页</SoftButton>
-      <SoftButton variant="primary" :height="32" :font-size="12.5" @click="query">查看</SoftButton>
     </div>
 
-    <div v-if="mode === 'classroom'" class="filters">
-      <label>
-        <span>校区</span>
-        <select v-model="campus" @change="building = buildings[0] || ''">
-          <option v-for="name in campuses" :key="name">{{ name }}</option>
-          <option v-if="!campuses.length" value="">（还没抓到）</option>
-        </select>
-      </label>
-      <label>
-        <span>教学楼</span>
-        <select v-model="building">
-          <option v-for="name in buildings" :key="name">{{ name }}</option>
-          <option v-if="!buildings.length" value="">（还没抓到）</option>
-        </select>
-      </label>
-      <label>
-        <span>教室</span>
-        <select v-model="room">
-          <option value="">全部教室</option>
-          <option v-for="name in rooms" :key="name">{{ name }}</option>
-        </select>
-      </label>
-      <span class="tiny">{{ message }}</span>
+    <div class="url-row">
+      <input v-model="urlDraft" type="text" placeholder="空闲教室查询页面的地址" @keyup.enter="saveHome" />
     </div>
 
-    <div class="board">
+    <Card :padding="12" class="board">
       <div class="board-head">
         <span class="label">教室占用情况</span>
-        <span v-if="view?.ok" class="tiny">
-          {{ stats.rooms }} 间教室 · 空着 {{ stats.free }} 个时段 · 占用 {{ stats.busyCells }} 个
+        <span v-if="shown.length" class="tiny">
+          {{ stats.rooms }} 间 · 空着 {{ stats.free }} 个时段 · 占用 {{ stats.busyCells }} 个
         </span>
         <span class="spacer" />
         <span class="tiny">一行一间教室，一列一个节次；悬停看课程</span>
       </div>
 
-      <div v-if="view?.ok && slots.length" class="timeline">
-        <div class="head-row">
+      <div class="filters">
+        <label>
+          <span>校区</span>
+          <select v-model="campus" @change="building = buildings[0] || ''">
+            <option v-for="name in campuses" :key="name">{{ name }}</option>
+            <option v-if="!campuses.length" value="">（还没读到）</option>
+          </select>
+        </label>
+        <label>
+          <span>教学楼</span>
+          <select v-model="building">
+            <option v-for="name in buildings" :key="name">{{ name }}</option>
+            <option v-if="!buildings.length" value="">（还没读到）</option>
+          </select>
+        </label>
+        <label>
+          <span>教室</span>
+          <select v-model="room">
+            <option value="">全部教室</option>
+            <option v-for="name in roomOptions" :key="name">{{ name }}</option>
+          </select>
+        </label>
+      </div>
+
+      <div v-if="shown.length" class="timeline">
+        <div class="grid-row head">
           <span class="room-col">教室</span>
-          <span v-for="slot in slots" :key="slot" class="slot-head">{{ slot.split(" ")[0] }}</span>        </div>
-        <div v-for="row in rows" :key="row[0]" class="row">
-          <span class="room-col">{{ row[0] }}</span>
+          <span v-for="(slot, index) in slotLabels" :key="`h-${index}`" class="slot-head">
+            {{ slotHead(slot) }}
+          </span>
+        </div>
+        <div v-for="one in shown" :key="one.name" class="grid-row">
+          <span class="room-col">{{ one.name }}</span>
           <span
-            v-for="(slot, index) in slots"
-            :key="`${row[0]}-${index}`"
+            v-for="(cell, index) in one.cells"
+            :key="`${one.name}-${index}`"
             class="cell"
-            :class="{ busy: (row[index + 2] || '').trim() }"
-            :title="cellTitle(row[index + 2] || '')"
+            :class="{ busy: cell.occupied }"
+            :title="cell.occupied ? `${cell.label || ''} ${cell.raw || ''}` : '空着'"
           >
-            {{ (row[index + 2] || "").trim() ? "占用" : "空" }}
+            {{ cellText(cell) }}
           </span>
         </div>
       </div>
       <div v-else class="empty">
-        {{ message || "点「查看」后，这里会画出每间教室的占用时段" }}
+        {{ message || "选好校区/教学楼后点「查询」，这里会画出每间教室的占用时段" }}
       </div>
-    </div>
+    </Card>
   </div>
 </template>
 
@@ -183,37 +279,25 @@ onMounted(load);
 .page {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   height: 100%;
+  min-height: 0;
 }
-.filters {
+.url-row {
   display: flex;
-  align-items: flex-end;
-  gap: 12px;
-  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
 }
-.filters label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.filters span {
-  font-size: 11.5px;
-  color: var(--muted);
-}
-.filters select {
-  min-width: 168px;
+.url-row input {
+  flex: 1;
+  height: 32px;
 }
 .board {
   flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
-  background: var(--card);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-card);
-  padding: 12px 14px;
-  min-height: 0;
 }
 .board-head {
   display: flex;
@@ -227,6 +311,26 @@ onMounted(load);
   font-weight: 640;
   color: var(--text-soft);
 }
+.filters {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.filters span {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.filters select {
+  min-width: 148px;
+  height: 28px;
+  flex: 0 0 auto;
+}
 .timeline {
   flex: 1;
   overflow: auto;
@@ -235,12 +339,18 @@ onMounted(load);
   gap: 2px;
   min-height: 0;
 }
-.head-row,
-.row {
+.grid-row {
   display: grid;
   grid-template-columns: 84px repeat(14, minmax(26px, 1fr));
   gap: 2px;
   align-items: center;
+}
+.grid-row.head {
+  position: sticky;
+  top: 0;
+  background: var(--card);
+  padding-bottom: 2px;
+  z-index: 1;
 }
 .slot-head {
   font-size: 10.5px;
@@ -253,17 +363,28 @@ onMounted(load);
   white-space: nowrap;
 }
 .cell {
-  height: 20px;
+  height: 22px;
   border-radius: 5px;
   font-size: 10px;
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
+  white-space: nowrap;
+  padding: 0 2px;
   background: color-mix(in srgb, var(--success) 12%, transparent);
   color: color-mix(in srgb, var(--success) 70%, var(--text));
 }
+/* 有课的格子：课程名从左边开始读，放不下就在**末尾**省略。
+   以前是 flex 居中 + overflow:hidden，字比格子宽时两头都被切掉，
+   屏幕上只剩中间那两三个字（「化教」之类），根本认不出是哪门课。 */
 .cell.busy {
-  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  display: block;
+  line-height: 22px;
+  text-align: left;
+  text-overflow: ellipsis;
+  padding: 0 5px;
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
   color: color-mix(in srgb, var(--danger) 80%, var(--text));
 }
 .empty {

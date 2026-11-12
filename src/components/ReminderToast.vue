@@ -5,10 +5,10 @@ import SoftButton from "../components/SoftButton.vue";
 import IconBadge from "../components/IconBadge.vue";
 import {
   dueReminders,
+  eventSetDone,
   markNotified,
   settingsAll,
   snoozeEvent,
-  updateEvent,
   type Reminder,
 } from "../api";
 
@@ -60,20 +60,21 @@ async function poll() {
 }
 
 async function done(item: Reminder) {
-  await markNotified(item.id);
-  await updateEvent(item.id, { done: true });
+  // 传 item.date：重复日程只把「这一次」标成完成，不会带成整条系列
+  await eventSetDone(item.id, true, item.date);
   dismiss(item);
 }
 
 async function snooze(item: Reminder) {
-  await snoozeEvent(item.id, 10);
-  dismiss(item);
+  // 只推迟，不记「已提醒」：10 分钟后还要再弹一次
+  await snoozeEvent(item.id, 10, item.date);
+  shown.value = shown.value.filter((one) => one.id !== item.id);
 }
 
 async function dismiss(item: Reminder) {
   shown.value = shown.value.filter((one) => one.id !== item.id);
   try {
-    await markNotified(item.id);
+    await markNotified(item.id, item.date);
   } catch {
     // 忽略
   }
@@ -111,10 +112,12 @@ onUnmounted(() => {
         <SoftButton :height="22" :font-size="11" @click="dismiss(item)">×</SoftButton>
       </div>
       <div class="actions">
+        <!-- 三个选项：知道了（只关掉）/ 标记完成 / 稍后 10 分钟提醒 -->
+        <SoftButton :height="26" :font-size="11.5" @click="dismiss(item)">我知道了</SoftButton>
         <SoftButton variant="primary" :height="26" :font-size="11.5" @click="done(item)">
           标记完成
         </SoftButton>
-        <SoftButton :height="26" :font-size="11.5" @click="snooze(item)">稍后 10 分钟</SoftButton>
+        <SoftButton :height="26" :font-size="11.5" @click="snooze(item)">稍后 10 分钟提醒</SoftButton>
       </div>
     </div>
   </div>
@@ -131,7 +134,7 @@ onUnmounted(() => {
   z-index: 60;
 }
 .toast {
-  width: 300px;
+  width: 372px;
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -166,6 +169,12 @@ onUnmounted(() => {
 .actions {
   display: flex;
   gap: 6px;
+  flex-wrap: wrap;
   justify-content: flex-end;
+}
+/* 三个按钮一行放得下：字号略小一点，别让「稍后 10 分钟提醒」换行 */
+.actions :deep(button) {
+  font-size: 11px;
+  white-space: nowrap;
 }
 </style>

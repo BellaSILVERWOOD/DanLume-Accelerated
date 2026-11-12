@@ -1,4 +1,4 @@
-﻿// 前端 → Rust 的唯一出口。
+// 前端 → Rust 的唯一出口。
 // 在 Tauri 里走 invoke；在浏览器里（npm run dev）自动降级为本地 mock，
 // 这样调界面不需要先把 Rust 编好。
 import { invoke } from "@tauri-apps/api/core";
@@ -15,6 +15,14 @@ export type EventRow = {
   done: boolean;
   group_id: number | null;
   repeat: string;
+  /** 重复日程里被跳过的那几天（逗号分隔） */
+  repeat_skip?: string;
+  /** 重复到哪一天为止（空 = 一直重复） */
+  repeat_until?: string;
+  /** 重复日程里已经完成的那几次（逗号分隔日期） */
+  done_dates?: string;
+  /** 展开出来的一次重复：母事件 id（母事件本身那一天没有这个字段） */
+  repeat_of?: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -211,7 +219,7 @@ export async function addEvent(payload: Partial<EventRow>): Promise<number> {
 
 export async function updateEvent(
   id: number,
-  patch: Partial<EventRow>,
+  patch: Partial<EventRow> & { clear_remind?: boolean },
 ): Promise<void> {
   if (!isTauri) {
     const target = MOCK_EVENTS.find((e) => e.id === id);
@@ -219,6 +227,38 @@ export async function updateEvent(
     return;
   }
   await invoke("update_event", { id, patch });
+}
+
+/**
+ * 标记完成 / 取消完成。
+ * `occurrenceDate` 是「哪一天的那一次」（重复日程只影响那一次，不会把整条系列
+ * 都标成已完成——这是用户反馈的那个 bug）。
+ */
+export async function eventSetDone(
+  id: number,
+  done: boolean,
+  occurrenceDate?: string,
+): Promise<boolean> {
+  if (!isTauri) {
+    const target = MOCK_EVENTS.find((e) => e.id === id);
+    if (target) {
+      if (target.repeat) {
+        const days = new Set((target.done_dates || "").split(",").filter(Boolean));
+        const day = occurrenceDate || target.date;
+        if (done) days.add(day);
+        else days.delete(day);
+        target.done_dates = [...days].sort().join(",");
+      } else {
+        target.done = done;
+      }
+    }
+    return true;
+  }
+  return invoke<boolean>("event_set_done", {
+    id,
+    done,
+    occurrenceDate: occurrenceDate ?? null,
+  });
 }
 
 export async function deleteEvent(id: number): Promise<void> {
@@ -550,9 +590,17 @@ const MOCK_MAILS: MailSummary[] = [
 
 export async function mailList(
   limit = 30,
-): Promise<{ ok: boolean; items: MailSummary[]; error: string }> {
+): Promise<{ ok: boolean; items: MailSummary[]; error: string; cached?: number }> {
   if (!isTauri) return { ok: true, items: MOCK_MAILS, error: "" };
   return invoke("mail_list", { limit });
+}
+
+/** 增量同步收件箱：只取服务器上 UID 更大的新邮件（旧版 uid 缓存做法） */
+export async function mailSync(
+  limit = 50,
+): Promise<{ ok: boolean; added?: number; fetched?: number; cached?: number; error?: string }> {
+  if (!isTauri) return { ok: true, added: 0 };
+  return invoke("mail_sync", { limit });
 }
 
 export async function mailBody(
@@ -573,6 +621,52 @@ export async function mailBody(
       error: "",
     };
   return invoke("mail_body", { uid });
+}
+
+/** 摘要顺手抽出来的「可能要加进日程的事」（前端画成可勾选的圆圈） */
+export type MailEventSuggestion = {
+  title: string;
+  date: string;
+  start_time: string;
+  end_time: string;
+  note: string;
+};
+
+/**
+ * 邮件顶端的 AI 摘要：走后端缓存的 `summary_zh`，同一封邮件只花一次 token。
+ * `force = true` 是「重新生成」；没配接口时返回 `ok:false` + 中文提示。
+ */
+export async function mailSummarize(
+  uid: string,
+  force = false,
+): Promise<{
+  ok: boolean;
+  summary: string;
+  cached: boolean;
+  error: string;
+  events?: MailEventSuggestion[];
+  model?: string;
+}> {
+  if (!isTauri)
+    return {
+      ok: true,
+      summary: "· 这是浏览器预览里的示例摘要，真的跑起来会调用你在 AI 页配的接口。",
+      cached: false,
+      error: "",
+      events: [
+        { title: "提交材料", date: "2026-11-18", start_time: "12:00", end_time: "", note: "示例" },
+      ],
+      model: "demo",
+    };
+  return invoke("mail_summarize", { uid, force });
+}
+
+/** 把勾选出来的「可能要加进日程的事」真的加进日历（走 AI 的 schedule_add 工具） */
+export async function mailAddEvents(
+  items: MailEventSuggestion[],
+): Promise<{ ok: boolean; added: number; results: unknown[]; error: string }> {
+  if (!isTauri) return { ok: true, added: items.length, results: [], error: "" };
+  return invoke("mail_add_events", { items });
 }
 
 const MOCK_SENT: MailRecord[] = [];
@@ -640,6 +734,350 @@ export async function homeworkItems(): Promise<{
 }> {
   if (!isTauri) return { ok: true, total: 0, courses: [], downloads: "" };
   return invoke("homework_items");
+}
+
+/** 真去 eLearning 拉一次 To Do（旧版 `elearning.todo_items` + `dashboard.save_assignments`） */
+export async function homeworkSync(): Promise<{
+  ok: boolean;
+  items?: { title: string; course: string; due: string; due_at?: string; url?: string; kind?: string }[];
+  at?: string;
+  error?: string;
+}> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("homework_sync");
+}
+
+/** 下载目录里还没归类的文件 + 可选的课程目录（用户手动归类） */
+export type Unclassified = {
+  ok: boolean;
+  root: string;
+  files: { name: string; size: number }[];
+  courses: string[];
+};
+
+export async function homeworkUnclassified(): Promise<Unclassified> {
+  if (!isTauri) return { ok: true, root: "", files: [], courses: [] };
+  return invoke<Unclassified>("homework_unclassified");
+}
+
+/** 把根目录里的文件挪进指定课程目录 */
+export async function homeworkClassify(
+  path: string,
+  course: string,
+): Promise<{ ok: boolean; moved: boolean; deduped?: boolean; target?: string; error?: string }> {
+  if (!isTauri) return { ok: false, moved: false, error: "browser preview" };
+  return invoke("homework_classify", { path, course });
+}
+
+/** 文献在线检索（arXiv + Crossref）与入库（对应旧版 `lit.search_all` / `add_paper`） */
+export type PaperSearchHit = {
+  source: string;
+  source_id: string;
+  title: string;
+  authors: string;
+  year: string;
+  venue: string;
+  abstract?: string;
+  url?: string;
+  pdf_url?: string;
+  doi?: string;
+};
+
+export type PaperSearchPage = {
+  ok: boolean;
+  results: PaperSearchHit[];
+  errors?: string[];
+  /** 每个来源这一页返回了多少条（过滤之后） */
+  counts?: { arxiv: number; crossref: number; semantic?: number };
+  /** 每个来源这一页**取回**了多少条（过滤之前，用来判断还能不能翻） */
+  raw?: { arxiv: number; crossref: number; semantic?: number };
+  /** Crossref / Semantic Scholar 报的「一共多少条」（arXiv 也报，但常常是 0） */
+  totals?: { arxiv: number; crossref: number; semantic?: number };
+  /** 这次检索实际要求出现的关键词（多词时按 AND 过滤） */
+  terms?: string[];
+  /**
+   * 严格匹配（每个词都要出现）一条都没有时，后端会自动放宽成「任一关键词命中」
+   * 并按命中词数排序；这时 `relaxed = true`。
+   */
+  relaxed?: boolean;
+  offset?: number;
+  limit?: number;
+  /** 还有下一页（某个来源这一页拿满了） */
+  more?: boolean;
+};
+
+/** 检索结果里额外带的「命中词数」字段 */
+export type PaperSearchHitWithCoverage = PaperSearchHit & {
+  matched_terms?: number;
+  total_terms?: number;
+};
+
+/**
+ * 在线检索（arXiv + Crossref）。`offset` 用来「再看下一页」：
+ * 以前固定只取 10 条/来源，搜 MRI 也只有 20 条，用户直接质疑「怎么可能只有 20 条」。
+ */
+export async function papersSearch(
+  query: string,
+  limit = 20,
+  offset = 0,
+): Promise<PaperSearchPage> {
+  if (!isTauri) return { ok: false, results: [] };
+  return invoke<PaperSearchPage>("papers_search", { query, limit, offset });
+}
+
+export async function papersAdd(
+  item: PaperSearchHit,
+  project?: string,
+): Promise<{ ok: boolean; id?: number; error?: string }> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("papers_add", { item, project });
+}
+
+/**
+ * 把这篇文献的 PDF 下到文献库目录（`library/<项目>/<年份>/<标题>.pdf`）。
+ * 对应旧版 `lit.download_pdf`：已经有文件就直接返回，不是 `%PDF` 就报「要登录」。
+ */
+export async function papersDownload(
+  id: number,
+): Promise<{ ok: boolean; path?: string; folder?: string; bytes?: number; summary: string }> {
+  if (!isTauri) return { ok: false, summary: "浏览器预览里不能下载" };
+  return invoke("papers_download", { id });
+}
+
+/** 参考文献（BibTeX / RIS / DOI）：对应旧版 `refs.py` */
+/* ---------------------------------------------------------------- 学生工作（通讯录 / 定时通知） */
+
+export type Contact = {
+  id: number;
+  name: string;
+  title?: string;
+  email?: string;
+  phone?: string;
+  /** 你在微信里给这个人的备注名 */
+  wechat?: string;
+  qq?: string;
+  /** 其它联系方式（飞书 / 钉钉 / webhook…） */
+  extra?: string;
+  note?: string;
+  updated_at?: string;
+};
+
+export async function contactsList(keyword = ""): Promise<Contact[]> {
+  if (!isTauri) return [];
+  return invoke<Contact[]>("contacts_list", { keyword });
+}
+
+export async function contactsSave(item: Partial<Contact>): Promise<number> {
+  if (!isTauri) return 0;
+  return invoke<number>("contacts_save", { item });
+}
+
+export async function contactsDelete(id: number): Promise<void> {
+  if (!isTauri) return;
+  await invoke("contacts_delete", { id });
+}
+
+/** AI 能不能读通讯录（默认关；勾选状态存在设置里） */
+export async function contactsAiAllowed(): Promise<boolean> {
+  if (!isTauri) return false;
+  return invoke<boolean>("contacts_ai_allowed");
+}
+
+export async function contactsSetAiAllowed(on: boolean): Promise<boolean> {
+  if (!isTauri) return on;
+  return invoke<boolean>("contacts_set_ai_allowed", { on });
+}
+
+/* ---------------------------------------------------------------- 看板娘悬浮球 */
+
+export async function mascotOpen(): Promise<void> {
+  if (!isTauri) return;
+  await invoke("mascot_open");
+}
+
+export async function mascotClose(): Promise<void> {
+  if (!isTauri) return;
+  await invoke("mascot_close");
+}
+
+/** 悬浮球收到的东西交给主窗口的 AI 面板（文件走路径，文字走 text） */
+export async function mascotSend(text: string, paths: string[] = []): Promise<void> {
+  if (!isTauri) return;
+  await invoke("mascot_send", { text, paths });
+}
+
+/** 主窗口这边监听悬浮球发来的内容 */
+export async function onMascotSend(
+  handler: (payload: { text: string; paths: string[] }) => void,
+): Promise<() => void> {
+  if (!isTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ text: string; paths: string[] }>("mascot:send", (event) =>
+    handler(event.payload),
+  );
+}
+
+/**
+ * 读当前微信聊天（J8-4，对应旧版 `wechat_read.py`）：
+ * 截图 → Windows 自带 OCR → 清洗；直读失败会自动退回剪贴板。
+ * `useClipboard = true` 时直接读剪贴板（用户自己右键复制了消息）。
+ */
+export async function wechatRead(
+  useClipboard = false,
+): Promise<{ ok: boolean; text?: string; how?: string; warning?: string; error?: string }> {
+  if (!isTauri) return { ok: false, error: "浏览器预览里读不了微信" };
+  return invoke("wechat_read", { useClipboard });
+}
+
+/** 定时通知的收件人：可以是通讯录里的人，也可以直接填地址 */
+export type NoticeTarget = { type: "contact" | "raw"; id?: number; address?: string; label?: string };
+
+export type StudentNotice = {
+  id: number;
+  title: string;
+  body: string;
+  /** email / webhook / wechat */
+  channel: string;
+  targets: NoticeTarget[];
+  send_at: string;
+  /** "" / daily / weekly */
+  repeat: string;
+  status: string;
+  last_error: string;
+  last_sent_at: string;
+};
+
+export async function studentNotices(): Promise<StudentNotice[]> {
+  if (!isTauri) return [];
+  return invoke<StudentNotice[]>("student_notices");
+}
+
+export async function studentNoticeSave(item: Partial<StudentNotice>): Promise<number> {
+  if (!isTauri) return 0;
+  return invoke<number>("student_notice_save", { item });
+}
+
+export async function studentNoticeDelete(id: number): Promise<void> {
+  if (!isTauri) return;
+  await invoke("student_notice_delete", { id });
+}
+
+export async function studentNoticeSend(
+  id: number,
+): Promise<{ ok: boolean; sent: number; error: string }> {
+  if (!isTauri) return { ok: true, sent: 1, error: "" };
+  return invoke("student_notice_send", { id });
+}
+
+export type RefEntry = {
+  id: number;
+  kind: string;
+  title: string;
+  authors: string;
+  year: string;
+  venue: string;
+  doi: string;
+  url: string;
+  note: string;
+  created_at?: string;
+};
+
+export async function refsList(limit = 200): Promise<{ ok: boolean; items: RefEntry[]; total: number }> {
+  if (!isTauri) return { ok: false, items: [], total: 0 };
+  return invoke("refs_list", { limit });
+}
+
+export async function refsImport(input: {
+  text?: string;
+  path?: string;
+  format?: "auto" | "bibtex" | "ris";
+}): Promise<{ ok: boolean; parsed?: number; added?: number; skipped?: number; error?: string }> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("refs_import", input);
+}
+
+export async function refsAddDoi(doi: string): Promise<{
+  ok: boolean;
+  added?: number;
+  entry?: RefEntry;
+  error?: string;
+}> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("refs_add_doi", { doi });
+}
+
+export async function refsDelete(id: number): Promise<{ ok: boolean }> {
+  if (!isTauri) return { ok: false };
+  return invoke("refs_delete", { id });
+}
+
+export async function refsExport(
+  format: "ris" | "bibtex" | "enw" = "ris",
+  path?: string,
+): Promise<{ ok: boolean; path?: string; error?: string }> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("refs_export", { format, path });
+}
+
+/** EndNote 装没装（旧版 `endnote.detect()`：注册表 + 常见安装目录） */
+export type EndnoteState = { found: boolean; path: string; summary: string };
+
+export async function endnoteDetect(): Promise<EndnoteState> {
+  if (!isTauri)
+    return { found: false, path: "", summary: "浏览器预览里查不了本机装没装 EndNote" };
+  return invoke<EndnoteState>("endnote_detect");
+}
+
+/** 用 EndNote 打开刚导出的 .enw / .ris；没装返回 `{ok:false, found:false}` */
+export async function endnoteOpen(
+  path: string,
+): Promise<{ ok: boolean; found: boolean; error: string }> {
+  if (!isTauri) return { ok: false, found: false, error: "浏览器预览里打不开" };
+  return invoke("endnote_open", { path });
+}
+
+/** 退信识别：扫收件箱里的退信，把发件箱对应邮件标成 bounced（旧版 `bounce.py`） */
+export async function bounceSync(): Promise<{
+  ok: boolean;
+  scanned?: number;
+  marked?: { mail_id: number; to: string; reason: string; code: string }[];
+  error?: string;
+}> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("bounce_sync");
+}
+
+/** 重要日（倒计时）：对应旧版 `important.py`，Rust 以前只有表没有界面 */
+export type ImportantDate = {
+  id: number;
+  title: string;
+  date: string;
+  note: string;
+  color: string;
+  kind: string;
+  days: number;
+  left: string;
+};
+
+export async function importantList(): Promise<{ ok: boolean; items: ImportantDate[] }> {
+  if (!isTauri) return { ok: false, items: [] };
+  return invoke("important_list");
+}
+
+export async function importantSave(input: {
+  id?: number;
+  title: string;
+  date: string;
+  note?: string;
+  color?: string;
+}): Promise<{ ok: boolean; date?: string; error?: string }> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("important_save", input);
+}
+
+export async function importantDelete(id: number): Promise<{ ok: boolean; error?: string }> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("important_delete", { id });
 }
 
 export async function homeworkWriteDeadlines(
@@ -797,10 +1235,25 @@ export async function ehallOpen(key: string): Promise<{
 
 /* -------------------------------------------------------------- 空教室 */
 
+export type ClassroomCell = {
+  label: string;
+  occupied: boolean;
+  slot?: number;
+  raw?: string;
+};
+
+export type ClassroomRoom = {
+  name: string;
+  cells: ClassroomCell[];
+};
+
 export type ClassroomView = {
   ok: boolean;
   maps: Record<string, string[]>;
   rooms: Record<string, string[]>;
+  /** 抓取好的「教室 × 节次」（新版缓存；旧版缓存没有这一项） */
+  grid?: ClassroomRoom[];
+  periods?: string[];
   building: string | null;
   room: string | null;
   value: string | null;
@@ -810,12 +1263,47 @@ export type ClassroomView = {
   rows: string[][];
 };
 
+export type ClassroomScrape = {
+  ok: boolean;
+  rooms: ClassroomRoom[];
+  periods?: string[];
+  value: string;
+  error: string;
+  url: string;
+  building: string;
+  room: string;
+  ts: number;
+};
+
+/** 抓当前（后台隐藏的）查询页里的教室表，对应旧版「抓取当前页面」 */
+export async function classroomScrape(
+  building: string,
+  room: string,
+): Promise<ClassroomScrape> {
+  return invoke<ClassroomScrape>("classroom_scrape", { building, room });
+}
+
+/**
+ * 查询：让后台那个隐藏的查询页选好校区/教学楼/教室、点「查询」，再把表格读回来。
+ * 对应旧版 `page_classroom.query_requested` → `ehall_bridge.classroom_query`。
+ */
+export async function classroomQuery(
+  campus: string,
+  building: string,
+  room: string,
+  url: string,
+): Promise<ClassroomScrape> {
+  return invoke<ClassroomScrape>("classroom_query", { campus, building, room, url });
+}
+
 export async function classroomView(): Promise<ClassroomView> {
   if (!isTauri)
     return {
       ok: false,
       maps: {},
       rooms: {},
+      grid: [],
+      periods: [],
       building: null,
       room: null,
       value: null,
@@ -888,7 +1376,9 @@ export interface ToolInfo {
 export async function aiChatTools(
   messages: ChatMessage[],
   temperature = 0.7,
-): Promise<{ text: string; rounds: number; log: ToolLogEntry[]; tools_on: number }> {
+  images: string[] = [],
+  scene = "",
+): Promise<AiChatResult> {
   if (!isTauri) {
     const last = messages.filter((one) => one.role === "user").pop();
     return {
@@ -898,7 +1388,156 @@ export async function aiChatTools(
       tools_on: 0,
     };
   }
-  return invoke("ai_chat_tools", { messages, temperature });
+  return invoke("ai_chat_tools", {
+    messages,
+    temperature,
+    images: images.length ? images : null,
+    scene: scene || null,
+  });
+}
+
+/** 流式对话的一小段增量（后端 `ai:delta` 事件） */
+export type AiDelta = { id: string; kind: "text" | "reasoning" | "tool"; text: string };
+
+/** 一次带工具的对话结果（一次性 / 流式两条路返回同一个形状） */
+export type AiChatResult = {
+  text: string;
+  rounds: number;
+  log: ToolLogEntry[];
+  tools_on: number;
+  memory_injected?: number;
+  remembered?: number;
+  reasoning?: string;
+  usage?: { prompt: number; completion: number; total: number };
+  /** 用户中途点了「停止生成」 */
+  stopped?: boolean;
+};
+
+/** 订阅流式增量，返回取消订阅的函数 */
+export async function onAiDelta(handler: (payload: AiDelta) => void): Promise<() => void> {
+  if (!isTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<AiDelta>("ai:delta", (event) => handler(event.payload));
+}
+
+/**
+ * 流式对话：正文一小段一小段推回来（事件 `ai:delta`），`reqId` 用来认领自己的增量。
+ *
+ * 想中途停下就调 `aiCancelStream(reqId)`；返回里的 `stopped` 会是 true，已经收到的字不丢。
+ */
+export async function aiChatStream(
+  reqId: string,
+  messages: ChatMessage[],
+  temperature = 0.7,
+  images: string[] = [],
+  scene = "",
+): Promise<AiChatResult> {
+  if (!isTauri) {
+    const last = messages.filter((one) => one.role === "user").pop();
+    return {
+      text: `（浏览器预览）你说：${last?.content ?? ""}`,
+      rounds: 0,
+      log: [],
+      tools_on: 0,
+    };
+  }
+  return invoke("ai_chat_stream", {
+    reqId,
+    messages,
+    temperature,
+    images: images.length ? images : null,
+    scene: scene || null,
+  });
+}
+
+/** 请后端停下某个流式请求（「停止生成」按钮） */
+export async function aiCancelStream(reqId: string): Promise<boolean> {
+  if (!isTauri) return true;
+  return invoke<boolean>("ai_cancel_stream", { reqId });
+}
+
+/** 危险工具要用户点头时后端发来的请求 */
+export type AiConfirm = {
+  id: string;
+  tool: string;
+  label: string;
+  target: string;
+  reason: string;
+  risk: "high" | "low";
+  args: Record<string, unknown>;
+};
+
+/** 订阅「要你点头」的请求，返回取消订阅的函数 */
+export async function onAiConfirm(handler: (payload: AiConfirm) => void): Promise<() => void> {
+  if (!isTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<AiConfirm>("ai:confirm", (event) => handler(event.payload));
+}
+
+/** 回答：allow（就这一次）/ session（本次会话都允许）/ deny */
+export async function aiConfirm(id: string, choice: "allow" | "session" | "deny"): Promise<boolean> {
+  if (!isTauri) return false;
+  return invoke<boolean>("ai_confirm", { id, choice });
+}
+
+/** 清掉「本次会话都允许」的记录 */
+export async function aiConfirmReset(): Promise<boolean> {
+  if (!isTauri) return false;
+  return invoke<boolean>("ai_confirm_reset");
+}
+
+/** 场景提示词清单（旧版 `prompts.load()["scenes"]`，给 AI 面板「场景」下拉用） */
+export type AiScene = { key: string; title: string };
+
+export async function aiScenes(): Promise<{ ok: boolean; scenes: AiScene[] }> {
+  if (!isTauri) return { ok: true, scenes: [] };
+  return invoke("ai_scenes");
+}
+
+/** 拖进来的路径展开成可当附件的文件（文件夹递归、按后缀过滤、去重） */
+export type AiFileCandidate = {
+  path: string;
+  name: string;
+  size: number;
+  kind: "text" | "office" | "pdf" | "image" | "";
+};
+
+export async function aiExpandPaths(
+  paths: string[],
+): Promise<{ ok: boolean; files: AiFileCandidate[]; notes: string[] }> {
+  if (!isTauri || !paths.length) return { ok: true, files: [], notes: [] };
+  return invoke("ai_expand_paths", { paths });
+}
+
+/** Agent 沙箱：AI 只能在自己的目录里读写；跑命令默认关闭 */
+export type SandboxEntry = { name: string; path: string; dir: boolean; size: number };
+export type SandboxState = {
+  ok: boolean;
+  root: string;
+  run: boolean;
+  entries: SandboxEntry[];
+};
+
+export async function agentSandboxState(): Promise<SandboxState> {
+  if (!isTauri) return { ok: true, root: "", run: false, entries: [] };
+  return invoke<SandboxState>("agent_sandbox_state");
+}
+
+export async function agentSandboxOpen(): Promise<void> {
+  if (!isTauri) return;
+  await invoke("agent_sandbox_open");
+}
+
+export async function agentSandboxSetRun(on: boolean): Promise<{ ok: boolean; run: boolean }> {
+  if (!isTauri) return { ok: true, run: on };
+  return invoke("agent_sandbox_set_run", { on });
+}
+
+export async function agentSandboxRun(
+  command: string,
+): Promise<{ ok: boolean; timed_out?: boolean; code?: number; output?: string; error?: string }> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("agent_sandbox_run", { command });
 }
 
 /** 工具清单（Rust 侧真值，与设置页的开关同源） */
@@ -1101,6 +1740,18 @@ export async function aiSaveSession(
   return invoke<number>("ai_save_session", { title, model, payload });
 }
 
+/** 改历史会话的标题 */
+export async function aiSessionRename(id: number, title: string): Promise<void> {
+  if (!isTauri) return;
+  await invoke("ai_session_rename", { id, title });
+}
+
+/** 删掉一条历史会话 */
+export async function aiSessionDelete(id: number): Promise<void> {
+  if (!isTauri) return;
+  await invoke("ai_session_delete", { id });
+}
+
 export type DataInfo = {
   data_dir: string;
   db_path: string;
@@ -1211,6 +1862,8 @@ export type Reminder = {
   start_time: string;
   end_time: string;
   remind_at: string;
+  remind_minutes?: number | null;
+  repeat?: string;
 };
 
 export async function dueReminders(): Promise<Reminder[]> {
@@ -1218,14 +1871,30 @@ export async function dueReminders(): Promise<Reminder[]> {
   return invoke<Reminder[]>("due_reminders");
 }
 
-export async function markNotified(id: number): Promise<void> {
+/** 记「这一次提醒过了」；重复日程传 occurrenceDate，只按天记 */
+export async function markNotified(id: number, occurrenceDate?: string): Promise<void> {
   if (!isTauri) return;
-  await invoke("mark_notified", { id });
+  await invoke("mark_notified", { id, occurrenceDate: occurrenceDate ?? null });
 }
 
-export async function snoozeEvent(id: number, minutes = 10): Promise<string> {
+/** 「稍后 10 分钟」；重复日程只推迟那一天 */
+export async function snoozeEvent(
+  id: number,
+  minutes = 10,
+  occurrenceDate?: string,
+): Promise<string> {
   if (!isTauri) return "";
-  return invoke<string>("snooze_event", { id, minutes });
+  return invoke<string>("snooze_event", {
+    id,
+    minutes,
+    occurrenceDate: occurrenceDate ?? null,
+  });
+}
+
+/** 整条重复系列一起标完成 / 取消 */
+export async function eventSeriesDone(id: number, done: boolean): Promise<boolean> {
+  if (!isTauri) return true;
+  return invoke<boolean>("event_series_done", { id, done });
 }
 
 /** 兜底：把页面原文粘进来，交给 Rust 解析并写缓存 */
@@ -1278,6 +1947,16 @@ export async function latexPdf(
   if (!isTauri)
     return { ok: false, path: "", error: "浏览器预览里不能编译 PDF" };
   return invoke("latex_pdf", { body, name: name ?? null });
+}
+
+/** 把选中文字里的公式转成 LaTeX（AI）；`latex` 是替换选区后的完整文本 */
+export async function latexFormulaFromText(
+  text: string,
+  display = false,
+): Promise<{ ok: boolean; latex: string; advice: string; error: string }> {
+  if (!isTauri)
+    return { ok: false, latex: "", advice: "", error: "浏览器预览里不能调用 AI" };
+  return invoke("latex_formula_from_text", { text, display });
 }
 
 /* ---------------------------------------------------------------- 窗口 */
@@ -1351,6 +2030,9 @@ export async function uisCapture(): Promise<{
   ok: boolean;
   cookies?: number;
   names?: string[];
+  has_castgc?: boolean;
+  has_service_session?: boolean;
+  verdict?: string;
   error?: string;
 }> {
   if (!isTauri) return { ok: false, error: "browser preview" };
@@ -1360,9 +2042,18 @@ export async function uisCapture(): Promise<{
 export async function jwglProbe(semester?: string): Promise<{
   ok: boolean;
   url?: string;
+  semester?: string;
+  semester_sniffed?: boolean;
   shape?: string;
   bytes?: number;
   top_keys?: string[];
+  /** 诊断时顺手解析出来的课表格子数（不写库） */
+  slots?: number;
+  sample_titles?: string[];
+  /** 教务页面上写的「学年起始日期」 */
+  term_start?: string;
+  /** 换算出来的第一周周一 */
+  first_monday?: string;
   head?: string;
   error?: string;
 }> {
@@ -1370,10 +2061,38 @@ export async function jwglProbe(semester?: string): Promise<{
   return invoke("jwgl_probe", { semester });
 }
 
+/**
+ * 导入教务课表：先抓 `semester/<数字 id>/print-data`，再解析成日程。
+ * `termStart` 是学期第一周周一（YYYY-MM-DD），`semester` 是教务 URL 里的数字学期号。
+ */
+export async function jwglImport(
+  termStart: string,
+  semester?: string,
+): Promise<{
+  ok: boolean;
+  added?: number;
+  skipped?: number;
+  slots?: number;
+  bytes?: number;
+  semester?: string;
+  semester_sniffed?: boolean;
+  /** 这次实际用的第一周周一（留空时会从教务页面的「学年起始日期」换算） */
+  term_start?: string;
+  term_start_sniffed?: boolean;
+  error?: string;
+}> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("jwgl_import", { termStart, semester });
+}
+
 export async function canvasProbe(): Promise<{
   ok: boolean;
   courses?: number;
   names?: string[];
+  /** 课程清单（id + 课程名），诊断时顺手记进 canvas_course_list */
+  list?: { id: string; name: string }[];
+  /** 诊断挑出来的默认课程（第一门真的能列文件的课） */
+  current?: { id: string; name: string; files: number } | null;
   error?: string;
 }> {
   if (!isTauri) return { ok: false, error: "browser preview" };
@@ -1546,6 +2265,9 @@ export type AccountState = {
   enabled: boolean;
   logged_in: boolean;
   username: string;
+  /** 服务器账号的角色（user / admin）；由 /me 缓存下来，客户端据此决定显示不显示管理员入口 */
+  role?: string;
+  is_admin?: boolean;
   account_id: string;
   device_fingerprint: string;
   token_expires_at: string;
@@ -1667,6 +2389,22 @@ export async function requestEmailCode(email: string): Promise<EmailCodeResult> 
     return { ok: true, email: email.trim(), expires_in: 600, cooldown: 60 };
   }
   return invoke<EmailCodeResult>("account_request_email_code", { email });
+}
+
+/** 忘记密码第一步：请求重置验证码（服务器只在邮箱注册过时才真发，但响应是一样的） */
+export async function requestResetCode(email: string): Promise<EmailCodeResult> {
+  if (!isTauri) return { ok: true, email: email.trim(), expires_in: 600, cooldown: 60 };
+  return invoke<EmailCodeResult>("account_request_reset_code", { email });
+}
+
+/** 忘记密码第二步：验证码 + 新口令 */
+export async function resetPassword(
+  email: string,
+  code: string,
+  password: string,
+): Promise<{ ok: boolean; message: string }> {
+  if (!isTauri) return { ok: true, message: "（浏览器预览）密码已重置" };
+  return invoke("account_reset_password", { email, code, password });
 }
 
 export async function accountRegister(
@@ -1829,3 +2567,357 @@ export async function onAnnouncement(
   }
 }
 
+/* ------------------------------------------------------- 文献方法流程图
+ *
+ * 对齐旧版 lit_flow.py：后端问模型要「结构化步骤」，前端用 CSS + SVG 自己画
+ * （旧版是 QPainter 画 PNG，v2 不落图片，直接画节点卡片）。
+ * 结果按文献 id 存 data/lit_flows/flow-<id>.json，重启后 litFlowLoad 还能读回来。
+ */
+
+export type FlowNode = {
+  id: string;
+  label: string;
+  detail: string;
+};
+
+export type FlowEdge = {
+  from: string;
+  to: string;
+  label?: string;
+};
+
+export type LitFlow = {
+  ok: boolean;
+  paper_id?: number;
+  title: string;
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+  /** true = 模型没按 JSON 回，已经降级成「纯文本步骤列表」 */
+  fallback?: boolean;
+  /** true = 直接用上次存下来的结果（没再花钱问一次模型） */
+  cached?: boolean;
+  saved?: boolean;
+  path?: string;
+  generated_at?: string;
+  /** true = 没有可用的 API Key / 配置，界面要引导去 设置 → AI */
+  need_key?: boolean;
+  /** 降级时模型的原话（前端「步骤列表」下面可以显示） */
+  raw?: string;
+  error: string;
+};
+
+function mockFlow(): LitFlow {
+  return {
+    ok: true,
+    title: "示例：方法流程",
+    nodes: [
+      { id: "n1", label: "读入数据", detail: "浏览器预览里的假数据" },
+      { id: "n2", label: "预处理", detail: "真实环境会由模型拆出来" },
+      { id: "n3", label: "训练模型", detail: "" },
+      { id: "n4", label: "汇报结果", detail: "" },
+    ],
+    edges: [
+      { from: "n1", to: "n2", label: "" },
+      { from: "n2", to: "n3", label: "" },
+      { from: "n3", to: "n4", label: "" },
+    ],
+    fallback: false,
+    cached: false,
+    saved: false,
+    generated_at: "",
+    error: "",
+  };
+}
+
+export async function litFlowGenerate(
+  paperId: number,
+  opts: { text?: string; title?: string; force?: boolean } = {},
+): Promise<LitFlow> {
+  if (!isTauri) return mockFlow();
+  return invoke<LitFlow>("lit_flow_generate", {
+    paperId,
+    text: opts.text ?? "",
+    title: opts.title ?? "",
+    force: opts.force ?? false,
+  });
+}
+
+/** 读回这篇文献上次生成的流程图（重启后还在） */
+export async function litFlowLoad(paperId: number): Promise<LitFlow> {
+  if (!isTauri) return mockFlow();
+  return invoke<LitFlow>("lit_flow_load", { paperId });
+}
+
+/** 删掉存下来的流程图 */
+export async function litFlowDelete(
+  paperId: number,
+): Promise<{ ok: boolean; deleted?: boolean; error: string }> {
+  if (!isTauri) return { ok: true, deleted: true, error: "" };
+  return invoke("lit_flow_delete", { paperId });
+}
+
+/**
+ * 用系统默认浏览器打开 http(s) 地址。
+ *
+ * 内嵌网页版（右栏 AI →「网页版」）被站点用 X-Frame-Options / CSP 挡住时，
+ * 这是唯一的出口：iframe 无法绕过，跨域也读不到内容，只能请用户去浏览器。
+ */
+export async function openUrl(url: string): Promise<void> {
+  if (!isTauri) {
+    // 浏览器预览界面时没有后端，直接开一个标签页
+    window.open(url, "_blank", "noopener,noreferrer");
+    return;
+  }
+  await invoke("web_open_url", { url });
+}
+
+/* --------------------------------------------------------- 记忆库 + 提示词
+ *
+ * 对应 Rust 侧 `memory.rs` / `prompts.rs`；旧版是 `lumina/memory.py`（memory.md 纯文本）
+ * 与 `lumina/prompts.py` + `lumina/prompt_gen.py`。
+ * 这一块的命令出错时不抛异常，统一返回 `{ok:false, error}`，界面原样显示就行。
+ */
+
+export type MemoryRow = {
+  id: number;
+  content: string;
+  /** 从哪儿来的：手动 / AI 自动写入 */
+  source: string;
+  /** 逗号分隔的标签 */
+  tags: string;
+  created_at: string;
+  updated_at: string;
+  /** 被带进对话几次 */
+  hits: number;
+  last_used_at: string | null;
+};
+
+/** 浏览器预览（npm run dev）时的假数据，让设置卡还能点 */
+let MOCK_MEMORY: MemoryRow[] = [];
+let MOCK_MEMORY_SEQ = 0;
+
+export async function memoryList(
+  limit = 200,
+): Promise<{ ok: boolean; items: MemoryRow[]; total: number }> {
+  if (!isTauri) return { ok: true, items: [...MOCK_MEMORY], total: MOCK_MEMORY.length };
+  return invoke("memory_list", { limit });
+}
+
+export async function memoryAdd(
+  content: string,
+  source = "手动",
+  tags = "",
+): Promise<{ ok: boolean; id?: number; duplicated?: boolean; total?: number; message?: string; error?: string }> {
+  if (!isTauri) {
+    const stamp = new Date().toISOString().slice(0, 19).replace("T", " ");
+    const row: MemoryRow = {
+      id: ++MOCK_MEMORY_SEQ,
+      content: content.trim(),
+      source,
+      tags,
+      created_at: stamp,
+      updated_at: stamp,
+      hits: 0,
+      last_used_at: null,
+    };
+    MOCK_MEMORY = [row, ...MOCK_MEMORY];
+    return { ok: true, id: row.id, duplicated: false, total: MOCK_MEMORY.length, message: "已记下" };
+  }
+  return invoke("memory_add", { content, source, tags });
+}
+
+export async function memorySearch(
+  keyword: string,
+): Promise<{ ok: boolean; items: MemoryRow[]; total: number }> {
+  if (!isTauri) {
+    const text = keyword.trim();
+    const items = MOCK_MEMORY.filter((one) => !text || one.content.includes(text));
+    return { ok: true, items, total: items.length };
+  }
+  return invoke("memory_search", { keyword });
+}
+
+export async function memoryUpdate(
+  id: number,
+  content?: string,
+  tags?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!isTauri) {
+    MOCK_MEMORY = MOCK_MEMORY.map((one) =>
+      one.id === id ? { ...one, content: content ?? one.content, tags: tags ?? one.tags } : one,
+    );
+    return { ok: true };
+  }
+  return invoke("memory_update", {
+    id,
+    content: content ?? null,
+    tags: tags ?? null,
+  });
+}
+
+export async function memoryDelete(
+  id: number,
+): Promise<{ ok: boolean; total?: number; error?: string }> {
+  if (!isTauri) {
+    MOCK_MEMORY = MOCK_MEMORY.filter((one) => one.id !== id);
+    return { ok: true, total: MOCK_MEMORY.length };
+  }
+  return invoke("memory_delete", { id });
+}
+
+export async function memoryClear(): Promise<{ ok: boolean; removed?: number; error?: string }> {
+  if (!isTauri) {
+    const removed = MOCK_MEMORY.length;
+    MOCK_MEMORY = [];
+    return { ok: true, removed };
+  }
+  return invoke("memory_clear");
+}
+
+export type PromptTemplate = {
+  key: string;
+  /** system = 系统提示词（内置几条，只能改）；scene = 场景模板（可增删） */
+  kind: "system" | "scene";
+  title: string;
+  text: string;
+  enabled: boolean;
+  builtin: boolean;
+};
+
+function mockTemplates(): PromptTemplate[] {
+  return [
+    {
+      key: "assistant",
+      kind: "system",
+      title: "通用助手",
+      text: "你是 Lume（卢梅），DanLume 里的写作与学习助手。（浏览器预览里的假数据）",
+      enabled: true,
+      builtin: true,
+    },
+    {
+      key: "weekly_report",
+      kind: "scene",
+      title: "生成周报",
+      text: "根据我的日程数据写一份周报。",
+      enabled: true,
+      builtin: true,
+    },
+  ];
+}
+
+export async function promptTemplates(): Promise<{
+  ok: boolean;
+  items: PromptTemplate[];
+  version?: number;
+  updated_at?: string;
+  note?: string;
+  error?: string;
+}> {
+  if (!isTauri) return { ok: true, items: mockTemplates(), version: 1, note: "浏览器预览" };
+  return invoke("prompt_templates");
+}
+
+export async function promptTemplateSave(
+  kind: string,
+  key: string,
+  title: string,
+  text: string,
+): Promise<{ ok: boolean; kind?: string; key?: string; total?: number; error?: string }> {
+  if (!isTauri) {
+    const items = mockTemplates();
+    const found = items.find((one) => one.kind === kind && one.key === key);
+    if (found) {
+      found.text = text;
+      found.title = title || found.title;
+      return { ok: true, kind, key };
+    }
+    return { ok: false, error: "浏览器预览不改假数据" };
+  }
+  return invoke("prompt_template_save", { kind, key, title, text });
+}
+
+export async function promptTemplateDelete(
+  kind: string,
+  key: string,
+): Promise<{ ok: boolean; key?: string; error?: string }> {
+  if (!isTauri) return { ok: false, error: "浏览器预览不改假数据" };
+  return invoke("prompt_template_delete", { kind, key });
+}
+
+/** 生成器：一段需求描述 → 一份结构化提示词（没配 AI 时 ok=false + 中文提示） */
+export async function promptGenerate(requirement: string): Promise<{
+  ok: boolean;
+  text?: string;
+  hint?: string;
+  model?: string;
+  chars?: number;
+  error?: string;
+}> {
+  if (!isTauri) {
+    return {
+      ok: true,
+      text: `角色：你是写作助手。\n目标：${requirement}\n输入：{用户提供的材料}\n输出格式：三句话摘要\n约束：不要编造。`,
+      model: "浏览器预览",
+      chars: 60,
+    };
+  }
+  return invoke("prompt_generate", { requirement });
+}
+
+
+
+/** 内嵌网页（Tauri 子 Webview）：eHall / eLearning 贴在页面里，不弹窗 */
+export async function embedOpen(
+  kind: string,
+  url: string,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): Promise<{ ok: boolean; label?: string; error?: string }> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("embed_open", { kind, url, x, y, width, height });
+}
+
+export async function embedBounds(
+  kind: string,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!isTauri) return { ok: false };
+  return invoke("embed_bounds", { kind, x, y, width, height });
+}
+
+export async function embedClose(kind: string): Promise<{ ok: boolean }> {
+  if (!isTauri) return { ok: false };
+  return invoke("embed_close", { kind });
+}
+
+export async function embedReload(kind: string): Promise<{ ok: boolean }> {
+  if (!isTauri) return { ok: false };
+  return invoke("embed_reload", { kind });
+}
+
+export async function embedNavigate(kind: string, url: string): Promise<{ ok: boolean; error?: string }> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("embed_navigate", { kind, url });
+}
+
+export async function embedStatus(kind: string): Promise<{ open: boolean; url: string }> {
+  if (!isTauri) return { open: false, url: "" };
+  return invoke("embed_status", { kind });
+}
+
+/** 从主窗口 cookie 抓一次 UIS 会话（内嵌网页登录后调用，和登录窗口共用同一份 profile） */
+export async function uisGrabProfile(): Promise<{
+  ok: boolean;
+  cookies?: number;
+  has_service_session?: boolean;
+  verdict?: string;
+  error?: string;
+}> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("uis_grab_profile");
+}

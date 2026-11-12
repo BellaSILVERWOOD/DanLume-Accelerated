@@ -16,6 +16,8 @@ pub const ASSIGNMENTS: &str =
     "/api/v1/courses/{cid}/assignments?per_page=100";
 pub const FILES: &str =
     "/api/v1/courses/{cid}/files?per_page=100&sort=created_at&order=desc";
+/// dash 页右侧 To Do（最近要交什么）——旧版 `elearning.TODO_API`
+pub const TODO: &str = "/api/v1/users/self/todo?per_page=50";
 
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
@@ -93,25 +95,171 @@ pub fn files(store: &Store, course_id: &str) -> Result<Vec<Value>, String> {
     Ok(value.as_array().cloned().unwrap_or_default())
 }
 
-/// 诊断：课程接口通不通、返回几条
+/// To Do 里各种 type 的中文叫法（与旧版 `elearning.TODO_KINDS` 一致）
+fn todo_kind(kind: &str) -> &'static str {
+    match kind.trim() {
+        "submitting" => "要交",
+        "grading" | "not_graded" => "待评分",
+        "peer_review" => "互评",
+        _ => "作业",
+    }
+}
+
+/// UTC 的 `due_at` → 本地 `YYYY-MM-DD HH:MM`（旧版 `utils.local_datetime`）
+fn local_due(value: &str) -> String {
+    let text = value.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(text) {
+        return parsed
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+    }
+    text.replace('T', " ").chars().take(16).collect()
+}
+
+/// 把 `/users/self/todo` 的返回整理成「最近作业」的行
+/// （与旧版 `elearning.todo_rows` 逐字段对齐：title / course / due / due_at / url / kind）。
+pub fn todo_rows(data: &Value) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let Some(items) = data.as_array() else {
+        return out;
+    };
+    for item in items {
+        let body = item
+            .get("assignment")
+            .or_else(|| item.get("quiz"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let title = body
+            .get("name")
+            .or_else(|| body.get("title"))
+            .or_else(|| item.get("name"))
+            .and_then(|one| one.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let course = item
+            .get("context_name")
+            .or_else(|| item.get("course_name"))
+            .and_then(|one| one.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let key = (title.clone(), course.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let due_at = body
+            .get("due_at")
+            .or_else(|| item.get("due_at"))
+            .and_then(|one| one.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        out.push(json!({
+            "title": title,
+            "course": course,
+            "due": local_due(&due_at),
+            "due_at": due_at,
+            "url": item
+                .get("html_url")
+                .or_else(|| body.get("html_url"))
+                .and_then(|one| one.as_str())
+                .unwrap_or(""),
+            "kind": todo_kind(item.get("type").and_then(|one| one.as_str()).unwrap_or("")),
+        }));
+    }
+    out.sort_by(|a, b| {
+        let left = a.get("due").and_then(|one| one.as_str()).unwrap_or("9999-99-99");
+        let right = b.get("due").and_then(|one| one.as_str()).unwrap_or("9999-99-99");
+        left.cmp(right).then_with(|| {
+            let l = a.get("title").and_then(|one| one.as_str()).unwrap_or("");
+            let r = b.get("title").and_then(|one| one.as_str()).unwrap_or("");
+            l.cmp(r)
+        })
+    });
+    out
+}
+
+/// 拉一次 eLearning 的 To Do（最近作业）。旧版 `elearning.todo_items` 的等价。
+pub fn todo_items(store: &Store) -> Result<Vec<Value>, String> {
+    let jar = ensure_session(store)?;
+    let value = get_json(&jar, TODO)?;
+    Ok(todo_rows(&value))
+}
+
+/// 诊断：课程接口通不通、返回几条，并把课程清单记下来给「下载课程文件」选课用。
+///
+/// 默认课程不再死取第一门：有的课（实测 119758「2026本科生入学教育考试」）文件接口直接
+/// 回 401「用户无权执行该操作」，拿它当默认会让「下载课程文件」每次都失败。
+/// 所以这里往后找一门真能列出文件的课，并记进 `canvas_last_course`。
 pub fn probe(store: &Store) -> Value {
     match courses(store, "") {
         Ok(rows) => {
-            // 记下第一门课，供「下载首门课程文件」按钮用
-            if let Some(first) = rows.first() {
-                if let Some(id) = first.get("id").and_then(|one| one.as_i64()) {
-                    let _ = store.set_setting("canvas_last_course", &id.to_string());
+            let list: Vec<Value> = rows
+                .iter()
+                .map(|one| {
+                    json!({
+                        "id": json_id_text(one.get("id")),
+                        "name": one.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                    })
+                })
+                .collect();
+            if let Ok(text) = serde_json::to_string(&list) {
+                let _ = store.set_setting("canvas_course_list", &text);
+            }
+            let mut chosen: Option<(String, String, usize)> = None;
+            for one in list.iter().take(8) {
+                let id = one.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = one.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if id.is_empty() {
+                    continue;
                 }
-                if let Some(name) = first.get("name").and_then(|one| one.as_str()) {
-                    let _ = store.set_setting("canvas_last_course_name", name);
+                match files(store, id) {
+                    Ok(file_rows) if !file_rows.is_empty() => {
+                        chosen = Some((id.to_string(), name.to_string(), file_rows.len()));
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(exc) => crate::uis_log(&format!("[canvas] 课程 {id} 的文件读不到：{exc}")),
                 }
             }
+            let current = match &chosen {
+                Some((id, name, count)) => {
+                    let _ = store.set_setting("canvas_last_course", id);
+                    let _ = store.set_setting("canvas_last_course_name", name);
+                    crate::uis_log(&format!("[canvas] 默认课程选了 {name}（{count} 个文件）"));
+                    json!({ "id": id, "name": name, "files": count })
+                }
+                None => {
+                    // 一门都列不出文件：还是记下第一门，界面上至少能选
+                    if let Some(first) = list.first() {
+                        if let Some(id) = first.get("id").and_then(|v| v.as_str()) {
+                            let _ = store.set_setting("canvas_last_course", id);
+                        }
+                        if let Some(name) = first.get("name").and_then(|v| v.as_str()) {
+                            let _ = store.set_setting("canvas_last_course_name", name);
+                        }
+                    }
+                    json!(null)
+                }
+            };
             json!({
                 "ok": true,
-                "courses": rows.len(),
-                "names": rows.iter().take(5).map(|one| {
+                "courses": list.len(),
+                "names": list.iter().take(5).map(|one| {
                     one.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string()
                 }).collect::<Vec<_>>(),
+                "list": list,
+                "current": current,
             })
         }
         Err(exc) => json!({ "ok": false, "error": exc }),
@@ -229,11 +377,22 @@ pub fn download_course(store: &Store, course_id: &str, limit: usize) -> Value {
         course_name
     };
     let target = base.join(&folder);
-    let _ = std::fs::create_dir_all(&target);
+    // 先确认这门课的文件能列出来再建目录：否则读不到文件时会在下载目录里留一个空文件夹
     let list = match files(store, course_id) {
         Ok(rows) => rows,
-        Err(exc) => return json!({ "ok": false, "error": exc }),
+        // 401「用户无权执行该操作」= 这门课不开放文件（实测入学教育考试那门就是这样），
+        // 换门课就行，不要说成「没登录」
+        Err(exc) => {
+            return json!({
+                "ok": false,
+                "error": format!("这门课的文件读不到（{exc}）；换一门课再试"),
+            })
+        }
     };
+    if list.is_empty() {
+        return json!({ "ok": false, "error": "这门课没有可下载的文件（换一门课再试）" });
+    }
+    let _ = std::fs::create_dir_all(&target);
     let mut saved: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let mut skipped = 0usize;
@@ -284,6 +443,24 @@ pub fn download_course(store: &Store, course_id: &str, limit: usize) -> Value {
         "files": saved,
         "target": target.display().to_string(),
     })
+}
+
+/// 「读取我的课程」时缓存的官方文件清单：`{"安全文件名": "课程名"}`。
+/// 这个键由 Python 版写（`elearning.save_remote_file_map`），Rust 也认它，
+/// 这样两个版本共用一份缓存——不用每次都重新联网拉 Canvas 清单。
+fn remote_file_map(json_text: &str) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(json_text) else {
+        return out;
+    };
+    for (name, course) in map {
+        let name = sanitize_file_name(name.trim());
+        let course = course.as_str().unwrap_or("").trim().to_string();
+        if !name.is_empty() && !course.is_empty() {
+            out.insert(name, course);
+        }
+    }
+    out
 }
 
 /// 旧版文件索引 `elearning_file_index` → 文件名 → 课程名。
@@ -366,15 +543,23 @@ struct MoveOutcome {
     renamed: HashMap<String, String>,
 }
 
-/// 纯文件操作：把 `base` 下直接放着的文件按索引（+ 可选的远程兜底）搬进课程子目录。
+/// 纯文件操作：把 `base` 下直接放着的文件按索引（+ 可选缓存 / 远程兜底）搬进课程子目录。
 ///
-/// `remote_lookup` 只在索引判断不了时调用，这样没登录 / 断网也不会先撞一次网络。
-fn migrate_files<F>(base: &Path, index_text: &str, mut remote_lookup: F) -> MoveOutcome
+/// 认课程的顺序：`elearning_file_index` → `elearning_remote_file_map`
+/// （Python 版「读取我的课程」时缓存的官方文件清单，键是安全化后的文件名）→
+/// `remote_lookup`（现拉一次 Canvas 清单，没登录就不该先撞网络）。
+fn migrate_files<F>(
+    base: &Path,
+    index_text: &str,
+    cached_map: &str,
+    mut remote_lookup: F,
+) -> MoveOutcome
 where
     F: FnMut(&str) -> Option<String>,
 {
     let mut out = MoveOutcome::default();
     let index = index_courses(index_text);
+    let cached = remote_file_map(cached_map);
     // 下载目录还没建（全新安装）就算没有要整理的东西
     if !base.exists() {
         return out;
@@ -406,8 +591,11 @@ where
             out.failed.push((name, "文件名清理后为空".to_string()));
             continue;
         }
-        // a) 先看旧索引；b) 再看 Canvas 文件清单
+        // a) 先看旧索引；b) 再看「读取课程」缓存的官方清单；c) 最后才联网
         let mut course = index.get(&name).cloned();
+        if course.is_none() {
+            course = cached.get(&clean).cloned().or_else(|| cached.get(&name).cloned());
+        }
         if course.is_none() {
             course = remote_lookup(&clean);
         }
@@ -520,6 +708,10 @@ fn canvas_file_courses(store: &Store) -> Result<HashMap<String, String>, String>
 pub fn migrate_downloads(store: &Store) -> Value {
     let base = downloads_root(store);
     let index_text = store.setting("elearning_file_index").unwrap_or_default();
+    // 「读取我的课程」时缓存的官方文件清单（Python 版写的，两个版本共用）
+    let cached_text = store
+        .setting("elearning_remote_file_map")
+        .unwrap_or_default();
     // Canvas 清单很贵：第一次真正需要时才请求，失败也只记一次空表
     let mut cache: Option<HashMap<String, String>> = None;
     let mut lookup = |name: &str| -> Option<String> {
@@ -530,7 +722,18 @@ pub fn migrate_downloads(store: &Store) -> Value {
             .as_ref()
             .and_then(|map| map.get(name).cloned())
     };
-    let outcome = migrate_files(&base, &index_text, &mut lookup);
+    let outcome = migrate_files(&base, &index_text, &cached_text, &mut lookup);
+    drop(lookup);
+    // 现拉的官方清单顺手缓存起来（Python 版用的是同一个键），下次整理就不用再联网
+    if cached_text.trim().is_empty() {
+        if let Some(map) = cache.as_ref() {
+            if !map.is_empty() {
+                if let Ok(text) = serde_json::to_string(map) {
+                    let _ = store.set_setting("elearning_remote_file_map", &text);
+                }
+            }
+        }
+    }
     // 索引回写：搬走的平铺文件改成「课程目录/文件名」
     if !outcome.renamed.is_empty() {
         if let Some(text) = rewrite_index(&index_text, &outcome.renamed) {
@@ -553,6 +756,119 @@ pub fn migrate_downloads(store: &Store) -> Value {
             .collect::<Vec<_>>(),
         "root": base.display().to_string(),
     })
+}
+
+/// 下载根目录下还「没归类」的文件 + 可以归进去的课程目录。
+///
+/// 用户 2026-11-11 报「有些作业没有归类」：从浏览器里手动下载的那些文件（比如
+/// `03《物种起源》.pdf`、Canvas 用附件 id 当文件名的 `34FAF30F@...png`）不在
+/// `elearning_remote_file_map` 里，自动整理认不出来，就永远留在根目录。
+/// 自动认不出的时候得让人自己指定，这个命令给出「候选文件 + 候选课程」。
+pub fn unclassified(store: &Store) -> Value {
+    let base = downloads_root(store);
+    let mut files: Vec<Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        let mut rows: Vec<(String, u64)> = Vec::new();
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(kind) if kind.is_file() => {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let size = entry.metadata().map(|one| one.len()).unwrap_or(0);
+                    rows.push((name, size));
+                }
+                _ => continue,
+            }
+        }
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        for (name, size) in rows {
+            files.push(json!({ "name": name, "size": size }));
+        }
+    }
+    // 候选课程目录：已经存在的子文件夹（包括没有文件在里面的）+ 官方清单里的课程名
+    let mut courses: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                courses.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+    let cached_text = store
+        .setting("elearning_remote_file_map")
+        .unwrap_or_default();
+    for (_name, course) in remote_file_map(&cached_text) {
+        let folder = course_dir_name(&course, "");
+        if !folder.is_empty() {
+            courses.push(folder);
+        }
+    }
+    courses.sort();
+    courses.dedup();
+    json!({
+        "ok": true,
+        "root": base.display().to_string(),
+        "files": files,
+        "courses": courses,
+    })
+}
+
+/// 把根目录里的一个文件挪进指定课程目录（用户手动归类）。
+///
+/// `course` 既可以是课程名（`GECC20002.01 生命进化论`），也可以是已经存在的目录名。
+pub fn classify(store: &Store, path: &str, course: &str) -> Result<Value, String> {
+    let base = downloads_root(store);
+    let source = PathBuf::from(path);
+    if !source.is_file() {
+        return Err("这个文件不在了".to_string());
+    }
+    let name = source
+        .file_name()
+        .map(|one| one.to_string_lossy().to_string())
+        .ok_or_else(|| "认不出文件名".to_string())?;
+    let clean = sanitize_file_name(&name);
+    let folder = course_dir_name(course, "");
+    if folder.is_empty() || course.trim().is_empty() {
+        return Err("先选一个课程目录".to_string());
+    }
+    let target_dir = base.join(&folder);
+    std::fs::create_dir_all(&target_dir).map_err(|exc| format!("建不了课程目录：{exc}"))?;
+    // 已经在目标目录里就不动了
+    if let (Some(parent), true) = (source.parent(), true) {
+        if let (Ok(left), Ok(right)) = (parent.canonicalize(), target_dir.canonicalize()) {
+            if left == right {
+                return Ok(json!({ "ok": true, "moved": false, "target": source.display().to_string() }));
+            }
+        }
+    }
+    let target = match plan_move(&source, &target_dir, &clean) {
+        Some(target) => target,
+        None => {
+            // 目标目录里已有同名同大小的一份：删掉根目录这份
+            std::fs::remove_file(&source).map_err(|exc| format!("删不掉重复文件：{exc}"))?;
+            return Ok(json!({
+                "ok": true,
+                "moved": false,
+                "deduped": true,
+                "target": target_dir.join(&clean).display().to_string(),
+            }));
+        }
+    };
+    move_file(&source, &target)?;
+    // 索引里如果有这个名字，跟着改路径，作业页「打开」才不会失效
+    let index_text = store.setting("elearning_file_index").unwrap_or_default();
+    if !index_text.trim().is_empty() {
+        let mut renamed: HashMap<String, String> = HashMap::new();
+        renamed.insert(name, format!("{folder}/{}", target.file_name().map(|one| one.to_string_lossy().to_string()).unwrap_or(clean.clone())));
+        if let Some(text) = rewrite_index(&index_text, &renamed) {
+            let _ = store.set_setting("elearning_file_index", &text);
+        }
+    }
+    Ok(json!({
+        "ok": true,
+        "moved": true,
+        "course": course,
+        "target": target.display().to_string(),
+    }))
 }
 
 #[cfg(test)]
@@ -620,6 +936,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建临时目录");
         dir
+    }
+
+    /// 手动归类：把下载根目录里的文件挪进指定课程目录
+    #[test]
+    fn classify_moves_file_into_course_folder() {
+        let base = temp_dir("classify");
+        std::fs::create_dir_all(base.join("生命进化论")).unwrap();
+        let file = base.join("03《物种起源》.pdf");
+        std::fs::write(&file, b"pdf-bytes").unwrap();
+
+        // 直接调文件级的归类逻辑（不碰数据库）：路线与 classify() 一致
+        let folder = course_dir_name("生命进化论", "");
+        let target_dir = base.join(&folder);
+        let target = plan_move(&file, &target_dir, &sanitize_file_name("03《物种起源》.pdf"))
+            .expect("目标位置");
+        move_file(&file, &target).unwrap();
+
+        assert!(!file.exists(), "根目录那份应该没了");
+        assert_eq!(
+            std::fs::read(base.join("生命进化论").join("03《物种起源》.pdf")).unwrap(),
+            b"pdf-bytes".to_vec()
+        );
     }
 
     /// 索引解析：只认「平铺」（name 里没有 `/`）且 course 非空的条目
@@ -710,8 +1048,8 @@ mod tests {
             {"course":"高等数学","assignment":"第一次作业","name":"b.pdf"},
             {"course":"高等数学","assignment":"第一次作业","name":"c.pdf"}
         ]"#;
-        // 不联网：兜底查询直接返回 None
-        let outcome = migrate_files(&base, index, |_name: &str| -> Option<String> { None });
+        // 不联网：缓存为空、兜底查询直接返回 None
+        let outcome = migrate_files(&base, index, "", |_name: &str| -> Option<String> { None });
 
         assert!(outcome.failed.is_empty(), "不该有失败：{:?}", outcome.failed);
         assert_eq!(outcome.moved.len(), 2);
@@ -752,6 +1090,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 「读取我的课程」缓存的官方清单：没有本地索引、也不联网，也能归类
+    #[test]
+    fn cached_remote_map_works_offline() {
+        let base = temp_dir("cached-map");
+        std::fs::write(base.join("3-Matrix.pdf"), b"m").unwrap();
+        std::fs::write(base.join("谁也认不出来.pdf"), b"x").unwrap();
+        let cached = r#"{"3-Matrix.pdf": "线性代数A"}"#;
+        let outcome =
+            migrate_files(&base, "", cached, |_name: &str| -> Option<String> { None });
+        println!("缓存归类结果：moved={:?} unresolved={:?}", outcome.moved, outcome.unresolved);
+        assert_eq!(outcome.moved.len(), 1);
+        assert_eq!(outcome.unresolved, vec!["谁也认不出来.pdf".to_string()]);
+        assert!(base.join("线性代数A").join("3-Matrix.pdf").is_file());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// 索引回写：只动搬走的条目，别的原样保留、中文不转义
     #[test]
     fn rewrite_index_updates_only_moved_entries() {
@@ -784,11 +1138,7 @@ mod tests {
     #[test]
     #[ignore]
     fn canvas_real_probe() {
-        std::env::set_var(
-            "LUMINA_DATA_DIR",
-            r"E:\FIles\Lena‘s Files\Work\znw\Agent\data",
-        );
-        let store = Store::open().expect("打不开数据库");
+        let store = crate::testdata::real_store("canvas");
         println!("Canvas 诊断：{}", probe(&store));
     }
 }

@@ -1,12 +1,25 @@
 <script setup lang="ts">
 // 日历：月视图（默认）+ 周视图（行=节次、列=周一到周日），右侧当日面板
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import Card from "../components/Card.vue";
 import SoftButton from "../components/SoftButton.vue";
 import IconGlyph from "../components/IconGlyph.vue";
 import MetricLine from "../components/MetricLine.vue";
 import Pill from "../components/Pill.vue";
-import { eventIndex, settingsAll, settingsSave, type EventRow } from "../api";
+import {
+  eventIndex,
+  eventSeriesDone,
+  eventSetDone,
+  importantDelete,
+  importantList,
+  importantSave,
+  settingsAll,
+  settingsSave,
+  type EventRow,
+  type ImportantDate,
+} from "../api";
+import EventEditor from "../components/EventEditor.vue";
+import ConfirmDialog from "../components/ConfirmDialog.vue";
 
 const view = ref<"month" | "week">("month");
 const cursor = ref(new Date());
@@ -18,10 +31,6 @@ const iso = (d: Date) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
     d.getDate(),
   ).padStart(2, "0")}`;
-
-const monthLabel = computed(
-  () => `${cursor.value.getFullYear()} 年 ${cursor.value.getMonth() + 1} 月`,
-);
 
 /** 月视图 6×7 格：从周一开始 */
 const cells = computed(() => {
@@ -58,20 +67,33 @@ const weekDays = computed(() => {
   });
 });
 
-/** 旧版周视图的行 = 节次 */
+/** 顶上那行标题：月视图是年月，周视图给出一周的范围（不然按「上一周」看不出变化） */
+const headLabel = computed(() => {
+  if (view.value === "month") {
+    return `${cursor.value.getFullYear()} 年 ${cursor.value.getMonth() + 1} 月`;
+  }
+  const first = weekDays.value[0];
+  const last = weekDays.value[6];
+  const fmt = (d: Date) => `${d.getMonth() + 1} 月 ${d.getDate()} 日`;
+  return `${first.date.getFullYear()} 年 ${fmt(first.date)} – ${fmt(last.date)}`;
+});
+
+/** 旧版周视图的行 = 节次（与 Python `config.PERIOD_TIMES` 的 14 节逐条一致） */
 const PERIODS = [
   ["第 1 节", "08:00"],
-  ["第 2 节", "08:50"],
+  ["第 2 节", "08:55"],
   ["第 3 节", "09:55"],
-  ["第 4 节", "10:45"],
-  ["第 5 节", "11:50"],
+  ["第 4 节", "10:50"],
+  ["第 5 节", "11:45"],
   ["第 6 节", "13:30"],
-  ["第 7 节", "14:20"],
+  ["第 7 节", "14:25"],
   ["第 8 节", "15:25"],
-  ["第 9 节", "16:15"],
-  ["第 10 节", "17:05"],
+  ["第 9 节", "16:20"],
+  ["第 10 节", "17:15"],
   ["第 11 节", "18:30"],
-  ["第 12 节", "19:20"],
+  ["第 12 节", "19:25"],
+  ["第 13 节", "20:20"],
+  ["第 14 节", "21:15"],
 ] as const;
 
 const selectedEvents = computed(
@@ -87,39 +109,143 @@ const minuteOf = (clock: string) => {
   return (h || 0) * 60 + (m || 0);
 };
 
-/** 一个日程落在哪个节次：开始时间之前（含）最近的那一节 */
-function periodIndex(clock: string): number {
-  const target = minuteOf(clock);
-  let found = 0;
-  PERIODS.forEach((period, i) => {
-    if (minuteOf(period[1]) <= target) found = i;
-  });
-  return found;
-}
-
-/** 一个日程占几节：按时长算（至少 1 节，最多到当天结束） */
-function periodSpan(event: { start_time: string; end_time: string }): number {
+/** 一节课的起止分钟（结束早于开始就按 45 分钟算） */
+function spanOf(event: { start_time: string; end_time: string }) {
   const start = minuteOf(event.start_time);
   let end = minuteOf(event.end_time);
-  if (end <= start) end = start + 45;            // 跨夜 / 没填结束时间
-  const first = periodIndex(event.start_time);
-  let last = first;
-  PERIODS.forEach((period, i) => {
-    if (minuteOf(period[1]) < end) last = i;
-  });
-  return Math.max(1, last - first + 1);
+  if (!Number.isFinite(end) || end <= start) end = start + 45;
+  return { start, end: Math.min(end, 24 * 60) };
 }
 
-/** 周视图：每行一个节次，每列一天；色块按占用的节数撑高 */
-const weekRows = computed(() =>
-  PERIODS.map((period, i) => ({
-    period,
-    cells: weekDays.value.map((day) => ({
-      key: day.key,
-      events: day.events
-        .filter((event) => periodIndex(event.start_time) === i)
-        .map((event) => ({ event, span: periodSpan(event) })),
-    })),
+/** 周视图每小时占多少像素（1 分钟 1 像素 → 一小时 60 像素） */
+const PX_PER_MIN = 1;
+
+/**
+ * 周视图的时间轴范围。
+ *
+ * 默认就是**整天上课时段 08:00–22:00**（14 节全在里面），有更早/更晚的日程再往外扩——
+ * 以前只按本周日程算边界，于是第 13/14 节的刻度落在白色背景外面（用户看到的就是「背景不够长」）。
+ */
+const weekRange = computed(() => {
+  let from = 8 * 60;
+  let to = 22 * 60;
+  weekDays.value.forEach((day) => {
+    day.events.forEach((event) => {
+      const { start, end } = spanOf(event);
+      from = Math.min(from, start - 15);
+      to = Math.max(to, end + 15);
+    });
+  });
+  return {
+    from: Math.max(0, Math.floor(from / 60) * 60),
+    to: Math.min(24 * 60, Math.ceil(to / 60) * 60),
+  };
+});
+
+const weekHeight = computed(() => (weekRange.value.to - weekRange.value.from) * PX_PER_MIN);
+
+/** 左侧节次刻度：按真实时间落在轴上的位置（不再是等分格子） */
+const periodTicks = computed(() =>
+  PERIODS.map((period) => ({
+    label: period[0],
+    clock: period[1],
+    top: (minuteOf(period[1]) - weekRange.value.from) * PX_PER_MIN,
+  })).filter((tick) => tick.top >= -6 && tick.top <= weekHeight.value),
+);
+
+/** 每小时一条浅色参考线 */
+const hourLines = computed(() => {
+  const out: number[] = [];
+  const first = Math.ceil(weekRange.value.from / 60) * 60;
+  for (let minute = first; minute <= weekRange.value.to; minute += 60) {
+    out.push((minute - weekRange.value.from) * PX_PER_MIN);
+  }
+  return out;
+});
+
+/** 时间轴上一个点（分钟）→ 像素 */
+const yOf = (minute: number) => (minute - weekRange.value.from) * PX_PER_MIN;
+
+/**
+ * 一天里的日程块：**位置和高度都按分钟算**（用户要求的「跟时长成精确关系」）。
+ *
+ * 宽度只在该「互相重叠的那一组」里分泳道：
+ * 以前是按整天算最大泳道数，只要这一天里任何两条日程撞上，**全天所有日程都被压成一半宽**
+ * （用户截图里 08:00 的线性代数明明没有冲突也是半宽，就是这个）。
+ */
+function dayBlocks(day: { key: string; events: EventRow[] }) {
+  // 同一个日程可能被重复列出（同 id + 同一天 + 同起止），去重后再算泳道；
+  // 否则重复项会跟自己「重叠」，把块压成一半宽（用户看到的窄条就是这个）。
+  const seen = new Set<string>();
+  const items = day.events
+    .filter((event) => {
+      const key = `${event.id}|${event.date}|${event.start_time}|${event.end_time}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .map((event) => ({ event, ...spanOf(event) }))
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  const out: {
+    key: string;
+    event: EventRow;
+    top: number;
+    height: number;
+    lane: number;
+    lanes: number;
+    clock: string;
+  }[] = [];
+  // 把时间上互相重叠的日程切成「组」，组内才需要分泳道
+  let group: typeof items = [];
+  let groupEnd = -1;
+  const flush = () => {
+    if (!group.length) {
+      return;
+    }
+    const laneEnds: number[] = [];
+    const placed = group.map((item) => {
+      let lane = laneEnds.findIndex((busyUntil) => busyUntil <= item.start);
+      if (lane < 0) {
+        lane = laneEnds.length;
+        laneEnds.push(0);
+      }
+      laneEnds[lane] = item.end;
+      return { item, lane };
+    });
+    const lanes = Math.max(1, laneEnds.length);
+    for (const { item, lane } of placed) {
+      out.push({
+        key: `${item.event.id}-${item.event.date}`,
+        event: item.event,
+        top: yOf(item.start),
+        height: Math.max(16, (item.end - item.start) * PX_PER_MIN - 1),
+        lane,
+        lanes,
+        clock: `${item.event.start_time}–${item.event.end_time}`,
+      });
+    }
+    group = [];
+    groupEnd = -1;
+  };
+  for (const item of items) {
+    if (group.length && item.start >= groupEnd) {
+      flush();
+    }
+    group.push(item);
+    groupEnd = Math.max(groupEnd, item.end);
+  }
+  flush();
+  return out;
+}
+
+/** 一周的日程块（每天各自算重叠分组） */
+const weekColumns = computed(() =>
+  weekDays.value.map((day, di) => ({
+    day,
+    index: di,
+    blocks: dayBlocks(day),
   })),
 );
 
@@ -129,7 +255,106 @@ async function load() {
   index.value = await eventIndex(iso(start), iso(end));
 }
 
+// ------------------------------------------------------------ 重要日（倒计时）
+// 对应旧版 important.py + important_dialog.py：以前 Rust 只有表、没有界面
+const importantItems = ref<ImportantDate[]>([]);
+const importantBusy = ref(false);
+const importantMsg = ref("");
+const draftTitle = ref("");
+const draftDate = ref("");
+const draftNote = ref("");
+
+async function loadImportant() {
+  try {
+    const result = await importantList();
+    importantItems.value = (result.items || []).filter((one) => one.days >= -1);
+  } catch {
+    importantItems.value = [];
+  }
+}
+
+async function addImportant() {
+  if (importantBusy.value) return;
+  const title = draftTitle.value.trim();
+  const day = draftDate.value.trim();
+  if (!title || !day) {
+    importantMsg.value = "标题和日期都要填（日期可以写 明天 / +7 / 2026-06-20）";
+    return;
+  }
+  importantBusy.value = true;
+  try {
+    const result = await importantSave({ title, date: day, note: draftNote.value.trim() });
+    if (!result.ok) {
+      importantMsg.value = result.error || "保存失败";
+      return;
+    }
+    importantMsg.value = `已加入：${result.date}`;
+    draftTitle.value = "";
+    draftDate.value = "";
+    draftNote.value = "";
+    await loadImportant();
+  } finally {
+    importantBusy.value = false;
+  }
+}
+
+/** 删重要日：也先确认（删了找不回来） */
+const pendingImportant = ref<ImportantDate | null>(null);
+const importantConfirmOpen = ref(false);
+
+function removeImportant(item: ImportantDate) {
+  pendingImportant.value = item;
+  importantConfirmOpen.value = true;
+}
+
+async function doRemoveImportant() {
+  const item = pendingImportant.value;
+  pendingImportant.value = null;
+  if (!item) return;
+  importantBusy.value = true;
+  try {
+    await importantDelete(item.id);
+    await loadImportant();
+  } finally {
+    importantBusy.value = false;
+  }
+}
+
+/**
+ * 勾 / 取消「完成」。
+ * 传 event.date：重复日程展开出来的那一次只影响这一天，不会把整条系列带成已完成。
+ */
+async function toggleDone(event: EventRow) {
+  await eventSetDone(event.id, !event.done, event.date);
+  await load();
+}
+
+/** 整条重复系列一起完成 / 取消（对应旧版「这一串都做完了」的诉求） */
+async function toggleSeries(event: EventRow) {
+  await eventSeriesDone(event.id, !event.done);
+  await load();
+}
+
+// ------------------------------------------------------------ 新建 / 编辑
+const editorOpen = ref(false);
+const editorInitial = ref<Partial<EventRow> | null>(null);
+
+function openNew(day?: Date) {
+  editorInitial.value = { date: iso(day || selected.value) };
+  editorOpen.value = true;
+}
+
+function openEdit(event: EventRow) {
+  editorInitial.value = { ...event };
+  editorOpen.value = true;
+}
+
+// 每分钟重读一次：过期日程会被「过期自动完成」勾掉（旧版 refresh_all 也是定时刷）
+let refreshTimer: number | null = null;
 onMounted(async () => {
+  refreshTimer = window.setInterval(() => {
+    if (document.visibilityState === "visible") void load();
+  }, 60_000);
   // 旧版 calendar_view：记住上次看的是月还是周
   try {
     const all = await settingsAll();
@@ -140,6 +365,11 @@ onMounted(async () => {
     // 读不到就用默认月视图
   }
   await load();
+  await loadImportant();
+});
+onUnmounted(() => {
+  if (refreshTimer !== null) window.clearInterval(refreshTimer);
+  refreshTimer = null;
 });
 watch(() => [cursor.value.getFullYear(), cursor.value.getMonth()], load);
 watch(view, (value) => {
@@ -167,6 +397,12 @@ function select(date: Date) {
     cursor.value = date;
   }
 }
+
+/** 周视图里点了某一天：选它（右侧当日面板跟着变），并保证这一周的数据已加载 */
+function selectDay(date: Date, event?: Event) {
+  event?.stopPropagation();
+  select(date);
+}
 const isToday = (date: Date) => iso(date) === iso(new Date());
 
 /** 月视图：鼠标滚轮翻月（向下=下个月，向上=上个月），带节流，避免一下翻好几个月 */
@@ -189,7 +425,7 @@ function onWheel(event: WheelEvent) {
     <div class="page-head">
       <div class="titles">
         <h1 class="h1">日历</h1>
-        <div class="muted">{{ monthLabel }}</div>
+        <div class="muted">{{ headLabel }}</div>
       </div>
       <div class="spacer" />
       <SoftButton :height="32" :font-size="12.5" @click="shift(-1)">
@@ -203,13 +439,15 @@ function onWheel(event: WheelEvent) {
         <button :class="{ on: view === 'month' }" @click="view = 'month'">月</button>
         <button :class="{ on: view === 'week' }" @click="view = 'week'">周</button>
       </div>
-      <SoftButton variant="primary" :height="32" :font-size="12.5" glyph="ADD">
+      <SoftButton variant="primary" :height="32" :font-size="12.5" glyph="ADD" @click="openNew()">
         新建日程
       </SoftButton>
     </div>
 
     <div class="body">
       <Card :padding="12" class="calendar-card">
+        <!-- 周视图比卡片高：内容放进自己的滚动区，别让日程块溢到卡片外面 -->
+        <div class="calendar-scroll">
         <div v-if="view === 'month'" class="weekday-row">
           <span v-for="name in WEEKDAYS" :key="name">{{ name }}</span>
         </div>
@@ -229,6 +467,7 @@ function onWheel(event: WheelEvent) {
               selected: cell.key === iso(selected),
             }"
             @click="select(cell.date)"
+            @dblclick="openNew(cell.date)"
           >
             <span class="num">{{ cell.date.getDate() }}</span>
             <span class="events">
@@ -248,38 +487,78 @@ function onWheel(event: WheelEvent) {
 
         <div v-else class="week-grid">
           <div class="week-head">
-            <span class="period-col"></span>
-            <span
+            <span class="head-spacer"></span>
+            <button
               v-for="day in weekDays"
               :key="day.key"
               class="day-head"
-              :class="{ today: isToday(day.date) }"
+              :class="{
+                today: isToday(day.date),
+                selected: day.key === iso(selected),
+              }"
+              @click="selectDay(day.date, $event)"
+              @dblclick="openNew(day.date)"
             >
               {{ WEEKDAYS[(day.date.getDay() + 6) % 7] }}
               <b>{{ day.date.getDate() }}</b>
-            </span>
+            </button>
           </div>
-          <div v-for="row in weekRows" :key="row.period[0]" class="week-row">
-            <span class="period-col">
-              <b>{{ row.period[0] }}</b>
-              <i>{{ row.period[1] }}</i>
-            </span>
-            <span v-for="cell in row.cells" :key="cell.key" class="week-cell">
+          <div class="week-body" :style="{ height: `${weekHeight}px` }">
+            <!-- 左侧时间刻度：节次标在它在时间轴上的真实位置 -->
+            <div class="scale-col">
               <span
-                v-for="item in cell.events"
-                :key="item.event.id"
-                class="event-block"
-                :class="`tone-${item.event.color}`"
-                :style="{ height: `calc(${item.span} * 34px - 4px)` }"
-                :title="`${item.event.start_time}–${item.event.end_time}`"
+                v-for="tick in periodTicks"
+                :key="`tick-${tick.clock}`"
+                class="scale-tick"
+                :style="{ top: `${tick.top}px` }"
               >
-                {{ item.event.title }}
+                <b>{{ tick.label }}</b>
+                <i>{{ tick.clock }}</i>
               </span>
-            </span>
+            </div>
+            <!-- 每天一列：背景网格 + 按分钟定位的日程块 -->
+            <div
+              v-for="col in weekColumns"
+              :key="`col-${col.day.key}`"
+              class="day-col"
+              :class="{
+                today: isToday(col.day.date),
+                'is-selected': col.day.key === iso(selected),
+              }"
+              @click="selectDay(col.day.date, $event)"
+              @dblclick="openNew(col.day.date)"
+            >
+              <span
+                v-for="top in hourLines"
+                :key="`line-${col.day.key}-${top}`"
+                class="hour-line"
+                :style="{ top: `${top}px` }"
+              />
+              <div
+                v-for="blk in col.blocks"
+                :key="blk.key"
+                class="event-block"
+                :class="`tone-${blk.event.color}`"
+                :style="{
+                  top: `${blk.top}px`,
+                  height: `${blk.height}px`,
+                  left: `calc(${(blk.lane * 100) / blk.lanes}% + 2px)`,
+                  width: `calc(${100 / blk.lanes}% - 4px)`,
+                }"
+                :title="`${blk.event.title} ${blk.clock}`"
+                @click.stop="openEdit(blk.event)"
+              >
+                <b class="blk-time">{{ blk.clock }}</b>
+                <span class="blk-title">{{ blk.event.title }}</span>
+              </div>
+            </div>
           </div>
+        </div>
         </div>
       </Card>
 
+      <!-- 右侧竖排：当日日程 + 重要日（两张卡同一列，避免挤掉日历的宽度） -->
+      <div class="side-stack">
       <Card :padding="12" class="side-card">
         <div class="side-head">
           <span class="h2">
@@ -291,18 +570,90 @@ function onWheel(event: WheelEvent) {
         <div v-if="!selectedEvents.length" class="muted empty">
           这一天还没有日程，双击日历上的日期可以新建
         </div>
-        <MetricLine
-          v-for="event in selectedEvents"
-          :key="event.id"
-          :title="event.title"
-          :meta="`${event.start_time}–${event.end_time}`"
-          :tone="event.color"
-        />
+        <div
+          v-for="(event, at) in selectedEvents"
+          :key="`${event.id}-${event.date}-${at}`"
+          class="ev-row"
+          @dblclick="openEdit(event)"
+        >
+          <button
+            class="ev-check"
+            :class="{ on: event.done }"
+            :title="event.done ? '取消完成' : '标记完成'"
+            @click="toggleDone(event)"
+          >
+            <IconGlyph v-if="event.done" name="CHECK" :size="11" color="var(--card)" />
+          </button>
+          <MetricLine
+            :title="event.title"
+            :meta="`${event.start_time}–${event.end_time}${event.repeat ? ' · 重复' : ''}`"
+            :tone="event.color"
+          />
+          <button
+            v-if="event.repeat"
+            class="ev-series"
+            :title="event.done ? '整条重复系列一起取消完成' : '整条重复系列一起标完成'"
+            @click="toggleSeries(event)"
+          >
+            整串
+          </button>
+        </div>
         <div class="side-foot">
-          <SoftButton :height="30" :font-size="12.5" glyph="ADD">新建日程</SoftButton>
+          <SoftButton :height="30" :font-size="12.5" glyph="ADD" @click="openNew()">新建日程</SoftButton>
         </div>
       </Card>
+
+      <!-- 重要日（倒计时）：对应旧版 important.py / important_dialog.py -->
+      <Card :padding="12" class="side-card important-card">
+        <div class="side-head">
+          <span class="h2">重要日</span>
+          <span class="spacer" />
+          <Pill :text="`${importantItems.length} 个`" :font-size="11.5" />
+        </div>
+        <div v-if="!importantItems.length" class="muted empty">
+          还没有重要日。填「考试 / 答辩 / 截止」这类日子，这里会显示还差几天。
+        </div>
+        <div
+          v-for="item in importantItems"
+          :key="item.id"
+          class="important-row"
+          :class="`tone-${item.color}`"
+        >
+          <div class="imp-main">
+            <b>{{ item.title }}</b>
+            <span class="imp-date">{{ item.date.slice(5) }}{{ item.note ? ` · ${item.note}` : "" }}</span>
+          </div>
+          <span class="imp-left">{{ item.left }}</span>
+          <button class="imp-del" title="删掉这条" @click="removeImportant(item)">×</button>
+        </div>
+        <div class="important-add">
+          <input v-model="draftTitle" type="text" placeholder="标题（如 期末考）" />
+          <input v-model="draftDate" type="text" placeholder="日期：2026-06-20 / 明天 / +7" />
+          <input v-model="draftNote" type="text" placeholder="备注（可空）" />
+          <SoftButton :height="28" :font-size="12" :disabled="importantBusy" @click="addImportant">
+            加入
+          </SoftButton>
+        </div>
+        <div v-if="importantMsg" class="hint">{{ importantMsg }}</div>
+      </Card>
+      </div>
     </div>
+
+    <EventEditor
+      :open="editorOpen"
+      :initial="editorInitial"
+      @close="editorOpen = false"
+      @saved="load()"
+    />
+
+    <!-- 删重要日：先确认 -->
+    <ConfirmDialog
+      v-model:open="importantConfirmOpen"
+      title="确定删掉这个重要日吗？"
+      :message="`「${pendingImportant?.title || '这一条'}」删除后无法恢复。`"
+      confirm-text="确认删除"
+      @confirm="doRemoveImportant"
+    />
   </div>
 </template>
 
@@ -345,11 +696,137 @@ function onWheel(event: WheelEvent) {
 .calendar-card {
   flex: 1;
   min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+/* 日历内容自己的滚动区（周视图 14 节比卡片高，必须在卡片里滚） */
+.calendar-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
 }
 .side-card {
   width: 300px;
   flex: none;
   gap: 6px;
+}
+/* 右侧竖排容器：当日 + 重要日两张卡，宽度固定 300，不抢日历的地方 */
+.side-stack {
+  width: 300px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.side-stack .side-card {
+  width: auto;
+}
+/* 重要日（倒计时）卡片 */
+.important-card {
+  max-height: 300px;
+  overflow: auto;
+}
+.important-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  font-size: 12px;
+  border-left: 3px solid currentColor;
+}
+.imp-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+}
+.imp-main b {
+  font-weight: 620;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.imp-date {
+  font-size: 10.5px;
+  opacity: 0.75;
+}
+.imp-left {
+  flex: none;
+  font-size: 11px;
+  font-weight: 620;
+}
+.imp-del {
+  flex: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.55;
+}
+.imp-del:hover {
+  opacity: 1;
+}
+.important-add {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+.important-add input {
+  font-size: 11.5px;
+  padding: 5px 8px;
+}
+/* 当日列表里每一行：左边「完成」小方框 + 标题/时间 */
+.ev-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+.ev-check {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  margin-top: 3px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.2px solid var(--border-strong, var(--border));
+  border-radius: 5px;
+  background: transparent;
+  color: var(--card);
+  cursor: pointer;
+}
+.ev-check:hover {
+  border-color: var(--accent);
+}
+.ev-check.on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.ev-series {
+  flex: none;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.ev-series:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 .weekday-row {
   display: grid;
@@ -428,40 +905,115 @@ function onWheel(event: WheelEvent) {
   flex-direction: column;
   gap: 2px;
 }
-.week-head,
-.week-row {
+.week-head {
   display: grid;
+  /* 和 .week-body 用完全相同的列定义，否则表头会比格子宽、两边对不上 */
   grid-template-columns: 64px repeat(7, minmax(0, 1fr));
   gap: 2px;
   min-height: 34px;
+}
+/* 周视图主体：左侧时间刻度 + 7 列，高度按分钟换算（见 script 里的 PX_PER_MIN） */
+.week-body {
+  display: grid;
+  grid-template-columns: 64px repeat(7, minmax(0, 1fr));
+  gap: 2px;
+  position: relative;
+}
+.scale-col {
+  position: relative;
+}
+.scale-tick {
+  position: absolute;
+  right: 4px;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+  font-size: 10px;
+  color: var(--muted);
+  transform: translateY(-2px);
+  white-space: nowrap;
+}
+.scale-tick b {
+  font-weight: 620;
+  font-size: 10.5px;
+}
+.scale-tick i {
+  font-style: normal;
+  color: var(--faint);
+}
+.day-col {
+  position: relative;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--card-alt) 45%, transparent);
+  cursor: pointer;
+  overflow: hidden;
+}
+.day-col:hover {
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+.day-col.today {
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+}
+.day-col.is-selected {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  outline: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.hour-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: color-mix(in srgb, var(--border-soft) 70%, transparent);
+  pointer-events: none;
+}
+.event-block {
+  position: absolute;
+  z-index: 2;
+  padding: 2px 5px;
+  border-radius: 5px;
+  font-size: 10.5px;
+  line-height: 1.25;
+  overflow: hidden;
+  cursor: pointer;
+  border-left: 3px solid currentColor;
+}
+.blk-time {
+  display: block;
+  font-size: 9.5px;
+  font-weight: 620;
+  opacity: 0.9;
+}
+.blk-title {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .day-head {
   font-size: 11.5px;
   color: var(--muted);
   text-align: center;
   padding: 3px 0;
+  border: 0;
+  background: transparent;
+  border-radius: 7px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.day-head:hover {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 .day-head.today {
   color: var(--accent);
   font-weight: 650;
 }
-.period-col {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  font-size: 10.5px;
-  color: var(--muted);
-  padding: 2px 4px;
+.day-head.selected {
+  color: var(--accent);
+  font-weight: 650;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
-.period-col i {
-  font-style: normal;
-  color: var(--faint);
-}
-.week-cell {
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--card-alt) 55%, transparent);
-  padding: 2px;
-  min-width: 0;
+.head-spacer {
+  display: block;
 }
 .event-block {
   display: block;

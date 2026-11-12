@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DanLume 看板娘</title>
+    <script>
+      // 和主界面一样：先把主题定下来，避免深浅色闪一下
+      (function () {
+        try {
+          var mode = localStorage.getItem("danlume.mode") || "auto";
+          var dark =
+            mode === "dark" ||
+            (mode === "auto" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.dataset.mode = dark ? "dark" : "light";
+          var accent = localStorage.getItem("danlume.accent");
+          if (accent) {
+            document.documentElement.style.setProperty("--accent", accent);
+          }
+        } catch (e) {}
+      })();
+
+      // 白屏兜底：这个窗口只有 168px 宽，页面要是加载失败就只剩一片白，
+      // 谁也不知道发生了什么。所以先摆一行「启动中」，脚本挂掉就把错误写在原处。
+      window.__mascotFail = function (why) {
+        var box = document.getElementById("boot");
+        if (!box) return;
+        box.textContent = "看板娘启动失败：" + why;
+        box.style.color = "#C0392B";
+        box.style.background = "#FFF";
+      };
+      window.addEventListener("error", function (event) {
+        var msg = (event && event.message) || "脚本错误";
+        if (event && event.target && event.target.tagName === "SCRIPT") {
+          msg = "取不到脚本 " + (event.target.src || "");
+        }
+        window.__mascotFail(msg);
+      });
+      window.addEventListener("unhandledrejection", function (event) {
+        var reason = event && event.reason;
+        window.__mascotFail(String((reason && reason.message) || reason));
+      });
+    </script>
+    <style>
+      #boot {
+        font: 11px/1.5 "Microsoft YaHei", system-ui, sans-serif;
+        color: #888;
+        padding: 8px 10px;
+      }
+    </style>
+  </head>
+  <body style="margin: 0; background: transparent">
+    <div id="boot">看板娘启动中…</div>
+    <div id="app"></div>
+    <script type="module" src="/src/mascot.ts"></script>
+  </body>
+</html>

@@ -491,13 +491,11 @@ mod tests {
         );
     }
 
+    /// 真数据用例（默认跳过）：数据来自临时副本，见 `crate::testdata`。
     #[test]
+    #[ignore]
     fn homework_from_real_db() {
-        std::env::set_var(
-            "LUMINA_DATA_DIR",
-            r"E:\FIles\Lena‘s Files\Work\znw\Agent\data",
-        );
-        let store = crate::store::Store::open().expect("打不开数据库");
+        let store = crate::testdata::real_store("elearn");
         let items = cached_items(&store);
         println!("缓存里的作业：{} 条", items.len());
         for item in &items {
