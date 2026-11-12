@@ -17,6 +17,7 @@ import LatexPage from "./pages/LatexPage.vue";
 import StudentWorkPage from "./pages/StudentWorkPage.vue";
 import NoticesPage from "./pages/NoticesPage.vue";
 import ReminderToast from "./components/ReminderToast.vue";
+import AssignmentToast from "./components/AssignmentToast.vue";
 import Mascot from "./components/Mascot.vue";
 import AnnouncementBanners from "./components/AnnouncementBanners.vue";
 import FirstRunGate from "./components/FirstRunGate.vue";
@@ -540,6 +541,8 @@ onUnmounted(() => window.removeEventListener("keydown", onFullscreenKey));
       @hide="hideMascot"
     />
     <ReminderToast />
+    <!-- 作业到期提醒（到期当天早上，用户 2026-11-12） -->
+    <AssignmentToast />
   </div>
 </template>
 

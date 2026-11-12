@@ -1146,6 +1146,76 @@ export async function homeworkWriteDeadlines(
   return invoke("homework_write_deadlines", { force });
 }
 
+/* -------------------------------------------------------------- 作业截止（日历页 + 当天提醒） */
+/*
+ * 数据来自 eLearning 的 `/dash`（Canvas 的 To Do），由「同步」写进本机缓存
+ * `homework_assignments`；这里读缓存，不联网。
+ */
+export type AssignmentDue = {
+  title: string;
+  course: string;
+  /** "YYYY-MM-DD HH:MM"（本地时间） */
+  due: string;
+  day: string;
+  clock: string;
+  /** 还差几天：0 = 今天，负数 = 已经过了 */
+  days_left: number;
+  /** 还差多少分钟（负数 = 已经过了；提醒按这个算，<1440 就提醒） */
+  minutes_left: number;
+  /** 「还有 5 小时」/「还有 2 天」/「已过 30 分钟」这种人话 */
+  left_text: string;
+  overdue: boolean;
+  url: string;
+  kind: string;
+};
+
+export async function homeworkUpcoming(days = 14): Promise<{
+  ok: boolean;
+  items: AssignmentDue[];
+  total: number;
+  synced_at: string;
+}> {
+  if (!isTauri) return { ok: true, items: [], total: 0, synced_at: "" };
+  return invoke("homework_upcoming", { days });
+}
+
+/** 今天该提醒的作业（`mark=true` 记成「今天提过」，默认只用来看） */
+export async function elearnDueReminders(mark = false): Promise<{
+  ok: boolean;
+  items: DueAssignment[];
+  /** 提前多少分钟开始提醒（现在是 24 小时） */
+  ahead_minutes: number;
+}> {
+  if (!isTauri) return { ok: true, items: [], ahead_minutes: 1440 };
+  return invoke("elearn_due_reminders", { mark });
+}
+
+/** 快到截止时间的一条（Rust 说「进入 24 小时窗口」了） */
+export type DueAssignment = {
+  key: string;
+  title: string;
+  course: string;
+  clock: string;
+  /** "YYYY-MM-DD HH:MM" */
+  due: string;
+  minutes_left: number;
+  left_text: string;
+  url: string;
+  /** 直接给卡片用的一句话：「课程 · 作业 还有 5 小时（11-12 23:59 截止）」 */
+  text: string;
+};
+
+/** 后台提醒到点时 Rust 会发这个事件（前端弹出卡片） */
+export async function onElearnDue(
+  handler: (payload: { items: DueAssignment[] }) => void,
+): Promise<() => void> {
+  if (!isTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ items: DueAssignment[] }>("elearn:due", (event) =>
+    handler(event.payload as { items: DueAssignment[] }),
+  );
+}
+
 /* -------------------------------------------------------------- 文献库 */
 
 export type Paper = {

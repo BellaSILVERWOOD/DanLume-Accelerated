@@ -19,6 +19,8 @@ tauri-build = { version = "2", features = [] }
 # tray-icon：关窗缩到系统托盘（用户 2026-11-12 要求）
 tauri = { version = "2", features = ["unstable", "protocol-asset", "tray-icon"] }
 tauri-plugin-dialog = "2"
+# 系统通知：作业到期当天早上的提醒（最小化到托盘也能弹）
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -53,6 +55,7 @@ windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_Security_Cryptography",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
   "Win32_System_Threading",
 ] }
 

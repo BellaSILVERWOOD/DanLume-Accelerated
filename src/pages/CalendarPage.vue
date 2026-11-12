@@ -10,11 +10,15 @@ import {
   eventIndex,
   eventSeriesDone,
   eventSetDone,
+  homeworkSync,
+  homeworkUpcoming,
   importantDelete,
   importantList,
   importantSave,
+  openUrl,
   settingsAll,
   settingsSave,
+  type AssignmentDue,
   type EventRow,
   type ImportantDate,
 } from "../api";
@@ -351,7 +355,61 @@ function openEdit(event: EventRow) {
 
 // 每分钟重读一次：过期日程会被「过期自动完成」勾掉（旧版 refresh_all 也是定时刷）
 let refreshTimer: number | null = null;
+// ---- 作业截止（用户 2026-11-12：eLearning 的 /dash 上有截止时间，摆到日历页右侧）
+const assignments = ref<AssignmentDue[]>([]);
+const assignmentMsg = ref("");
+const assignmentBusy = ref(false);
+const assignmentDays = ref(14);
+const assignmentSyncedAt = ref("");
+
+async function loadAssignments() {
+  try {
+    const result = await homeworkUpcoming(assignmentDays.value);
+    assignments.value = result.items || [];
+    assignmentSyncedAt.value = result.synced_at || "";
+  } catch {
+    assignments.value = [];
+  }
+}
+
+/** 「同步」：拉一次 eLearning 的 To Do（需要先登录过 eLearning），顺便写进日程 */
+async function syncAssignments() {
+  if (assignmentBusy.value) return;
+  assignmentBusy.value = true;
+  assignmentMsg.value = "正在同步 eLearning 的作业…";
+  try {
+    const result = await homeworkSync();
+    if (!result.ok) {
+      const error = result.error || "";
+      // 401 = eLearning 那边没有登录态，这句比原始报错有用得多
+      if (error.includes("401")) {
+        assignmentMsg.value =
+          "eLearning 还没登录（401）：去左侧「作业」页点一次登录，登录好再回来点「同步」";
+      } else {
+        assignmentMsg.value = `同步失败：${error || "未知原因"}`;
+      }
+      return;
+    }
+    await loadAssignments();
+    assignmentMsg.value = `同步好了：${assignments.value.length} 个待交作业`;
+  } catch (err) {
+    assignmentMsg.value = `同步失败：${String(err)}`;
+  } finally {
+    assignmentBusy.value = false;
+  }
+}
+
+/** 「还有 5 小时 / 还有 2 天 3 小时 / 已过 30 分钟」—— 文案由 Rust 统一给，前后端一致 */
+function dueText(item: AssignmentDue): string {
+  return item.left_text || (item.overdue ? "已过期" : "");
+}
+
+function openAssignment(item: AssignmentDue) {
+  if (item.url) void openUrl(item.url);
+}
+
 onMounted(async () => {
+  await loadAssignments();
   refreshTimer = window.setInterval(() => {
     if (document.visibilityState === "visible") void load();
   }, 60_000);
@@ -636,6 +694,43 @@ function onWheel(event: WheelEvent) {
         </div>
         <div v-if="importantMsg" class="hint">{{ importantMsg }}</div>
       </Card>
+
+      <!-- 作业截止：读 eLearning `/dash` 的 To Do（用户 2026-11-12 要求摆在这里） -->
+      <Card :padding="12" class="side-card assignment-card">
+        <div class="side-head">
+          <span class="h2">作业截止</span>
+          <span class="spacer" />
+          <Pill :text="`${assignments.length} 个待交`" :font-size="11.5" />
+        </div>
+        <div v-if="!assignments.length" class="muted empty">
+          还没有作业数据。点下面的「同步」从 eLearning 拉一次（要先在 eLearning 页登录）。
+        </div>
+        <div
+          v-for="item in assignments"
+          :key="`${item.course}-${item.title}-${item.due}`"
+          class="assign-row"
+          :class="{ late: item.overdue, today: item.days_left === 0 }"
+          :title="item.url ? '点一下在浏览器里打开这次作业' : ''"
+          @click="openAssignment(item)"
+        >
+          <div class="assign-main">
+            <b>{{ item.title }}</b>
+            <span class="assign-meta">
+              {{ item.course || "（未注明课程）" }} · 截止 {{ item.due.slice(5, 16) }}
+            </span>
+          </div>
+          <span class="assign-left" :class="{ soon: item.minutes_left > 0 && item.minutes_left <= 1440 }">
+            {{ dueText(item) }}
+          </span>
+        </div>
+        <div class="assign-foot">
+          <SoftButton :height="28" :font-size="12" :disabled="assignmentBusy" @click="syncAssignments">
+            {{ assignmentBusy ? "同步中…" : "同步 eLearning" }}
+          </SoftButton>
+          <span class="hint tiny">截止前 24 小时提醒一次</span>
+        </div>
+        <div v-if="assignmentMsg" class="hint">{{ assignmentMsg }}</div>
+      </Card>
       </div>
     </div>
 
@@ -724,6 +819,69 @@ function onWheel(event: WheelEvent) {
 .side-stack .side-card {
   width: auto;
 }
+/* 作业截止卡片 */
+.assignment-card .assign-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.assignment-card .assign-row:hover {
+  background: var(--card-hover);
+}
+.assignment-card .assign-row.today {
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+.assignment-card .assign-row.late {
+  opacity: 0.65;
+}
+.assign-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.assign-main b {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.assign-meta {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.assign-left {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  line-height: 1.3;
+  color: var(--accent);
+  font-weight: 600;
+  /* 「还有 2 天 3 小时」别折行 */
+  white-space: nowrap;
+  padding-top: 1px;
+}
+.assign-row.late .assign-left {
+  color: var(--faint);
+}
+.assign-left.soon {
+  color: var(--rose, #c0392b);
+}
+.assign-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
 /* 重要日（倒计时）卡片 */
 .important-card {
   max-height: 300px;

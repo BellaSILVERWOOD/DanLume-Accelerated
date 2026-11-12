@@ -18,7 +18,8 @@
     "core:webview:allow-create-webview-window",
     "dialog:allow-open",
     "dialog:allow-save",
-    "dialog:allow-message"
+    "dialog:allow-message",
+    "notification:default"
   ],
   "remote": {
     "urls": [

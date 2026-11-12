@@ -1648,6 +1648,25 @@ fn homework_write_deadlines(force: Option<bool>, state: State<'_, AppState>) -> 
     elearn::write_deadlines(get_store(), force.unwrap_or(true))
 }
 
+/// 日历页右侧「作业截止」卡：未来 N 天内的截止时间（数据是缓存里的，不联网）
+///
+/// 用户 2026-11-12：eLearning 的 `/dash` 上有作业截止时间，想直接摆在日历页。
+#[tauri::command]
+fn homework_upcoming(days: Option<i64>, state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    elearn::upcoming(get_store(), days.unwrap_or(14))
+}
+
+/// 快到截止时间的作业（`mark = true` 就记成「这条提过了」）
+///
+/// 判定在 `elearn::due_reminders` 里：进入「截止前 24 小时」的窗口就返回，每条只提醒一次。
+#[tauri::command]
+fn elearn_due_reminders(mark: Option<bool>, state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    let rows = elearn::due_reminders(get_store(), mark.unwrap_or(false));
+    json!({ "ok": true, "items": rows, "ahead_minutes": 24 * 60 })
+}
+
 // ------------------------------------------------------------------ 文献库
 
 /// 文献在线检索：arXiv + Crossref + Semantic Scholar（都不用 Key），按 DOI / 标题去重
@@ -2431,6 +2450,24 @@ fn mascot_send(
     });
     let _ = app.emit_to("main", "mascot:send", payload.clone());
     Ok(payload)
+}
+
+// ---------------------------------------------------------------- 桌面通知
+
+/// 弹一条系统通知（最小化到托盘时也能看到）
+///
+/// 失败不报错：有的 Windows 机器把通知权限关掉了，这时还有前端的卡片兜底。
+fn notify_desktop(app: &tauri::AppHandle, title: &str, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(exc) = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+    {
+        eprintln!("[notify] 系统通知没弹出来：{exc}");
+    }
 }
 
 // ---------------------------------------------------------------- 读微信（J8-4）
@@ -4937,6 +4974,42 @@ pub fn run() {
                     }
                 });
             }
+            // 作业截止的当天提醒（用户 2026-11-12）：早于设置里的小时不吵，
+            // 到点以后每条每天只提一次；系统通知 + 事件（前端还能弹卡片）。
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    // 启动 25 秒后再看（别和开机时的一堆同步抢资源）
+                    std::thread::sleep(std::time::Duration::from_secs(25));
+                    loop {
+                        let rows = std::panic::catch_unwind(|| {
+                            elearn::due_reminders(get_store(), true)
+                        })
+                        .unwrap_or_default();
+                        if !rows.is_empty() {
+                            let count = rows.len();
+                            let body = rows
+                                .iter()
+                                .map(|one| {
+                                    one.get("text")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("作业今天截止")
+                                        .to_string()
+                                })
+                                .collect::<Vec<String>>()
+                                .join("\n");
+                            notify_desktop(
+                                &handle,
+                                &format!("今天有 {count} 个作业要交"),
+                                &body,
+                            );
+                            let _ = handle.emit("elearn:due", json!({ "items": rows }));
+                            eprintln!("[elearn] 今天有 {count} 个作业截止，已提醒");
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(300));
+                    }
+                });
+            }
             // 定时通知的后台闹钟：每 30 秒看一眼有没有到点的（旧版没有这个功能，是新加的）
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_secs(8));
@@ -5012,6 +5085,8 @@ pub fn run() {
             papers_semantic_status,
             papers_semantic_index,
             papers_semantic_search,
+            homework_upcoming,
+            elearn_due_reminders,
             refs_list,
             refs_import,
             refs_add_doi,
@@ -5145,6 +5220,8 @@ pub fn run() {
             account_notify_status,
         ])
         .plugin(tauri_plugin_dialog::init())
+        // 系统通知：作业到期当天早上的提醒（见 `elearn::due_reminders`）
+        .plugin(tauri_plugin_notification::init())
         .run(tauri::generate_context!())
         .expect("启动 Tauri 失败");
 }
