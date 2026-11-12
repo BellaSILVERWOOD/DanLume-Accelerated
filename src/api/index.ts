@@ -833,6 +833,64 @@ export async function papersAdd(
   return invoke("papers_add", { item, project });
 }
 
+/* ---------------------------------------------------------------- 按意思搜（语义检索） */
+/*
+ * 分工：服务器只把文字算成 512 维向量（B 方案：模型跑服务器本机，不花 API 钱），
+ * 向量存在本地 `paper_vectors` 表，检索时在本地算余弦 —— 每次搜索只有问句那一句联网。
+ */
+export type SemanticStatus = {
+  ok: boolean;
+  indexed: number;
+  papers: number;
+  need_index: boolean;
+  logged_in: boolean;
+};
+
+export type SemanticHit = {
+  id: number;
+  title: string;
+  authors: string;
+  year: string;
+  venue: string;
+  file_path: string;
+  /** 余弦相似度（0–1，越大越接近） */
+  score: number;
+};
+
+export async function papersSemanticStatus(): Promise<SemanticStatus> {
+  if (!isTauri) return { ok: false, indexed: 0, papers: 0, need_index: false, logged_in: false };
+  return invoke<SemanticStatus>("papers_semantic_status");
+}
+
+export async function papersSemanticIndex(force = false): Promise<{
+  ok: boolean;
+  indexed?: number;
+  total?: number;
+  dim?: number;
+  model?: string;
+  message?: string;
+  error?: string;
+}> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("papers_semantic_index", { force });
+}
+
+export async function papersSemanticSearch(
+  query: string,
+  limit = 10,
+): Promise<{
+  ok: boolean;
+  hits?: SemanticHit[];
+  indexed?: number;
+  /** 有多少篇的向量是「旧模型」建的（维度对不上，已被跳过） */
+  stale?: number;
+  note?: string;
+  error?: string;
+}> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("papers_semantic_search", { query, limit });
+}
+
 /**
  * 把这篇文献的 PDF 下到文献库目录（`library/<项目>/<年份>/<标题>.pdf`）。
  * 对应旧版 `lit.download_pdf`：已经有文件就直接返回，不是 `%PDF` 就报「要登录」。

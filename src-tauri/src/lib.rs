@@ -34,6 +34,7 @@ mod registration;
 mod reminders;
 mod sandbox;
 mod secrets;
+mod semantic;
 mod store;
 mod student;
 mod summary;
@@ -1692,6 +1693,42 @@ async fn papers_download(id: i64) -> Result<serde_json::Value, String> {
     match handle {
         Ok(value) => Ok(value),
         Err(exc) => Ok(json!({ "ok": false, "summary": format!("下载任务没跑起来：{exc}") })),
+    }
+}
+
+/// 语义检索：本地有多少篇建了向量、还差多少
+#[tauri::command]
+fn papers_semantic_status(state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    crate::semantic::status(get_store())
+}
+
+/// 语义检索：给还没建向量的文献补上（要联网，所以 async + spawn_blocking）
+#[tauri::command]
+async fn papers_semantic_index(force: Option<bool>) -> Result<serde_json::Value, String> {
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        crate::semantic::index(get_store(), force.unwrap_or(false))
+    })
+    .await;
+    match handle {
+        Ok(value) => Ok(value),
+        Err(exc) => Ok(json!({ "ok": false, "error": format!("建索引的任务没跑起来：{exc}") })),
+    }
+}
+
+/// 文献库「按意思搜」：问句走一次服务器算向量，其余在本地算
+#[tauri::command]
+async fn papers_semantic_search(
+    query: String,
+    limit: Option<usize>,
+) -> Result<serde_json::Value, String> {
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        crate::semantic::search(get_store(), &query, limit.unwrap_or(10))
+    })
+    .await;
+    match handle {
+        Ok(value) => Ok(value),
+        Err(exc) => Ok(json!({ "ok": false, "error": format!("检索任务没跑起来：{exc}") })),
     }
 }
 
@@ -4972,6 +5009,9 @@ pub fn run() {
             papers_search,
             papers_add,
             papers_download,
+            papers_semantic_status,
+            papers_semantic_index,
+            papers_semantic_search,
             refs_list,
             refs_import,
             refs_add_doi,

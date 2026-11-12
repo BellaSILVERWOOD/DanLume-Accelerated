@@ -18,6 +18,9 @@ import {
   paperUpdate,
   papersDownload,
   papersList,
+  papersSemanticIndex,
+  papersSemanticSearch,
+  papersSemanticStatus,
   pickFiles,
   papersAdd,
   papersSearch,
@@ -293,6 +296,94 @@ async function refreshAiReady() {
   }
 }
 
+// ---- 按意思搜（语义检索，B 方案：服务器只算向量，本地比）
+//
+// 用户 2026-11-12 选了「模型跑服务器本机、不花 API 钱」这条路；
+// 关键词搜不到的（比如标题写 `across field strengths`、你想搜「跨场强」）靠它补。
+const semanticHits = ref<
+  {
+    id: number;
+    title: string;
+    authors: string;
+    year: string;
+    venue: string;
+    score: number;
+  }[]
+>([]);
+const semanticBusy = ref(false);
+const semanticMsg = ref("");
+const semanticStatus = ref<{ indexed: number; papers: number; need_index: boolean } | null>(null);
+
+async function refreshSemanticStatus() {
+  try {
+    semanticStatus.value = await papersSemanticStatus();
+  } catch {
+    semanticStatus.value = null;
+  }
+}
+
+/** 建索引（`force` = 全部重建）；建完自动刷新状态 */
+async function buildIndex(force: boolean) {
+  if (semanticBusy.value) return;
+  semanticBusy.value = true;
+  semanticMsg.value = force ? "正在重建全部向量…" : "正在给新文献补向量…";
+  try {
+    const result = await papersSemanticIndex(force);
+    semanticMsg.value = result.ok ? result.message || "建好了" : result.error || "建索引失败";
+    await refreshSemanticStatus();
+  } catch (err) {
+    semanticMsg.value = `建索引失败：${String(err)}`;
+  } finally {
+    semanticBusy.value = false;
+  }
+}
+
+async function searchSemantic() {
+  const query = searchText.value.trim();
+  if (!query) {
+    semanticMsg.value = "先写要搜的意思，比如「跨场强 MRI 图像翻译」";
+    return;
+  }
+  if (semanticBusy.value) return;
+  semanticBusy.value = true;
+  semanticHits.value = [];
+  semanticMsg.value = "正在按意思搜…";
+  try {
+    // 还没索引就先建（第一次用会多花一两秒）
+    if (semanticStatus.value?.need_index) {
+      await buildIndex(false);
+    }
+    const result = await papersSemanticSearch(query, 10);
+    if (!result.ok) {
+      semanticMsg.value = result.error || "没搜到";
+      return;
+    }
+    semanticHits.value = result.hits || [];
+    semanticMsg.value = result.hits?.length
+      ? `按意思找到 ${result.hits.length} 篇（从 ${result.indexed} 篇里排的）`
+      : "没有相近的文献";
+    if (result.stale && result.stale > 0) {
+      semanticMsg.value += `；另有 ${result.stale} 篇用的是旧模型的向量，点「重建索引」重来一次`;
+    }
+  } catch (err) {
+    semanticMsg.value = `按意思搜失败：${String(err)}`;
+  } finally {
+    semanticBusy.value = false;
+    await refreshSemanticStatus();
+  }
+}
+
+/** 点「看这篇」：切到左边那篇（不在当前筛选里就先清掉筛选） */
+async function selectSemantic(hit: { id: number }) {
+  if (!items.value.some((one) => one.id === hit.id)) {
+    project.value = "";
+    starsMin.value = 0;
+    keyword.value = "";
+    await load();
+  }
+  selectedId.value = hit.id;
+}
+
 // ---- 下载 PDF（J1-2，对应旧版 lit.download_pdf）----
 const downloadBusy = ref(false);
 const downloadMsg = ref("");
@@ -434,6 +525,7 @@ onMounted(async () => {
   await load();
   await refreshAiReady();
   await loadFlowForSelected();
+  await refreshSemanticStatus();
   try {
     endnote.value = await endnoteDetect();
   } catch {
@@ -473,8 +565,43 @@ onMounted(async () => {
         <SoftButton :height="28" :font-size="12" :disabled="searchBusy" @click="searchOnline">
           {{ searchBusy ? "搜索中…" : "搜 arXiv / Crossref / S2" }}
         </SoftButton>
+        <SoftButton
+          :height="28"
+          :font-size="12"
+          :disabled="semanticBusy"
+          title="本地文献库「按意思搜」：问句由服务器算一次向量，其余在本地比"
+          @click="searchSemantic"
+        >
+          {{ semanticBusy ? "思考中…" : "按意思搜" }}
+        </SoftButton>
       </div>
       <div v-if="searchMsg" class="hint">{{ searchMsg }}</div>
+      <div v-if="semanticStatus" class="hint">
+        语义索引：{{ semanticStatus.indexed }}/{{ semanticStatus.papers }} 篇
+        <template v-if="semanticStatus.need_index">
+          <SoftButton :height="24" :font-size="11" :disabled="semanticBusy" @click="buildIndex(false)">
+            建索引
+          </SoftButton>
+        </template>
+        <template v-else>
+          <SoftButton :height="24" :font-size="11" :disabled="semanticBusy" @click="buildIndex(true)">
+            重建索引
+          </SoftButton>
+        </template>
+      </div>
+      <div v-if="semanticMsg" class="hint">{{ semanticMsg }}</div>
+      <div v-for="hit in semanticHits" :key="`sem-${hit.id}`" class="ref-row">
+        <div class="ref-main">
+          <b>{{ hit.title }}</b>
+          <span class="ref-meta">
+            {{ hit.authors || "（无作者）" }}{{ hit.year ? ` · ${hit.year}` : "" }}{{
+              hit.venue ? ` · ${hit.venue}` : ""
+            }}
+          </span>
+        </div>
+        <span class="coverage full">相似度 {{ (hit.score * 100).toFixed(0) }}%</span>
+        <SoftButton :height="26" :font-size="11.5" @click="selectSemantic(hit)">看这篇</SoftButton>
+      </div>
       <div v-for="hit in searchHits" :key="`${hit.source}-${hit.source_id}`" class="ref-row">
         <div class="ref-main">
           <b>{{ hit.title }}</b>
