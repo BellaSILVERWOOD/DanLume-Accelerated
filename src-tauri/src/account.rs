@@ -846,10 +846,10 @@ mod tests {
         assert!(!logged_in(&store));
         set_token(&store, TOKEN_KEY, "access-abc").unwrap();
         set_token(&store, REFRESH_KEY, "refresh-xyz").unwrap();
-        // 明文永远不该出现在 settings 里（DPAPI 前缀；非 Windows 是 plain:，也算加密分支）
+        // 明文不能出现在 settings；macOS 只应有 Keychain 引用，Windows 使用 DPAPI。
         let raw = store.setting(TOKEN_KEY).unwrap();
         assert!(!raw.contains("access-abc"), "token 不该明文存：{raw}");
-        assert!(raw.starts_with("dpapi:") || raw.starts_with("b64:") || raw.starts_with("plain:"));
+        assert!(raw.starts_with("dpapi:") || raw.starts_with("keychain:") || raw.starts_with("b64:") || raw.starts_with("plain:"));
         assert_eq!(token(&store), "access-abc");
         assert_eq!(refresh_token(&store), "refresh-xyz");
         assert!(logged_in(&store));

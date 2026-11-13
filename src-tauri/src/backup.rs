@@ -168,7 +168,8 @@ pub fn export(db_path: &Path, out: &Path) -> Result<Value, String> {
             Connection::open(&snapshot).map_err(|err| format!("快照打不开：{err}"))?;
         let stripped_keys: Vec<String> = {
             let mut stmt = conn
-                .prepare("SELECT key FROM settings WHERE value LIKE ?1 ORDER BY key")
+                // macOS Keychain 引用及旧版 plain:/b64: 值也不能进入可分享的备份包。
+                .prepare("SELECT key FROM settings WHERE value LIKE ?1 OR value LIKE 'keychain:%' OR value LIKE 'plain:%' OR value LIKE 'b64:%' ORDER BY key")
                 .map_err(|err| format!("读设置失败：{err}"))?;
             let rows = stmt
                 .query_map(rusqlite::params![secret_pattern()], |row| {
@@ -180,7 +181,8 @@ pub fn export(db_path: &Path, out: &Path) -> Result<Value, String> {
         };
         let stripped_rows = conn
             .execute(
-                "DELETE FROM settings WHERE value LIKE ?1",
+                // Windows DPAPI / macOS Keychain / 旧版明文混淆数据一并剥离。
+                "DELETE FROM settings WHERE value LIKE ?1 OR value LIKE 'keychain:%' OR value LIKE 'plain:%' OR value LIKE 'b64:%'",
                 rusqlite::params![secret_pattern()],
             )
             .map_err(|err| format!("剥离密钥失败：{err}"))?;

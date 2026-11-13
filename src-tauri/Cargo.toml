@@ -50,6 +50,10 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 
+# macOS 凭据保存在系统 Keychain，SQLite 只保存随机引用；Windows 仍使用 DPAPI。
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
   "Win32_Foundation",

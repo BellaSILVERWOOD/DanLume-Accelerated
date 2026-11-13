@@ -487,7 +487,8 @@ mod tests {
 
         let raw = store.setting(SESSION_KEY).unwrap_or_default();
         println!("存的密文前缀：{}", &raw[..raw.len().min(12)]);
-        assert!(raw.starts_with("dpapi:") || raw.starts_with("b64:"), "必须加密后存");
+        // macOS 只保存 Keychain 引用；Windows 为 DPAPI，均不可从数据库直接还原。
+        assert!(raw.starts_with("dpapi:") || raw.starts_with("keychain:") || raw.starts_with("b64:"), "必须加密后存");
         assert!(!raw.contains("TGT-xyz"), "明文不能出现在库里");
 
         let back = load_session(&store).expect("会话读不出来");
