@@ -60,6 +60,9 @@ import {
   settingsSave,
   uisLogin,
   proxySummary,
+  mascotOpen,
+  mascotClose,
+  mascotResize,
   mailWatchState,
   mailWatchCheck,
   mailWatchResetSeen,
@@ -109,6 +112,40 @@ function switchOn(key: string): boolean {
   const value = values[key] ?? "";
   if (OFF_BY_DEFAULT.has(key) && value === "") return false;
   return value !== "0";
+}
+
+/* ---------------- 看板娘（梅子） ---------------- */
+const mascotMsg = ref("");
+
+async function applyMascotScale() {
+  try {
+    const result = await mascotResize();
+    mascotMsg.value = result.ok
+      ? result.opened === false
+        ? `大小已记下（${Math.round(result.width || 0)}×${Math.round(result.height || 0)}），下次打开梅子生效`
+        : `已缩放到 ${Math.round(result.width || 0)}×${Math.round(result.height || 0)}`
+      : `应用失败：${result.error || "未知原因"}`;
+  } catch (err) {
+    mascotMsg.value = `应用失败：${String(err)}`;
+  }
+}
+
+async function openMascot() {
+  try {
+    await mascotOpen();
+    await applyMascotScale();
+  } catch (err) {
+    mascotMsg.value = `打开失败：${String(err)}`;
+  }
+}
+
+async function closeMascot() {
+  try {
+    await mascotClose();
+    mascotMsg.value = "已关掉梅子";
+  } catch (err) {
+    mascotMsg.value = `关掉失败：${String(err)}`;
+  }
 }
 
 /* ---------------- 盯邮箱（J2-6） ---------------- */
@@ -801,6 +838,22 @@ const cards: CardDef[] = [
       { label: "只收未读", kind: "switch", key: "imap_unread_only" },
     ],
     actions: ["save", "imap-test"],
+  },
+  {
+    key: "mascot",
+    title: "看板娘（梅子）",
+    subtitle: "桌面上那个人物：大小可以调；文件拖到她身上就发给 AI",
+    category: "其他",
+    fields: [
+      {
+        label: "大小（百分比）",
+        kind: "select",
+        key: "mascot_scale",
+        options: ["70", "85", "100", "115", "130", "150", "180"],
+        hint: "默认 100（约 250×430）；改完点下面的「立即应用大小」，开着的小窗会马上缩放",
+      },
+    ],
+    actions: ["save"],
   },
   {
     key: "mailwatch",
@@ -1859,6 +1912,23 @@ async function refreshAdminFlag() {
                   @input="setValue(field, ($event.target as HTMLInputElement).value)"
                 />
                 <span v-if="field.hint" class="hint">{{ field.hint }}</span>
+              </div>
+            </div>
+          </template>
+
+          <!-- 看板娘：立即应用大小 / 打开 / 关掉 -->
+          <template v-if="card.key === 'mascot'">
+            <div class="field">
+              <div class="label">现在应用</div>
+              <div class="control">
+                <div class="row-actions">
+                  <SoftButton :height="28" :font-size="12" @click="applyMascotScale">
+                    立即应用大小
+                  </SoftButton>
+                  <SoftButton :height="28" :font-size="12" @click="openMascot">打开梅子</SoftButton>
+                  <SoftButton :height="28" :font-size="12" @click="closeMascot">关掉梅子</SoftButton>
+                </div>
+                <span class="hint">{{ mascotMsg || "改完大小记得点「立即应用大小」；也可以直接关了重开" }}</span>
               </div>
             </div>
           </template>

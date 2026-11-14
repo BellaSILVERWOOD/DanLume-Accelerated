@@ -964,6 +964,18 @@ export async function mascotOpen(): Promise<void> {
   await invoke("mascot_open");
 }
 
+/** 按设置里的 `mascot_scale` 立刻缩放看板娘小窗（没开就只更新尺寸） */
+export async function mascotResize(): Promise<{
+  ok: boolean;
+  width?: number;
+  height?: number;
+  opened?: boolean;
+  error?: string;
+}> {
+  if (!isTauri) return { ok: true };
+  return invoke("mascot_resize");
+}
+
 export async function mascotClose(): Promise<void> {
   if (!isTauri) return;
   await invoke("mascot_close");

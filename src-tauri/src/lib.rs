@@ -2621,8 +2621,8 @@ fn mascot_open(app: tauri::AppHandle) -> Result<(), String> {
     }
     // 位置不能写死：写死 1500×520 在小屏（1366×768、或 125% 缩放）上直接跑到屏幕外面，
     // 表现就是「窗口开了但一片白、找不到」。改成按主显示器的工作区算，贴右边、略靠下。
-    // 梅子要摆人物图（精灵表 320x426 的比例），所以窗口比原来高不少
-    let (width, height) = (250.0_f64, 430.0_f64);
+    // 尺寸跟着设置里的 `mascot_scale`（百分比，默认 100）：用户 2026-11-14 要求「允许在设置里调大小」
+    let (width, height) = mascot_size(get_store());
     let mut spot = (900.0_f64, 400.0_f64);
     if let Ok(Some(monitor)) = app.primary_monitor() {
         let scale = monitor.scale_factor();
@@ -2651,6 +2651,30 @@ fn mascot_open(app: tauri::AppHandle) -> Result<(), String> {
     .position(spot.0, spot.1);
     builder.build().map_err(|err| format!("开不了看板娘窗口：{err}"))?;
     Ok(())
+}
+
+/// 梅子窗口的尺寸：基准 250×430，按设置里的 `mascot_scale`（70–200%）缩放
+fn mascot_size(store: &crate::store::Store) -> (f64, f64) {
+    let scale = store
+        .setting("mascot_scale")
+        .and_then(|text| text.trim().parse::<f64>().ok())
+        .map(|value| value.clamp(70.0, 200.0) / 100.0)
+        .unwrap_or(1.0);
+    (250.0 * scale, 430.0 * scale)
+}
+
+/// 改完设置立刻把开着的小窗缩放到新尺寸（不用关掉重开）
+#[tauri::command]
+fn mascot_resize(app: tauri::AppHandle, state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    let (width, height) = mascot_size(get_store());
+    match app.get_webview_window("mascot") {
+        Some(win) => match win.set_size(tauri::LogicalSize::new(width, height)) {
+            Ok(()) => json!({ "ok": true, "width": width, "height": height }),
+            Err(exc) => json!({ "ok": false, "error": exc.to_string() }),
+        },
+        None => json!({ "ok": true, "width": width, "height": height, "opened": false }),
+    }
 }
 
 /// 关掉看板娘小窗
@@ -5414,6 +5438,7 @@ pub fn run() {
             contacts_list,
             mascot_open,
             mascot_close,
+            mascot_resize,
             mascot_send,
             wechat_read,
             contacts_save,
