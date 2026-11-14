@@ -58,6 +58,18 @@ import {
 } from "../lib/aiAttach";
 import { pendingMascot, takeMascot, type MascotPayload } from "../lib/mascotBus";
 
+/**
+ * 梅子现在是什么状态（用户 2026-11-14）：
+ * * 模型还没出字 / 在调工具 → 「思考中」，放 kanban_thinking
+ * * 已经开始出字 → 「回答中」，放恍然大悟那张
+ * 都没有就返回空串（聊天区不挂图）。
+ */
+const meiziState = computed<"" | "think" | "answer">(() => {
+  const last = messages.value[messages.value.length - 1];
+  if (!last || !last.streaming) return "";
+  return last.text && last.text.trim() ? "answer" : "think";
+});
+
 const ATTACH_KEY = "ai_attach_paths";
 const SCENE_KEY = "ai_scene";
 
@@ -865,9 +877,21 @@ onBeforeUnmount(() => {
           <div v-if="!history.length" class="empty">还没有历史会话</div>
         </div>
 
+        <!-- 梅子在思考 / 在回答：右下角一张小图（用户 2026-11-14 指定用哪两张） -->
+        <div v-if="meiziState" class="meizi-live">
+          <img
+            :src="meiziState === 'answer' ? '/mascot/meizi-answer.webp' : '/mascot/meizi-thinking.webp'"
+            :alt="meiziState === 'answer' ? '梅子在回答' : '梅子在思考'"
+            draggable="false"
+          />
+          <span>{{ meiziState === "answer" ? "梅子在回答…" : "梅子在思考…" }}</span>
+        </div>
         <div ref="scroller" class="chat" @scroll.passive="onScroll">
-          <div v-if="!messages.length" class="empty">
-            有什么要做？可以直接把 PDF / Word / 图片拖进来当上下文。
+          <!-- 空对话时摆梅子的立绘（用户 2026-11-14：第一张图放 AI 页面） -->
+          <div v-if="!messages.length" class="empty ai-empty">
+            <img class="ai-portrait" src="/mascot/meizi-ai.png" alt="梅子" draggable="false" />
+            <div class="ai-greet">我是梅子，有什么要做？</div>
+            <div class="ai-sub">可以直接把 PDF / Word / 图片拖进来当上下文，也可以让我帮你写日程、改公式。</div>
           </div>
           <div v-for="(message, index) in messages" :key="index" class="msg" :class="message.role">
             <!-- 助手：时间行 + 正文 + 操作条 -->
@@ -1042,6 +1066,55 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/* 空对话时的梅子立绘 */
+.ai-empty {
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+}
+.ai-portrait {
+  width: 150px;
+  max-height: 200px;
+  object-fit: contain;
+  border-radius: 14px;
+  margin-bottom: 2px;
+  filter: drop-shadow(0 6px 14px rgba(0, 0, 0, 0.12));
+}
+.ai-greet {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-soft);
+}
+.ai-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.5;
+  max-width: 260px;
+}
+
+/* 梅子状态图：贴在聊天区右下角，不挡文字 */
+.meizi-live {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  pointer-events: none;
+  opacity: 0.96;
+}
+.meizi-live img {
+  height: 96px;
+  width: auto;
+  border-radius: 10px;
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.18));
+}
+.meizi-live span {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
 .ai-panel {
   flex: 1;
   min-height: 0;

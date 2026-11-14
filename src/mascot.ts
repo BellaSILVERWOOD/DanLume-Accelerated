@@ -2,12 +2,16 @@
 //
 // 为什么不复用主界面 + hash 判断：实测在 Tauri 的 asset 协议下 hash 会被吞掉，
 // 结果主界面被塞进 168px 的小窗里。单独一个 entry 最稳。
+//
+// 这里**故意不 import `./api`**（那个模块 2900 行，主界面那一堆东西都在里面）：
+// 小窗只需要三个命令，直接 invoke 就够。api 模块里任何一处模块级问题都会让整个小窗白屏，
+// 而小窗一旦白屏，页面上的 × 也点不到 —— 用户就「关不掉看板娘」了（2026-11-14 反馈）。
 import { createApp } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import MascotBall from "./components/MascotBall.vue";
 import "./styles/tokens.css";
 import "./styles/base.css";
 import { apply, loadFromSettings } from "./theme";
-import { settingsAll } from "./api";
 
 /** 把错误写进 mascot.html 里那行「启动中」，别让 168px 的窗口只剩白屏 */
 function fail(why: string): void {
@@ -25,10 +29,10 @@ function fail(why: string): void {
  */
 async function syncTheme(): Promise<void> {
   try {
-    const all = await settingsAll();
-    loadFromSettings(all.values || {});
+    const all = await invoke<{ values: Record<string, string> }>("settings_all");
+    loadFromSettings(all?.values || {});
   } catch {
-    // 读不到设置（服务器没起来 / 首次启动）就先用本机缓存的默认值
+    // 读不到设置（刚启动 / 服务器异常）就先用本机缓存的默认值
     apply();
   }
 }
@@ -49,6 +53,13 @@ try {
   fail(String((err as Error)?.message || err));
   console.error("[mascot] mount failed", err);
 }
+
+// Esc 直接关掉小窗（用户 2026-11-14：看板娘关不掉 → 至少给个键盘出口）
+window.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  invoke("mascot_close").catch(() => undefined);
+});
 
 // 小窗里也不要浏览器右键菜单
 document.addEventListener("contextmenu", (event) => {

@@ -92,8 +92,8 @@ function isActive(item: { key: PageKey | "ai" }): boolean {
       </SoftButton>
       <SoftButton glyph="MAIL" :height="38" @click="emit('new-mail')">新邮件</SoftButton>
       <SoftButton glyph="CLOCK" :height="38" @click="emit('focus')">专注模式</SoftButton>
-      <!-- T2 看板娘悬浮球：桌面置顶小窗，把文件拖进去就直接发给 AI -->
-      <SoftButton glyph="INFO" :height="38" @click="emit('mascot')">看板娘</SoftButton>
+      <!-- 看板娘「梅子」：桌面置顶小窗，把文件拖进去就直接发给 AI -->
+      <SoftButton glyph="INFO" :height="38" @click="emit('mascot')">梅子</SoftButton>
     </div>
 
     <div class="spacer" />

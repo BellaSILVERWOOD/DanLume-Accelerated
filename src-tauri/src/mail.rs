@@ -201,6 +201,60 @@ fn address_text(message: &mail_parser::Message<'_>, name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// 一封邮件的日期，**一定给得出**（本地时间 `YYYY-MM-DD HH:MM`）
+///
+/// 2026-11-14 用户报「收了新邮件但完全不显示」：原来直接取 `Date` 头的原文，
+/// 有 8 封的 Date 头解析为空串 → 存进库就是空字符串 → `ORDER BY date DESC` 把它们排到最后，
+/// 列表只取前 30 条，新邮件永远看不到。现在按「解析出来的 Date → Date 原文 → INTERNALDATE → 现在」
+/// 的顺序兜底，确保每条都有可排序的日期。
+fn summary_date(message: &mail_parser::Message<'_>, fetch: &imap::types::Fetch) -> String {
+    let parsed = message.date().map(|date| date.to_timestamp());
+    let raw = header_text(message, "Date");
+    let internal = fetch.internal_date().map(|date| date.timestamp());
+    pick_date_text(parsed, &raw, internal, chrono::Local::now().timestamp())
+}
+
+fn format_local(stamp: i64) -> String {
+    chrono::DateTime::from_timestamp(stamp, 0)
+        .map(|utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// 兜底顺序（纯函数，方便单测）：解析出来的 Date → Date 头原文 → IMAP 的 INTERNALDATE → 现在
+///
+/// **绝不允许返回空串**：空日期存进库后，`ORDER BY date DESC` 会把它排到最后，
+/// 列表只取前 30 条 — 新邮件就永远看不见了（2026-11-14 的事故）。
+fn pick_date_text(
+    parsed: Option<i64>,
+    raw: &str,
+    internal: Option<i64>,
+    now: i64,
+) -> String {
+    if let Some(stamp) = parsed {
+        let text = format_local(stamp);
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    if let Ok(date) = chrono::DateTime::parse_from_rfc2822(raw.trim()) {
+        let text = format_local(date.timestamp());
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    if let Some(stamp) = internal {
+        let text = format_local(stamp);
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    format_local(now)
+}
+
 /// 拉最近 `limit` 封邮件的概要（不建缓存、不落盘）
 pub fn list_inbox(store: &Store, limit: usize) -> Result<Vec<MailSummary>, String> {
     let config = config(store)?;
@@ -231,7 +285,7 @@ pub fn list_inbox(store: &Store, limit: usize) -> Result<Vec<MailSummary>, Strin
         let flags = format!("{:?}", fetch.flags());
         let subject = subject_text(&message);
         let from = from_text(&message);
-        let date = header_text(&message, "Date");
+        let date = summary_date(&message, &fetch);
         let content_type = header_text(&message, "Content-Type");
         rows.push(MailSummary {
             uid,
@@ -842,6 +896,34 @@ pub fn write_debug(path: &str, data: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    /// 日期兜底：任何一步都不许返回空串（空串会让新邮件在列表里排到最后 = 看不见）
+    #[test]
+    fn mail_date_falls_back_and_never_empty() {
+        let stamp = 1_760_000_000_i64; // 2025-10-09 附近，随便一个确定的时间
+        let text = format_local(stamp);
+        assert!(text.len() >= 16 && text.contains(':'), "{text}");
+        // ① 解析出来的 Date 优先
+        assert_eq!(
+            pick_date_text(Some(stamp), "Tue, 03 Jun 2025 09:15:00 +0000", Some(stamp + 60), stamp),
+            text
+        );
+        // ② 没有解析结果时用 Date 原文（chrono 会校验星期，所以这里用真的星期二）
+        let rfc = "Tue, 03 Jun 2025 09:15:00 +0000";
+        let expect_raw = format_local(
+            chrono::DateTime::parse_from_rfc2822(rfc).expect("样例日期要能解析").timestamp(),
+        );
+        assert_eq!(pick_date_text(None, rfc, None, stamp), expect_raw);
+        assert!(!expect_raw.is_empty());
+        // ③ Date 原文也没有 → INTERNALDATE
+        assert_eq!(pick_date_text(None, "", Some(stamp), stamp), text);
+        // ④ 全都没有 → 现在（也绝不能是空串）
+        let now_text = pick_date_text(None, "", None, stamp);
+        assert_eq!(now_text, text);
+        assert!(!now_text.is_empty());
+        // ⑤ 乱码 Date 也不至于空
+        assert!(!pick_date_text(None, "not a date", None, stamp).is_empty());
+    }
+
     use super::*;
 
     /// 真数据用例：数据来自临时副本（见 `crate::testdata`），不碰用户的真实库。
@@ -1057,6 +1139,16 @@ pub fn ensure_inbox_schema(store: &Store) {
         )",
         [],
     );
+    // 老数据里 date 是空串的（Date 头解析不出来），拿 fetched_at 补一下：
+    // 否则 `ORDER BY date DESC` 会把它们排到最后，列表前 30 条里永远看不到这些邮件
+    //（2026-11-14 用户报「收了新邮件但完全不显示」就是这个）。
+    let _ = conn.execute(
+        "UPDATE inbox_messages
+            SET date = substr(COALESCE(NULLIF(fetched_at, ''), datetime('now', 'localtime')), 1, 16)
+          WHERE COALESCE(date, '') = ''",
+        [],
+    );
+
     // 老库（Python 建的）没有这两列，补上；补不了就算了，读的时候有默认值
     let columns: Vec<String> = {
         let mut out = Vec::new();

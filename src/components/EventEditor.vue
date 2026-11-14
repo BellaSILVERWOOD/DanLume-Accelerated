@@ -5,7 +5,7 @@
 import { computed, ref, watch } from "vue";
 import SoftButton from "./SoftButton.vue";
 import ConfirmDialog from "./ConfirmDialog.vue";
-import { addEvent, deleteEvent, updateEvent, type EventRow } from "../api";
+import { addEvent, deleteEvent, skipEventOccurrence, updateEvent, type EventRow } from "../api";
 
 const props = withDefaults(
   defineProps<{
@@ -155,10 +155,47 @@ async function save() {
 
 /** 删除前先问一句（用户 2026-11-11：删日程要弹「删除后无法恢复」） */
 const confirmOpen = ref(false);
+/** 重复日程要选择作用范围（用户 2026-11-14：删系列时要问「这一天 / 整个系列」） */
+const repeatScopeOpen = ref(false);
+
+/** 这条是不是重复日程（点开的是展开出来的某一次时 `repeat_of` 有值） */
+const isRepeating = computed(() => occurrence.value || !!props.initial?.repeat);
 
 function remove() {
   if (busy.value) return;
+  // 重复日程：先问「只删这一天」还是「整个系列」
+  if (isRepeating.value) {
+    repeatScopeOpen.value = true;
+    return;
+  }
   confirmOpen.value = true;
+}
+
+/** 只删这一天：记进 repeat_skip，母事件和以后的重复都不动 */
+async function doRemoveOnce() {
+  if (busy.value) return;
+  const id = Number(props.initial?.id || 0);
+  const day = String(props.initial?.date || date.value || "").slice(0, 10);
+  if (!id || day.length < 10) {
+    repeatScopeOpen.value = false;
+    confirmOpen.value = true;
+    return;
+  }
+  busy.value = true;
+  try {
+    const result = await skipEventOccurrence(id, day);
+    busy.value = false;
+    repeatScopeOpen.value = false;
+    if (!result.ok) {
+      error.value = result.error || "删不掉这一次";
+      return;
+    }
+    emit("saved");
+    emit("close");
+  } catch (err) {
+    busy.value = false;
+    error.value = String(err);
+  }
 }
 
 async function doRemove() {
@@ -276,6 +313,32 @@ async function doRemove() {
       </div>
     </div>
 
+    <!-- 重复日程：只删这一天，还是整个系列（用户 2026-11-14） -->
+    <div v-if="repeatScopeOpen" class="scope-mask" @click.self="repeatScopeOpen = false">
+      <div class="scope-card">
+        <div class="scope-title">这是重复日程，删哪个？</div>
+        <div class="scope-hint">
+          「只删这一天」只让 {{ String(props.initial?.date || date || "").slice(5, 10) }} 这一次不出现，
+          以后照样重复；「删除整个系列」以后都不会再出现。
+        </div>
+        <div class="scope-actions">
+          <SoftButton :height="30" :font-size="12" @click="repeatScopeOpen = false">取消</SoftButton>
+          <SoftButton :height="30" :font-size="12" :disabled="busy" @click="doRemoveOnce">
+            只删这一天
+          </SoftButton>
+          <SoftButton
+            variant="primary"
+            :height="30"
+            :font-size="12"
+            :disabled="busy"
+            @click="repeatScopeOpen = false; confirmOpen = true"
+          >
+            删除整个系列
+          </SoftButton>
+        </div>
+      </div>
+    </div>
+
     <!-- 删日程：先确认（删了就找不回来） -->
     <ConfirmDialog
       v-model:open="confirmOpen"
@@ -288,6 +351,42 @@ async function doRemove() {
 </template>
 
 <style scoped>
+/* 重复日程的删除范围弹层 */
+.scope-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.32);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 90;
+}
+.scope-card {
+  width: 420px;
+  max-width: calc(100vw - 60px);
+  padding: 16px 18px;
+  border-radius: 14px;
+  background: var(--card);
+  box-shadow: var(--shadow-pop, 0 12px 32px rgba(0, 0, 0, 0.25));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.scope-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.scope-hint {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.scope-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
 .mask {
   position: fixed;
   inset: 0;

@@ -261,6 +261,15 @@ export async function eventSetDone(
   });
 }
 
+/** 重复日程：只删这一次（记进 repeat_skip，母事件与以后的重复都不动） */
+export async function skipEventOccurrence(
+  id: number,
+  date: string,
+): Promise<{ ok: boolean; error?: string; skipped?: string[] }> {
+  if (!isTauri) return { ok: false, error: "browser preview" };
+  return invoke("event_skip_occurrence", { id, date });
+}
+
 export async function deleteEvent(id: number): Promise<void> {
   if (!isTauri) {
     const at = MOCK_EVENTS.findIndex((e) => e.id === id);
@@ -646,6 +655,8 @@ export async function mailSummarize(
   error: string;
   events?: MailEventSuggestion[];
   model?: string;
+  /** 钓鱼 / 风险判断（摘要最后一行「风险：低|中|高 —— 理由」解析出来的） */
+  risk?: { level: "" | "low" | "medium" | "high"; reason: string };
 }> {
   if (!isTauri)
     return {

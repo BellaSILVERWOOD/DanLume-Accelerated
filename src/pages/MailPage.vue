@@ -43,6 +43,11 @@ const summaryError = ref("");
 const summaryBusy = ref(false);
 const summaryModel = ref("");
 const summaryCached = ref(false);
+/** 钓鱼 / 风险判断（用户 2026-11-14：摘要里要检查是不是钓鱼邮件） */
+const summaryRisk = ref<{ level: "" | "low" | "medium" | "high"; reason: string }>({
+  level: "",
+  reason: "",
+});
 const summaryMemory = new Map<string, { text: string; model: string }>();
 
 /**
@@ -154,6 +159,7 @@ async function open(item: MailSummary) {
   summaryError.value = "";
   summaryModel.value = "";
   summaryCached.value = false;
+  summaryRisk.value = { level: "", reason: "" };
   summaryText.value = summaryMemory.get(item.uid)?.text || "";
   summaryBusy.value = false;
   // 换了一封：日程候选也清掉（等这封的摘要回来再填）
@@ -192,6 +198,8 @@ async function loadSummary(uid: string, force = false) {
       summaryMemory.set(uid, { text: result.summary, model: result.model || "" });
       eventItems.value = result.events || [];
       pickedEvents.value = [];
+      summaryRisk.value = result.risk || { level: "", reason: "" };
+      summaryRisk.value = result.risk || { level: "", reason: "" };
     } else {
       summaryText.value = "";
       summaryError.value = result.error || "没拿到摘要";
@@ -419,6 +427,22 @@ onMounted(async () => {
                 {{ summaryBusy ? "生成中…" : summaryText ? "重新生成" : "生成摘要" }}
               </button>
             </div>
+            <!-- 钓鱼 / 风险（用户 2026-11-14）：摘要上面一行，高/中风险用醒目色 -->
+            <div
+              v-if="summaryRisk.level"
+              class="risk-line"
+              :class="`risk-${summaryRisk.level}`"
+              :title="summaryRisk.reason"
+            >
+              <b>{{
+                summaryRisk.level === "high"
+                  ? "⚠ 高风险：像钓鱼 / 诈骗邮件"
+                  : summaryRisk.level === "medium"
+                    ? "⚠ 有点儿可疑，别急着点链接"
+                    : "✓ 没看出风险"
+              }}</b>
+              <span v-if="summaryRisk.reason">· {{ summaryRisk.reason }}</span>
+            </div>
             <div v-if="summaryText" class="ai-text">{{ summaryText }}</div>
             <div v-else-if="summaryError" class="ai-error">{{ summaryError }}</div>
             <div v-else class="ai-note">{{ summaryBusy ? "把正文压成两三行，稍等几秒…" : "还没有摘要" }}</div>
@@ -553,6 +577,33 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+/* 钓鱼 / 风险提示行 */
+.risk-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: baseline;
+  margin: 4px 0 2px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.risk-line b {
+  font-weight: 600;
+}
+.risk-low {
+  background: color-mix(in srgb, #34c759 12%, transparent);
+  color: #1f7a37;
+}
+.risk-medium {
+  background: color-mix(in srgb, #ff9500 16%, transparent);
+  color: #8a5000;
+}
+.risk-high {
+  background: color-mix(in srgb, #ff3b30 16%, transparent);
+  color: #a11a12;
+}
 .page {
   display: flex;
   flex-direction: column;

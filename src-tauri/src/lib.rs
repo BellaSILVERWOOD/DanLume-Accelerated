@@ -1092,7 +1092,7 @@ fn mail_summary_messages(
     vec![
         json!({
             "role": "system",
-            "content": "你是邮件摘要助手。用简体中文，只写正文里确实有的信息，不编造时间、金额和人名。",
+            "content": "你是邮件摘要助手，同时负责替用户把关安全。用简体中文，只写正文里确实有的信息，不编造时间、金额和人名。",
         }),
         json!({
             "role": "user",
@@ -1102,13 +1102,44 @@ fn mail_summary_messages(
                  1. 2–3 行，每行以「· 」开头；第一行先说清这是什么邮件（谁发的、关于什么事）；\n\
                  2. 正文里出现的截止时间、会议时间、金额、需要点的链接或要回复的事，必须写进去；没有就别编；\n\
                  3. 如果确实需要用户处理，最后单独一行用「要做：」开头；纯通知就不写这一行；\n\
-                 4. 不要复述称呼、签名、页脚，不要用 Markdown 标题 / 加粗 / 代码块 / 分隔线；\n\
-                 5. 全篇不超过 120 个汉字。\n\
+                 4. **安全判断**：检查这封邮件是不是钓鱼 / 诈骗 / 有风险，最后单独一行用「风险：」开头，\
+                    格式 `风险：低|中|高 —— 一句理由`。判断依据举例：要求点陌生链接登录或改密码、\
+                    催得很急或威胁封号、发件域名可疑（很像但不等于官方域名）、附件是可执行文件或压缩包、\
+                    索要验证码 / 密码 / 银行卡、要求转账付款、突然更换收款账号。没有任何可疑点就写「风险：低 —— 没有可疑链接或索取信息」。\n\
+                 5. 不要复述称呼、签名、页脚，不要用 Markdown 标题 / 加粗 / 代码块 / 分隔线；\n\
+                 6. 全篇不超过 150 个汉字（含「风险：」那行）。\n\
                  \n\
                  主题：{subject}\n发件人：{from}\n时间：{date}{attach}\n\n正文（完整，未删减）：\n{body}"
             ),
         }),
     ]
+}
+
+/// 从摘要里读出「风险：低|中|高 —— 理由」这一行（用户 2026-11-14：摘要要提示钓鱼/风险）
+///
+/// 模型偶尔不按格式写，所以这里只做「尽量读」：读不到就返回空，不影响摘要本身。
+fn mail_summary_risk(summary: &str) -> serde_json::Value {
+    for line in summary.lines() {
+        let text = line.trim().trim_start_matches(['·', '-', ' ', '\t']);
+        let Some(rest) = text.strip_prefix("风险：").or_else(|| text.strip_prefix("风险:")) else {
+            continue;
+        };
+        let rest = rest.trim();
+        let level = if rest.starts_with('高') {
+            "high"
+        } else if rest.starts_with('中') {
+            "medium"
+        } else {
+            "low"
+        };
+        let reason = rest
+            .trim_start_matches(['高', '中', '低'])
+            .trim_start_matches(['—', '-', '－', ':', '：', ' '])
+            .trim()
+            .to_string();
+        return json!({ "level": level, "reason": reason });
+    }
+    json!({ "level": "", "reason": "" })
 }
 
 /// 从邮件里抽「可能需要加进日程的事」的提示词
@@ -1285,7 +1316,7 @@ async fn mail_summarize(
         if !cached.trim().is_empty() && events_done {
             return Ok(json!({
                 "ok": true, "summary": cached, "cached": true, "error": "",
-                "events": events,
+                "events": events, "risk": mail_summary_risk(&cached),
             }));
         }
         // 摘要有了、但「可能要加的日程」还没抽过（老缓存）：只补抽日程，不重新生成摘要
@@ -1301,7 +1332,7 @@ async fn mail_summarize(
                 let events = mail_events_for(store, &uid, &subject, &from, &date, &body, false);
                 return Ok(json!({
                     "ok": true, "summary": cached, "cached": true, "error": "",
-                    "events": events,
+                    "events": events, "risk": mail_summary_risk(&cached),
                 }));
             }
         }
@@ -1393,6 +1424,7 @@ async fn mail_summarize(
     Ok(json!({
         "ok": true, "summary": summary, "cached": false, "error": "",
         "events": events,
+        "risk": mail_summary_risk(&summary),
         "model": meta.get("model").and_then(|one| one.as_str()).unwrap_or(""),
     }))
 }
@@ -1742,6 +1774,46 @@ fn homework_upcoming(days: Option<i64>, state: State<'_, AppState>) -> serde_jso
 }
 
 // ---------------------------------------------------------------- 盯邮箱（J2-6）
+
+/// 重复日程：只删「这一次」（把这一天记进 `repeat_skip`，对应旧版 dialogs 的「只删这一次」）
+///
+/// 用户 2026-11-14：删重复日程时要能选「只删这一天 / 整个系列」。
+/// 整个系列走 `delete_event`；这一天走这里，母事件和以后的重复都不动。
+#[tauri::command]
+fn event_skip_occurrence(id: i64, date: String, state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    let day = date.trim().chars().take(10).collect::<String>();
+    if day.len() < 10 {
+        return json!({ "ok": false, "error": "日期看不懂（要 YYYY-MM-DD）" });
+    }
+    let store = get_store();
+    let conn = store.connection();
+    let existing: String = conn
+        .query_row(
+            "SELECT COALESCE(repeat_skip, '') FROM events WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    let mut days: Vec<String> = existing
+        .split(',')
+        .map(|one| one.trim().to_string())
+        .filter(|one| !one.is_empty())
+        .collect();
+    if !days.contains(&day) {
+        days.push(day.clone());
+    }
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let updated = conn.execute(
+        "UPDATE events SET repeat_skip = ?1, updated_at = ?2 WHERE id = ?3",
+        rusqlite::params![days.join(","), stamp, id],
+    );
+    match updated {
+        Ok(0) => json!({ "ok": false, "error": "没有这条日程" }),
+        Ok(_) => json!({ "ok": true, "skipped": days }),
+        Err(exc) => json!({ "ok": false, "error": exc.to_string() }),
+    }
+}
 
 /// 盯邮箱：当前状态（开关 / 关键词 / 间隔 / 已处理多少封）
 #[tauri::command]
@@ -2549,7 +2621,8 @@ fn mascot_open(app: tauri::AppHandle) -> Result<(), String> {
     }
     // 位置不能写死：写死 1500×520 在小屏（1366×768、或 125% 缩放）上直接跑到屏幕外面，
     // 表现就是「窗口开了但一片白、找不到」。改成按主显示器的工作区算，贴右边、略靠下。
-    let (width, height) = (200.0_f64, 216.0_f64);
+    // 梅子要摆人物图（精灵表 320x426 的比例），所以窗口比原来高不少
+    let (width, height) = (250.0_f64, 430.0_f64);
     let mut spot = (900.0_f64, 400.0_f64);
     if let Ok(Some(monitor)) = app.primary_monitor() {
         let scale = monitor.scale_factor();
@@ -2564,7 +2637,7 @@ fn mascot_open(app: tauri::AppHandle) -> Result<(), String> {
         "mascot",
         tauri::WebviewUrl::App("mascot.html".into()),
     )
-    .title("DanLume 看板娘")
+    .title("DanLume 梅子")
     .inner_size(width, height)
     .min_inner_size(140.0, 200.0)
     .resizable(true)
@@ -5068,6 +5141,8 @@ pub fn run() {
                     let quit_handle = handle.clone();
                     let menu = tauri::menu::MenuBuilder::new(app)
                         .text("show", "显示主界面")
+                        .text("mascot", "看板娘（显示/打开）")
+                        .text("mascot-close", "关掉看板娘")
                         .text("quit", "退出 DanLume")
                         .build();
                     let mut builder = tauri::tray::TrayIconBuilder::with_id("danlume-tray")
@@ -5079,6 +5154,20 @@ pub fn run() {
                     let _ = builder
                         .on_menu_event(move |_tray, event| match event.id.as_ref() {
                             "quit" => quit_handle.exit(0),
+                            // 看板娘白屏时页面上没有可点的 ×，这里一定关得掉（2026-11-14）
+                            "mascot-close" => {
+                                if let Some(win) = menu_handle.get_webview_window("mascot") {
+                                    let _ = win.close();
+                                }
+                            }
+                            "mascot" => {
+                                if let Some(win) = menu_handle.get_webview_window("mascot") {
+                                    let _ = win.show();
+                                    let _ = win.set_focus();
+                                } else {
+                                    let _ = mascot_open(menu_handle.clone());
+                                }
+                            }
                             _ => {
                                 if let Some(win) = menu_handle.get_webview_window("main") {
                                     let _ = win.show();
@@ -5310,6 +5399,7 @@ pub fn run() {
             homework_mark_done,
             proxy_summary,
             proxy_probe,
+            event_skip_occurrence,
             mail_watch_state,
             mail_watch_check,
             mail_watch_consume,
