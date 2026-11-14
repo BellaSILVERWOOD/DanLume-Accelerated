@@ -2642,10 +2642,10 @@ fn mascot_open(app: tauri::AppHandle) -> Result<(), String> {
     .min_inner_size(140.0, 200.0)
     .resizable(true)
     .decorations(false)
-    // 不透明：透明窗口在小窗里既难截图也容易出现「看不到内容」的怪状态，
-    // 圆角由页面里的卡片自己画（好看的部分不受影响）
-    .transparent(false)
-    .shadow(true)
+    // 透明窗口（用户 2026-11-14：桌面上只要人物 + 聊天气泡，不要对话框背景）；
+    // 阴影也关掉 —— 透明窗带系统阴影会在人物周围留一块方形灰影
+    .transparent(true)
+    .shadow(false)
     .always_on_top(true)
     .skip_taskbar(true)
     .position(spot.0, spot.1);
