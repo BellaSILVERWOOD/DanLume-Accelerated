@@ -5,7 +5,20 @@
 // 滚动、切页、窗口缩放都重新算一次，离开页面时关掉（否则子 Webview 会浮在最上面）。
 import { onMounted, onUnmounted, ref, watch } from "vue";
 import SoftButton from "./SoftButton.vue";
-import { embedBounds, embedClose, embedNavigate, embedOpen, embedReload, openUrl, uisGrabProfile } from "../api";
+import {
+  embedBounds,
+  embedClose,
+  embedCloseTab,
+  embedNavigate,
+  embedNewTab,
+  embedOpen,
+  embedReload,
+  embedSelectTab,
+  embedTabs,
+  openUrl,
+  uisGrabProfile,
+  type EmbedTab,
+} from "../api";
 
 const props = withDefaults(
   defineProps<{
@@ -22,6 +35,108 @@ const ready = ref(false);
 const message = ref("");
 const currentUrl = ref(props.url);
 const sessionMsg = ref("");
+
+/* ---- 多标签页（M5，对应旧版 `EmbeddedWebPanel` 的 QTabBar） ---- */
+const tabs = ref<EmbedTab[]>([]);
+const activeTab = ref(0);
+const tabsEnabled = ref(false);
+const tabNote = ref("");
+let tabTimer = 0;
+let tabBusy = false;
+
+/** 问一次 Rust：几个标签页、当前第几个、有没有网页想开新窗口 */
+async function pollTabs() {
+  if (!ready.value || tabBusy) return;
+  tabBusy = true;
+  try {
+    const state = await embedTabs(props.kind);
+    tabsEnabled.value = !!state.enabled;
+    if (!state.ok) return;
+    tabs.value = state.tabs || [];
+    activeTab.value = state.active ?? 0;
+    const pending = (state.pending || "").trim();
+    if (pending) {
+      // 网页里点了 target=_blank：多标签页开着就再开一个，关着就原地跳
+      if (tabsEnabled.value) {
+        await newTab(pending);
+      } else {
+        currentUrl.value = pending;
+        await embedNavigate(props.kind, pending);
+        void pollTabs();
+      }
+    }
+    // 标签页被关光了：把首页开回来，别留一块空白
+    if (!tabs.value.length) {
+      ready.value = false;
+      await open();
+    }
+  } catch {
+    /* 下一轮再问 */
+  } finally {
+    tabBusy = false;
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  tabTimer = window.setInterval(pollTabs, 1500);
+  void pollTabs();
+}
+
+function stopPolling() {
+  if (tabTimer) window.clearInterval(tabTimer);
+  tabTimer = 0;
+}
+
+/** 开一个新标签页（不给地址就开这个面板的首页） */
+async function newTab(url?: string) {
+  const box = rect();
+  if (!box) return;
+  const target = (url || "").trim() || props.url;
+  const state = await embedNewTab(props.kind, target, box.x, box.y, box.width, box.height);
+  if (state.ok) {
+    tabs.value = state.tabs || [];
+    activeTab.value = state.active ?? 0;
+    tabNote.value = "";
+    currentUrl.value = target;
+    await syncBounds();
+    watchSlowLoad();
+  } else {
+    tabNote.value = state.error || "开新标签页失败";
+  }
+}
+
+/** 切标签页 */
+async function switchTab(index: number) {
+  if (index === activeTab.value) return;
+  const state = await embedSelectTab(props.kind, index);
+  if (!state.ok) {
+    tabNote.value = state.error || "切不过去";
+    return;
+  }
+  tabs.value = state.tabs || [];
+  activeTab.value = state.active ?? index;
+  const tab = tabs.value.find((one) => one.index === activeTab.value);
+  if (tab?.url) currentUrl.value = tab.url;
+  await syncBounds();
+}
+
+/** 关标签页；最后一个关掉就整块重开首页 */
+async function closeTab(index: number) {
+  const state = await embedCloseTab(props.kind, index);
+  if (!state.ok) {
+    tabNote.value = state.error || "关不掉";
+    return;
+  }
+  tabs.value = state.tabs || [];
+  activeTab.value = state.active ?? 0;
+  if (state.closed || !tabs.value.length) {
+    ready.value = false;
+    await open();
+    return;
+  }
+  await syncBounds();
+}
 /** J8-6：8 秒还没加载出来 → 提示「可能被挡」，并给一个浏览器打开的入口 */
 const slow = ref(false);
 let slowTimer = 0;
@@ -106,6 +221,7 @@ async function open() {
   await syncBounds();
   scheduleGrabs();
   watchSlowLoad();
+  startPolling();
 }
 
 async function reload() {
@@ -159,6 +275,7 @@ onMounted(async () => {
   window.addEventListener("scroll", scheduleSync, true);
 });
 onUnmounted(async () => {
+  stopPolling();
   window.removeEventListener("resize", scheduleSync);
   window.removeEventListener("scroll", scheduleSync, true);
   observer?.disconnect();
@@ -191,6 +308,24 @@ defineExpose({ reload, goHome, open });
 
 <template>
   <div class="embed">
+    <!-- 多标签页：一个面板里好几个网页，点标签切、× 关、（+）开新的 -->
+    <div v-if="tabsEnabled && tabs.length" class="tabs">
+      <div class="tab-strip">
+        <button
+          v-for="tab in tabs"
+          :key="tab.index"
+          class="tab"
+          :class="{ on: tab.index === activeTab }"
+          :title="tab.url || tab.title"
+          @click="switchTab(tab.index)"
+        >
+          <span class="tab-title">{{ tab.title || "新标签页" }}</span>
+          <span class="tab-x" title="关掉这个标签页" @click.stop="closeTab(tab.index)">×</span>
+        </button>
+      </div>
+      <button class="tab-add" title="新标签页" @click="newTab()">＋</button>
+      <span v-if="tabNote" class="tiny">{{ tabNote }}</span>
+    </div>
     <div class="embed-head">
       <span class="muted tiny">{{ currentUrl }}</span>
       <span class="spacer" />
@@ -229,6 +364,75 @@ defineExpose({ reload, goHome, open });
   align-items: center;
   gap: 6px;
   font-size: 12px;
+}
+/* 标签页条：跟 Windows 浏览器一样一排，横向能滚 */
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.tab-strip {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  min-width: 0;
+  flex: 1;
+}
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 6px 0 9px;
+  border-radius: 8px 8px 0 0;
+  border: 1px solid var(--border-soft);
+  border-bottom: none;
+  background: var(--card-alt, transparent);
+  color: var(--muted);
+  font-size: 11.5px;
+  max-width: 190px;
+  flex: 0 0 auto;
+  cursor: pointer;
+}
+.tab.on {
+  background: var(--card);
+  color: var(--text);
+  font-weight: 600;
+}
+.tab-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tab-x {
+  flex: 0 0 auto;
+  width: 15px;
+  text-align: center;
+  border-radius: 5px;
+  color: var(--muted);
+  line-height: 15px;
+}
+.tab-x:hover {
+  background: color-mix(in srgb, var(--danger) 20%, transparent);
+  color: var(--danger);
+}
+.tab-add {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px 8px 0 0;
+  border: 1px solid var(--border-soft);
+  border-bottom: none;
+  background: var(--card-alt, transparent);
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+.tab-add:hover {
+  color: var(--text);
 }
 .embed-slot {
   flex: 1;

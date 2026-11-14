@@ -6,17 +6,23 @@ import { computed, onMounted, ref, watch } from "vue";
 import SoftButton from "../components/SoftButton.vue";
 import Pill from "../components/Pill.vue";
 import IconBadge from "../components/IconBadge.vue";
+import EmbedWebview from "../components/EmbedWebview.vue";
 import {
   aiState,
   endnoteDetect,
   endnoteOpen,
+  libraryAccess,
+  libraryAccessUrl,
+  librarySetAccess,
   litFlowDelete,
   litFlowGenerate,
   litFlowLoad,
   openPath,
   paperCitation,
   paperUpdate,
+  papersDatabases,
   papersDownload,
+  papersLinks,
   papersList,
   papersSemanticIndex,
   papersSemanticSearch,
@@ -30,8 +36,11 @@ import {
   refsImport,
   refsList,
   revealPath,
+  type LibraryAccess,
+  type LibraryDatabase,
   type LitFlow,
   type Paper,
+  type PaperLinks,
   type PaperSearchHitWithCoverage,
   type RefEntry,
 } from "../api";
@@ -388,6 +397,111 @@ async function selectSemantic(hit: { id: number }) {
 const downloadBusy = ref(false);
 const downloadMsg = ref("");
 
+/* ---- 下载链接 + 机构登录弹窗（M4，对应旧版 `lit.access_url` / `library_page.py`）----
+ *
+ * 用户 2026-11-14：「文献库能否增加下载链接，然后如果需要机构登录，可以弹窗一个
+ * DanLume 内置浏览器，让用户操作（由于此处为一次性页面所以弹窗可以接受）」。
+ * 弹的是 `EmbedWebview`（子 Webview），登录态留在 WebView2 的 profile 里，
+ * 下回再点就不用重新登录。
+ */
+const links = ref<PaperLinks | null>(null);
+const libraryOpen = ref(false);
+const libraryUrl = ref("");
+const accessState = ref<LibraryAccess | null>(null);
+const prefixDraft = ref("");
+const libraryMsg = ref("");
+const databases = ref<LibraryDatabase[]>([]);
+
+const libraryHomeUrl = computed(() => accessState.value?.dbnav || "https://libdbnav.fudan.edu.cn/");
+
+/** 这篇文献有没有可点的链接 */
+const hasLink = computed(() => !!(links.value?.download || links.value?.page));
+
+async function loadLinks() {
+  const paper = selected.value;
+  if (!paper) {
+    links.value = null;
+    return;
+  }
+  try {
+    links.value = await papersLinks(paper.id);
+  } catch {
+    links.value = null;
+  }
+}
+
+async function loadDatabases() {
+  if (databases.value.length) return;
+  try {
+    databases.value = (await papersDatabases()).items || [];
+  } catch {
+    databases.value = [];
+  }
+}
+
+/** 打开内置浏览器（弹窗）；地址按当前访问方式套前缀 */
+async function openDatabase(url: string, label = "") {
+  const target = (url || "").trim();
+  if (!target) {
+    libraryMsg.value = "这篇没有可用的链接";
+    return;
+  }
+  if (accessState.value === null) {
+    try {
+      accessState.value = await libraryAccess();
+      prefixDraft.value = accessState.value.prefix || "";
+    } catch {
+      /* 读不到就用默认（校内直连） */
+    }
+  }
+  await loadDatabases();
+  let finalUrl = target;
+  try {
+    const rewritten = await libraryAccessUrl(target);
+    if (rewritten.ok && rewritten.url) finalUrl = rewritten.url;
+  } catch {
+    /* 改写失败就按原地址开 */
+  }
+  libraryMsg.value =
+    label || (finalUrl !== target ? "已套上校外访问前缀" : "需要机构登录就在这里登录，登录态会留着");
+  libraryUrl.value = finalUrl;
+  libraryOpen.value = true;
+}
+
+function openDownloadLink() {
+  const target = links.value?.download || links.value?.page || "";
+  void openDatabase(target, links.value?.needs_login ? "没有现成 PDF：登录后在这里自己下" : "");
+}
+
+function openPageLink() {
+  void openDatabase(links.value?.page || "", "");
+}
+
+async function toggleAccessMode() {
+  const next = accessState.value?.mode === "prefix" ? "campus" : "prefix";
+  await saveAccess(next, prefixDraft.value);
+}
+
+async function saveAccess(mode: string, prefix: string) {
+  try {
+    const saved = await librarySetAccess(mode, prefix);
+    accessState.value = saved;
+    prefixDraft.value = saved.prefix || "";
+    libraryMsg.value =
+      saved.mode === "prefix"
+        ? saved.prefix
+          ? "已切到「校外访问前缀」：地址会先套上前缀再打开"
+          : "已切到校外，但前缀还空着（填 WebVPN / libproxy 的前缀）"
+        : "已切到「校内直连」";
+    await loadLinks();
+  } catch (err) {
+    libraryMsg.value = `保存失败：${String(err)}`;
+  }
+}
+
+/** 下载失败时，多半是要机构登录：直接把内置浏览器弹出来 */
+const LOGIN_HINTS = ["机构", "登录", "HTTP 40", "HTTP 41", "不是 PDF", "验证"];
+
 async function downloadPaper() {
   const paper = selected.value;
   if (!paper || downloadBusy.value) return;
@@ -396,7 +510,16 @@ async function downloadPaper() {
   try {
     const result = await papersDownload(paper.id);
     downloadMsg.value = result.summary || (result.ok ? "下载完成" : "下载失败");
-    if (result.ok) await load();
+    if (result.ok) {
+      await load();
+      await loadLinks();
+      return;
+    }
+    const text = String(result.summary || "");
+    if (LOGIN_HINTS.some((one) => text.includes(one)) && hasLink.value) {
+      downloadMsg.value = `${text}（已打开内置浏览器：登录后在这里自己点下载）`;
+      await openDatabase(links.value?.download || links.value?.page || "", "登录后在这里自己点下载");
+    }
   } catch (err) {
     downloadMsg.value = `下载失败：${String(err)}`;
   } finally {
@@ -519,6 +642,12 @@ const stars = [1, 2, 3, 4, 5];
 watch(selectedId, () => {
   flowOpen.value = false;
   loadFlowForSelected();
+  void loadLinks();
+});
+
+// 选中的那篇可能是列表第一项（`selected` 默认取 items[0]），所以盯 `selected` 本身
+watch(selected, () => {
+  void loadLinks();
 });
 
 onMounted(async () => {
@@ -760,6 +889,24 @@ onMounted(async () => {
               <div class="label">备注</div>
               <div class="text">{{ selected.note || "（空）" }}</div>
             </div>
+            <!-- 下载链接（M4）：点了弹内置浏览器；需要机构登录就在里面登录 -->
+            <div class="field">
+              <div class="label">下载链接</div>
+              <div class="text">
+                <button
+                  v-if="hasLink"
+                  class="ext-link"
+                  :title="links?.download_url || links?.download || ''"
+                  @click="openDownloadLink"
+                >
+                  {{ links?.download || links?.page }}
+                </button>
+                <span v-else class="muted">这篇没有可下载的链接（可以去「图书馆数据库」里按标题搜）</span>
+                <div v-if="links?.needs_login" class="hint">
+                  没有现成的开放 PDF：多半要学校权限，点上面的链接会弹出内置浏览器让你登录。
+                </div>
+              </div>
+            </div>
           </div>
           <div class="detail-foot">
             <Pill :text="`${selected.stars} 星`" :font-size="11.5" />
@@ -780,6 +927,12 @@ onMounted(async () => {
               @click="openPath(selected.file_path)"
             >
               打开 PDF
+            </SoftButton>
+            <SoftButton :height="28" :font-size="12" :disabled="!hasLink" @click="openPageLink">
+              原文页面
+            </SoftButton>
+            <SoftButton :height="28" :font-size="12" @click="openDatabase(libraryHomeUrl)">
+              图书馆数据库
             </SoftButton>
           </div>
           <div v-if="downloadMsg" class="detail-foot">
@@ -805,6 +958,74 @@ onMounted(async () => {
           </div>
         </template>
         <div v-else class="empty">选左边一篇文献</div>
+      </div>
+    </div>
+
+    <!-- 图书馆数据库（M4）：一次性弹窗，里面就是 DanLume 自己的浏览器 -->
+    <div v-if="libraryOpen" class="lib-mask" @click.self="libraryOpen = false">
+      <div class="lib-card">
+        <div class="lib-head">
+          <div class="lib-titles">
+            <div class="h2">图书馆数据库（内置浏览器）</div>
+            <div class="tiny">
+              数据库的全文 / 下载由学校买的权限决定；校外先登录再套「校外访问前缀」
+            </div>
+          </div>
+          <span class="spacer" />
+          <SoftButton :height="28" :font-size="12" @click="openDatabase(libraryHomeUrl)">
+            数据库导航
+          </SoftButton>
+          <SoftButton
+            :height="28"
+            :font-size="12"
+            @click="openDatabase(accessState?.uis || 'https://id.fudan.edu.cn/')"
+          >
+            统一身份认证
+          </SoftButton>
+          <SoftButton
+            :height="28"
+            :font-size="12"
+            @click="openDatabase(accessState?.webvpn || 'https://webvpn.fudan.edu.cn/')"
+          >
+            WebVPN
+          </SoftButton>
+          <SoftButton variant="primary" :height="28" :font-size="12" @click="libraryOpen = false">
+            关闭
+          </SoftButton>
+        </div>
+        <div class="lib-access">
+          <SoftButton :height="28" :font-size="12" @click="toggleAccessMode">
+            {{ accessState?.mode === "prefix" ? "校外访问（前缀）" : "校内直连" }}
+          </SoftButton>
+          <input
+            v-model="prefixDraft"
+            type="text"
+            placeholder="校外访问前缀，例如 https://libproxy.fudan.edu.cn:8080/LibProxy/?url="
+            @keyup.enter="saveAccess('prefix', prefixDraft)"
+          />
+          <SoftButton :height="28" :font-size="12" @click="saveAccess('prefix', prefixDraft)">
+            保存前缀
+          </SoftButton>
+        </div>
+        <div class="lib-chips">
+          <span class="tiny">常用：</span>
+          <button
+            v-for="db in databases"
+            :key="db.id"
+            class="chip"
+            :title="db.url"
+            @click="openDatabase(db.url)"
+          >
+            {{ db.name }}
+          </button>
+        </div>
+        <EmbedWebview
+          v-if="libraryUrl"
+          kind="library"
+          :url="libraryUrl"
+          home-label="数据库导航"
+        />
+        <div v-if="libraryMsg" class="tiny lib-msg">{{ libraryMsg }}</div>
       </div>
     </div>
 
@@ -1093,6 +1314,88 @@ onMounted(async () => {
   font-size: 11px;
   color: var(--muted);
   line-height: 1.5;
+}
+/* 下载链接（M4）：一行地址，点开就是内置浏览器 */
+.ext-link {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 12px;
+  color: var(--accent);
+  text-align: left;
+  cursor: pointer;
+  word-break: break-all;
+  text-decoration: underline dotted;
+}
+.ext-link:hover {
+  text-decoration: underline;
+}
+.hint {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.6;
+  margin-top: 3px;
+}
+/* 图书馆数据库弹窗：里面嵌的是子 Webview，弹窗自己只留页头和工具条 */
+.lib-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: rgba(0, 0, 0, 0.34);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.lib-card {
+  width: min(1180px, 96vw);
+  height: min(880px, 92vh);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 12px 14px 14px;
+  border-radius: var(--radius-card);
+  border: 1px solid var(--hairline, var(--border-soft));
+  background: var(--card);
+  box-shadow: var(--shadow-pop);
+}
+.lib-head,
+.lib-access,
+.lib-chips {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.lib-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.lib-access input {
+  flex: 1;
+  height: 28px;
+  font-size: 12px;
+}
+.lib-chips {
+  flex-wrap: wrap;
+}
+.chip {
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 12px;
+  border: 1px solid var(--border-soft);
+  background: var(--card-alt, transparent);
+  color: var(--text-soft);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.chip:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.lib-msg {
+  color: var(--muted);
 }
 .flow-mask {
   position: fixed;

@@ -83,6 +83,14 @@ async function checkNow() {
   }
 }
 
+/** 时间写法：2026-11-19 22:59–23:59（用户 2026-11-14：日程是「截止前 1 小时 → 截止」） */
+function whenText(item: MailWatchItem): string {
+  const start = (item.start_time || "").trim();
+  const end = (item.end_time || "").trim();
+  const span = start && end ? `${start}–${end}` : start || end;
+  return span ? `${item.date || ""} ${span}`.trim() : item.date || "";
+}
+
 onMounted(async () => {
   try {
     unlisten = await onMailWatch((payload) => {
@@ -111,7 +119,7 @@ defineExpose({ checkNow });
     </div>
     <div v-if="note" class="watch-note">{{ note }}</div>
     <div v-for="(item, index) in items" :key="index" class="watch-row">
-      <span class="watch-date">{{ item.date }} {{ item.start_time || "" }}</span>
+      <span class="watch-date">{{ whenText(item) }}</span>
       <span class="watch-title">{{ item.title }}</span>
       <span v-if="item.from" class="watch-from" :title="item.from">{{ item.from }}</span>
     </div>

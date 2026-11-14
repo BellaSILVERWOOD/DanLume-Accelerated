@@ -221,11 +221,15 @@ function toggleEvent(index: number) {
   }
 }
 
-/** 摘要右上角的日期写法：2026-11-18 12:00 → 11-18 12:00 */
+/** 摘要右上角的日期写法：2026-11-18 12:00 → 11-18 11:00–12:00
+ *  （用户 2026-11-14：日程是「截止前 1 小时 → 截止」，两头都要看得见） */
 function shortWhen(item: MailEventSuggestion): string {
   const date = (item.date || "").slice(5);
   const start = (item.start_time || "").trim();
-  return start ? `${date} ${start}` : date;
+  const end = (item.end_time || "").trim();
+  if (start && end) return `${date} ${start}–${end}`;
+  const one = start || end;
+  return one ? `${date} ${one}` : date;
 }
 
 /** 把勾选的日程真的加进日历（后端走 AI 的 schedule_add 工具） */

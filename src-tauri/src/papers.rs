@@ -815,6 +815,241 @@ pub fn library_folder(project: &str, year: &str) -> std::path::PathBuf {
     folder
 }
 
+// ---------------------------------------------------------- 图书馆的机构访问（M4）
+//
+// 用户 2026-11-14：「文献库能否增加下载链接，然后如果需要机构登录，可以弹窗一个
+// DanLume 内置浏览器，让用户操作（由于此处为一次性页面所以弹窗可以接受）」。
+//
+// 照旧版 `lit.py` 的做法：数据库这种站点必须用真实浏览器内核（登录态、Cookie、
+// 重定向都在浏览器里），所以弹一个内置 Webview（`embed.rs` 的 `kind = "library"`）；
+// 校外访问用「前缀」模板套地址（旧版 `lit.access_url`），不写死到代码里。
+
+pub const DBNav_URL: &str = "https://libdbnav.fudan.edu.cn/";
+pub const UIS_LOGIN_URL: &str = "https://id.fudan.edu.cn/";
+pub const WEBVPN_URL: &str = "https://webvpn.fudan.edu.cn/";
+pub const ACCESS_MODE_KEY: &str = "library_access";
+pub const PROXY_PREFIX_KEY: &str = "library_proxy_prefix";
+
+/// 常用数据库（旧版 `lit.DB_LINKS`，`{q}` 是查询词占位）
+const DB_LINKS: &[(&str, &str, &str, bool)] = &[
+    (
+        "arxiv",
+        "arXiv",
+        "https://arxiv.org/search/?query={q}&searchtype=all",
+        false,
+    ),
+    (
+        "ieee",
+        "IEEE Xplore",
+        "https://ieeexplore.ieee.org/search/searchresult.jsp?queryText={q}",
+        true,
+    ),
+    (
+        "sciencedirect",
+        "ScienceDirect",
+        "https://www.sciencedirect.com/search?qs={q}",
+        true,
+    ),
+    (
+        "scholar",
+        "Google 学术",
+        "https://scholar.google.com/scholar?q={q}",
+        false,
+    ),
+    (
+        "cnki",
+        "中国知网",
+        "https://kns.cnki.net/kns8s/defaultresult/index?kw={q}",
+        true,
+    ),
+];
+
+/// 校内直连（`campus`）还是走校外前缀（`prefix`）
+pub fn access_mode(store: &Store) -> String {
+    let text = store.setting(ACCESS_MODE_KEY).unwrap_or_default();
+    if text.trim() == "prefix" {
+        "prefix".to_string()
+    } else {
+        "campus".to_string()
+    }
+}
+
+pub fn proxy_prefix(store: &Store) -> String {
+    store
+        .setting(PROXY_PREFIX_KEY)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// 把地址里的非保留字符做百分号编码（校外前缀要求整段编码，`/` `:` 都要编）
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    for byte in text.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// 查询词编码成 `q=a+b` 那种（空格用 +）
+fn query_encode(text: &str) -> String {
+    percent_encode(text).replace("%20", "+")
+}
+
+/// 按当前访问方式改写好地址（旧版 `lit.access_url`）
+pub fn access_url_text(mode: &str, prefix: &str, target: &str) -> String {
+    let target = target.trim();
+    if target.is_empty() || mode != "prefix" {
+        return target.to_string();
+    }
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return target.to_string();
+    }
+    let mut prefix = prefix.to_string();
+    if !(prefix.ends_with('=') || prefix.ends_with('/') || prefix.ends_with("?url=")) {
+        if prefix.ends_with("url") {
+            prefix.push('=');
+        }
+    }
+    format!("{prefix}{}", percent_encode(target))
+}
+
+pub fn access_url(store: &Store, target: &str) -> String {
+    access_url_text(&access_mode(store), &proxy_prefix(store), target)
+}
+
+pub fn access_state(store: &Store) -> Value {
+    json!({
+        "ok": true,
+        "mode": access_mode(store),
+        "prefix": proxy_prefix(store),
+        "dbnav": DBNav_URL,
+        "uis": UIS_LOGIN_URL,
+        "webvpn": WEBVPN_URL,
+    })
+}
+
+pub fn set_access(store: &Store, mode: &str, prefix: &str) -> Value {
+    let mode = if mode.trim() == "prefix" { "prefix" } else { "campus" };
+    let _ = store.set_setting(ACCESS_MODE_KEY, mode);
+    let _ = store.set_setting(PROXY_PREFIX_KEY, prefix.trim());
+    access_state(store)
+}
+
+/// 数据库列表（旧版 `lit.database_links`）：数据库导航排第一
+pub fn database_links(query: &str) -> Vec<Value> {
+    let text = query_encode(query.trim());
+    let mut out: Vec<Value> = vec![json!({
+        "id": "dbnav",
+        "name": "数据库导航",
+        "url": DBNav_URL,
+        "needs_login": true,
+    })];
+    for (id, name, url, needs_login) in DB_LINKS {
+        let target = if text.is_empty() {
+            // 没有查询词就给数据库首页（旧版也是 `url.split("?")[0]`）
+            url.split('?').next().unwrap_or(url).to_string()
+        } else {
+            url.replace("{q}", &text)
+        };
+        out.push(json!({
+            "id": id,
+            "name": name,
+            "url": target,
+            "needs_login": *needs_login,
+        }));
+    }
+    out
+}
+
+/// 这些地址本身就能匿名打开（arXiv / bioRxiv / OpenReview…），不用机构登录
+fn looks_open_access(url: &str) -> bool {
+    let text = url.trim().to_lowercase();
+    [
+        "arxiv.org",
+        "biorxiv.org",
+        "medrxiv.org",
+        "openreview.net",
+        "aclanthology.org",
+        "proceedings.mlr.press",
+        "papers.nips.cc",
+        "openaccess.thecvf.com",
+    ]
+    .iter()
+    .any(|host| text.contains(host))
+}
+
+/// 这篇文献的「下载链接 / 原文页面」（前端拿去做可点的按钮 + 弹内置浏览器）
+pub fn links_of(store: &Store, id: i64) -> Value {
+    let row = {
+        let conn = store.connection();
+        conn.query_row(
+            "SELECT COALESCE(title,''), COALESCE(url,''), COALESCE(pdf_url,''),
+                    COALESCE(doi,''), COALESCE(file_path,''), COALESCE(source,'')
+             FROM papers WHERE id = ?1",
+            rusqlite::params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .ok()
+    };
+    let Some((title, url, pdf_url, doi, file_path, source)) = row else {
+        return json!({ "ok": false, "error": "没有这篇文献" });
+    };
+    let doi_link = if doi.trim().is_empty() {
+        String::new()
+    } else {
+        format!("https://doi.org/{}", doi.trim())
+    };
+    // 「下载链接」优先用真 PDF 地址；没有就退回 DOI（多半要机构登录）
+    let download = if !pdf_url.trim().is_empty() {
+        pdf_url.trim().to_string()
+    } else {
+        doi_link.clone()
+    };
+    // 「原文页面」优先用入库时的 url，再看 DOI
+    let page = if !url.trim().is_empty() {
+        url.trim().to_string()
+    } else {
+        doi_link.clone()
+    };
+    let target = if !download.is_empty() { download.clone() } else { page.clone() };
+    json!({
+        "ok": true,
+        "title": title,
+        "source": source,
+        "url": url,
+        "pdf_url": pdf_url,
+        "doi": doi,
+        "file_path": file_path,
+        "doi_link": doi_link,
+        "download": target,
+        "page": page,
+        // 校外时套上访问前缀（校内直连原样返回）
+        "download_url": access_url(store, &download),
+        "page_url": access_url(store, &page),
+        // 没有真 PDF 地址 **并且** 地址不是开放获取站点 = 大概要走学校权限
+        "needs_login": pdf_url.trim().is_empty() && !looks_open_access(&target),
+        "mode": access_mode(store),
+        "prefix": proxy_prefix(store),
+    })
+}
+
+
 /// 下载这篇文献的 PDF 到文献库（对应旧版 `lit.download_pdf`）
 ///
 /// 规则都一样：已经有文件就直接说「下载过了」；没 `pdf_url` 就退回 `https://doi.org/<doi>`；
@@ -940,6 +1175,52 @@ pub fn download_pdf(store: &Store, id: i64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 机构访问（M4）：校内直连原样返回，校外套前缀并整段编码
+    #[test]
+    fn access_url_wraps_with_prefix() {
+        let plain = "https://www.sciencedirect.com/science/article/pii/X1";
+        // 校内直连（默认）：一个字都不改
+        assert_eq!(access_url_text("campus", "https://libproxy/x?url=", plain), plain);
+        // 校外：前缀 + 整段编码（`:` `/` 都要编）
+        let wrapped = access_url_text(
+            "prefix",
+            "https://libproxy.fudan.edu.cn:8080/LibProxy/?url=",
+            plain,
+        );
+        assert!(
+            wrapped.starts_with("https://libproxy.fudan.edu.cn:8080/LibProxy/?url=https%3A%2F%2F"),
+            "{wrapped}"
+        );
+        assert!(!wrapped.contains("://www."), "整段要编码，不能只编码尾巴：{wrapped}");
+        // 前缀写成 `...url` 少个等号 → 自动补
+        let fixed = access_url_text("prefix", "https://webvpn.fudan.edu.cn/https/77726476706e69737468656265737421f9f6/url", "https://a.b/c");
+        assert!(fixed.ends_with("%3A%2F%2Fa.b%2Fc"), "{fixed}");
+        // 前缀空着 / 地址空着：原样返回，别拼出怪东西
+        assert_eq!(access_url_text("prefix", "", plain), plain);
+        assert_eq!(access_url_text("prefix", "https://p/?url=", ""), "");
+    }
+
+    /// 数据库列表：数据库导航排第一，没有查询词就给首页
+    #[test]
+    fn database_links_start_with_nav() {
+        let items = database_links("");
+        assert_eq!(items.len(), 6, "{items:?}");
+        assert_eq!(items[0]["id"], json!("dbnav"));
+        // 没查询词：问号后面的都去掉
+        let arxiv = items.iter().find(|one| one["id"] == json!("arxiv")).unwrap();
+        assert_eq!(arxiv["url"], json!("https://arxiv.org/search/"));
+        // 有查询词：`{q}` 换掉，空格变 +
+        let items = database_links("graph neural net");
+        let scholar = items.iter().find(|one| one["id"] == json!("scholar")).unwrap();
+        assert_eq!(
+            scholar["url"],
+            json!("https://scholar.google.com/scholar?q=graph+neural+net")
+        );
+        assert_eq!(scholar["needs_login"], json!(false));
+        let cnki = items.iter().find(|one| one["id"] == json!("cnki")).unwrap();
+        assert_eq!(cnki["needs_login"], json!(true));
+    }
 
     /// 多关键词：arXiv 上 `all:MRI crossfield` 会退化成「只要有一个词」，
     /// 搜出来一堆只有 MRI 的结果（用户就是这么发现的）。这里锁住 AND 写法。

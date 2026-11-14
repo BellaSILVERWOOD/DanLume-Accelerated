@@ -1390,7 +1390,8 @@ pub fn save_events(store: &Store, uid: &str, items: &[serde_json::Value]) {
 /// 为什么需要：抽出来的结果缓存在 `events_at` 里，改了规则也不会重抽，
 /// 用户看到的一直是老结果（2026-11-11 用户两次报「怎么少一个」，就是老缓存没失效）。
 /// 版本号对不上时把所有邮件的 `events_at` 清空，下次打开会按新规则重抽一次。
-pub const EVENTS_VERSION: u32 = 2;
+/// 3：日程改成「截止前 1 小时 → 截止」（用户 2026-11-14 的要求），老缓存要作废
+pub const EVENTS_VERSION: u32 = 3;
 
 /// 版本变了就清一遍「抽过了」标记（每个进程只做一次）
 pub fn invalidate_old_event_cache(store: &Store) {

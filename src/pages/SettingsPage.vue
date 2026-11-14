@@ -114,6 +114,18 @@ function switchOn(key: string): boolean {
   return value !== "0";
 }
 
+/**
+ * 浏览器多标签页（M5）：界面上的开关存在 localStorage（`theme.ts`），
+ * 后端的内嵌网页读的是设置库里的 `browser_tabs`，两边都要写，
+ * 不然开关一拨，网页那边还是老样子（旧版 `web_panel.set_tabs_enabled` 就是同一个坑）。
+ */
+function toggleBrowserTabs(on: boolean) {
+  setBrowserTabs(on);
+  persistTheme();
+  values.browser_tabs = on ? "1" : "0";
+  void settingsSave({ browser_tabs: on ? "1" : "0" });
+}
+
 /* ---------------- 看板娘（梅子） ---------------- */
 const mascotMsg = ref("");
 
@@ -1604,7 +1616,7 @@ async function refreshAdminFlag() {
                 <input
                   type="checkbox"
                   :checked="themeState.browserTabs"
-                  @change="setBrowserTabs(($event.target as HTMLInputElement).checked), persistTheme()"
+                  @change="toggleBrowserTabs(($event.target as HTMLInputElement).checked)"
                 />
                 <span />
               </label>

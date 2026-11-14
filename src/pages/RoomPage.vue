@@ -32,6 +32,32 @@ const message = ref("");
 const busy = ref(false);
 const url = ref(EHALL_HOME);
 const urlDraft = ref(EHALL_HOME);
+/** 缓存里那条数据是什么时候抓的（用户 2026-11-14：页面显示的经常不是今天的） */
+const cacheStamp = ref("");
+
+/** 后端 `ts` 是秒级时间戳 → 「2026-11-14 09:30:00」，认不出来就原样显示 */
+function stampText(ts: number | string | null | undefined): string {
+  const raw = String(ts ?? "").trim();
+  if (!raw) return "";
+  if (/^\d{9,}$/.test(raw)) {
+    return new Date(Number(raw) * 1000).toLocaleString("zh-CN", { hour12: false });
+  }
+  return raw;
+}
+
+/** 缓存就是今天抓的 */
+const freshToday = computed(() => {
+  const stamp = (cacheStamp.value || "").trim();
+  if (!stamp) return false;
+  const today = new Date();
+  const todayText = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(
+    today.getDate(),
+  ).padStart(2, "0")}`;
+  return stamp.startsWith(todayText);
+});
+
+/** 缓存不是今天抓的 → 顶部红字提醒 + 「刷新」会真的去重抓 */
+const cacheStale = computed(() => !!cacheStamp.value.trim() && !freshToday.value);
 
 const campuses = computed(() => Object.keys(view.value?.maps || {}));
 const buildings = computed(() => view.value?.maps?.[campus.value] || []);
@@ -91,11 +117,31 @@ function applyRadio(data: ClassroomView) {
   if (!building.value) building.value = cachedBuilding || buildings.value[0] || "";
 }
 
+/** 「刷新」：缓存是今天的就重读；不是今天的（或没数据）就真去抓一次 — 用户 2026-11-14 报的坑
+ *
+ * 真抓失败时**不要**再 `load()`：那会把「没查到 / 要登录」的提示盖掉，
+ * 用户只看到老数据和一句「最近一次查询」，还以为刷新没反应。
+ */
+async function refreshToday() {
+  if (busy.value) return;
+  if (freshToday.value && rooms.value.length) {
+    await load();
+    return;
+  }
+  const ok = await query();
+  if (ok) {
+    await load();
+  } else if (!message.value.trim()) {
+    message.value = "没抓到今天的空教室：确认查询页地址，并先在 eHall 页登录一次";
+  }
+}
+
 async function load() {
   busy.value = true;
   try {
     const data = await classroomView();
     view.value = data;
+    cacheStamp.value = stampText(data.ts);
     rooms.value = data.grid || [];
     periods.value = data.periods || [];
     applyRadio(data);
@@ -135,11 +181,11 @@ async function saveHome() {
 }
 
 /** 查询：后台页面选条件 → 点「查询」→ 读表格 */
-async function query() {
-  if (busy.value) return;
+async function query(): Promise<boolean> {
+  if (busy.value) return false;
   if (!building.value && !campuses.value.length) {
     message.value = "还没读到校区/教学楼：先点「设为首页」填查询页地址，再查一次";
-    return;
+    return false;
   }
   busy.value = true;
   message.value = `正在查询 ${campus.value || ""} ${building.value || ""}${
@@ -153,12 +199,15 @@ async function query() {
       message.value = `${result.value || "查到结果"}（${result.building || campus.value || "全部"}）`;
       // 顺手刷新下拉（第一次查询后才知道有哪些楼/教室）
       view.value = await classroomView();
+      cacheStamp.value = stampText(view.value.ts);
       applyRadio(view.value);
-    } else {
-      message.value = result.error || "没查到教室表：确认查询页地址、并在网页里登录 eHall";
+      return true;
     }
+    message.value = result.error || "没查到教室表：确认查询页地址、并在网页里登录 eHall";
+    return false;
   } catch (err) {
     message.value = `查询失败：${String(err)}`;
+    return false;
   } finally {
     busy.value = false;
   }
@@ -174,6 +223,7 @@ async function scrape() {
     if (result.ok && result.rooms?.length) {
       rooms.value = result.rooms;
       periods.value = result.periods || [];
+      cacheStamp.value = stampText(result.ts);
       message.value = `${result.value || "抓到结果"}（${result.building || "全部教学楼"}）`;
     } else {
       message.value = result.error || "页面上没找到教室表";
@@ -202,9 +252,14 @@ onMounted(async () => {
       </div>
       <div class="spacer" />
       <Pill v-if="rooms.length" :text="`${rooms.length} 间教室`" :font-size="11.5" />
+      <span v-if="cacheStamp" class="tiny" :class="{ stale: cacheStale }">
+        数据时间 {{ cacheStamp }}{{ cacheStale ? "（不是今天的，点「刷新（重抓今天）」）" : "" }}
+      </span>
       <SoftButton :height="32" :font-size="12.5" :disabled="busy" @click="scrape">重新读取</SoftButton>
       <SoftButton :height="32" :font-size="12.5" @click="saveHome">设为首页</SoftButton>
-      <SoftButton :height="32" :font-size="12.5" :disabled="busy" @click="load">刷新</SoftButton>
+      <SoftButton :height="32" :font-size="12.5" :disabled="busy" @click="refreshToday">
+        {{ cacheStale ? "刷新（重抓今天）" : "刷新" }}
+      </SoftButton>
       <SoftButton variant="primary" :height="32" :font-size="12.5" :disabled="busy" @click="query">
         查询
       </SoftButton>
@@ -222,6 +277,10 @@ onMounted(async () => {
         </span>
         <span class="spacer" />
         <span class="tiny">一行一间教室，一列一个节次；悬停看课程</span>
+      </div>
+
+      <div v-if="cacheStale" class="stale-bar">
+        下面这份数据是 {{ cacheStamp }} 抓的，<b>不是今天的</b>。点右上角「刷新（重抓今天）」会重新进 eHall 查一次。
       </div>
 
       <div class="filters">
@@ -276,6 +335,19 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+.tiny.stale {
+  color: #c0392b;
+  font-weight: 600;
+}
+.stale-bar {
+  font-size: 11.5px;
+  line-height: 1.6;
+  padding: 6px 9px;
+  border-radius: 7px;
+  color: color-mix(in srgb, var(--danger) 85%, var(--text));
+  background: color-mix(in srgb, var(--danger) 11%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 26%, transparent);
+}
 .page {
   display: flex;
   flex-direction: column;

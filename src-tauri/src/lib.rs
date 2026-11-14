@@ -1169,13 +1169,17 @@ fn mail_events_messages(
                  2. 每项字段：\n\
                  {{\"title\": \"日程标题，不超过 20 字，动宾短语\",\n\
                   \"date\": \"YYYY-MM-DD\",\n\
-                  \"start_time\": \"HH:MM，不知道就空串\",\n\
-                  \"end_time\": \"HH:MM，不知道就空串\",\n\
+                  \"start_time\": \"HH:MM，开始时间\",\n\
+                  \"end_time\": \"HH:MM，结束 / 截止时间\",\n\
                   \"note\": \"一句话备注（关键要求 / 地点），没有就空串\"}}\n\
-                 3. **逐行读完全文，一条都不要漏**：正文里的表格、列表、每一场宣讲会 / 讲座\n\
+                 3. **每条日程都要占 1 小时，并且「结束于」截止 / 结束时间**：\n\
+                 邮件只给一个时间点（「11月19日 23:59 前提交」这种截止时间）时，\n\
+                 「end_time」写那个时间，「start_time」写它前 1 小时（23:59 → 22:59，\n\
+                 15:00 → 14:00）；邮件里明确写了几点到几点（如讲座 14:00–16:00）才照原时段写。\n\
+                 4. **逐行读完全文，一条都不要漏**：正文里的表格、列表、每一场宣讲会 / 讲座\n\
                  （哪怕在同一张表里）都要各算一条；最多 10 条；\n\
-                 4. 日期必须是 `YYYY-MM-DD` 数字格式（不要写「11月12日」）；\n\
-                 5. 正文里没有明确日期就输出 []，**不要编日期**；纯通知也输出 []。\n\
+                 5. 日期必须是 `YYYY-MM-DD` 数字格式（不要写「11月12日」）；\n\
+                 6. 正文里没有明确日期就输出 []，**不要编日期**；纯通知也输出 []。\n\
                  \n主题：{subject}\n发件人：{from}\n\n正文：\n{body}"
             ),
         }),
@@ -1241,6 +1245,35 @@ fn normalize_mail_time(raw: &str) -> (String, String) {
     (start, end)
 }
 
+/// 邮件抽出来的日程要**占 1 小时、结束于截止时间**（用户 2026-11-14 的要求：
+/// 「生成的时候是结束时间前 1 小时到结束时间」）。
+///
+/// 为什么：模型常常只给一个时间点（`11-19 23:59 提交作业`），加进日历就是一个零长度
+/// 事件，日历上根本看不见；邮件里明确给了时段的（讲座 14:00–16:00）才照原样。
+/// 只有一个时间时**当成结束时间**：截止时间才是这封邮件真正关心的东西。
+fn anchor_hour_block(start: &str, end: &str) -> (String, String) {
+    let parse = |text: &str| chrono::NaiveTime::parse_from_str(text.trim(), "%H:%M").ok();
+    let fmt = |at: chrono::NaiveTime| at.format("%H:%M").to_string();
+    let hour = chrono::Duration::minutes(60);
+    let start_at = parse(start);
+    let end_at = parse(end);
+    match (start_at, end_at) {
+        (None, None) => (String::new(), String::new()),
+        // 只有一个时间：当结束时间，往前推 1 小时
+        (Some(one), None) => (fmt(one - hour), fmt(one)),
+        (None, Some(one)) => (fmt(one - hour), fmt(one)),
+        (Some(from), Some(to)) => {
+            if to > from && to - from <= chrono::Duration::hours(4) {
+                // 邮件里写得明明白白的一段，照原样
+                (fmt(from), fmt(to))
+            } else {
+                // 顺序反了 / 相等 / 长得不像真实时段（24 小时那种）→ 按结束锚定成 1 小时
+                (fmt(to - hour), fmt(to))
+            }
+        }
+    }
+}
+
 /// 把模型吐的东西解析成日程条目：去掉代码块、找最外层数组、逐条校验
 fn parse_mail_events(raw: &str, today: &str) -> Vec<serde_json::Value> {
     let text = raw.trim();
@@ -1285,6 +1318,8 @@ fn parse_mail_events(raw: &str, today: &str) -> Vec<serde_json::Value> {
         if end_time.is_empty() {
             end_time = end3;
         }
+        // 用户 2026-11-14：日程要「截止前 1 小时 → 截止」，不是一个时间点
+        let (start_time, end_time) = anchor_hour_block(&start_time, &end_time);
         out.push(json!({
             "title": title,
             "date": date,
@@ -1947,6 +1982,44 @@ async fn papers_download(id: i64) -> Result<serde_json::Value, String> {
     }
 }
 
+/// 这篇文献的下载链接 / 原文页面（M4：前端拿去做可点按钮 + 弹内置浏览器）
+#[tauri::command]
+fn papers_links(id: i64, state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    crate::papers::links_of(get_store(), id)
+}
+
+/// 常用数据库列表（数据库导航 + IEEE / ScienceDirect / 知网…，可带查询词）
+#[tauri::command]
+fn papers_databases(query: Option<String>) -> serde_json::Value {
+    let items = crate::papers::database_links(query.as_deref().unwrap_or(""));
+    json!({ "ok": true, "items": items })
+}
+
+/// 图书馆的机构访问方式（校内直连 / 校外前缀）
+#[tauri::command]
+fn library_access(state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    crate::papers::access_state(get_store())
+}
+
+#[tauri::command]
+fn library_set_access(
+    mode: String,
+    prefix: Option<String>,
+    state: State<'_, AppState>,
+) -> serde_json::Value {
+    let _ = &state;
+    crate::papers::set_access(get_store(), &mode, &prefix.unwrap_or_default())
+}
+
+/// 把地址按当前访问方式改写好（前端「在数据库里打开」用）
+#[tauri::command]
+fn library_access_url(url: String, state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    json!({ "ok": true, "url": crate::papers::access_url(get_store(), &url) })
+}
+
 /// 语义检索：本地有多少篇建了向量、还差多少
 #[tauri::command]
 fn papers_semantic_status(state: State<'_, AppState>) -> serde_json::Value {
@@ -2366,6 +2439,50 @@ fn embed_navigate(kind: String, url: String) -> serde_json::Value {
 #[tauri::command]
 fn embed_status(kind: String) -> serde_json::Value {
     crate::embed::status(&kind)
+}
+
+/// 当前面板的标签页列表（多标签页：前端每 1.5 秒问一次，顺便看有没有 pending 的新窗口）
+#[tauri::command]
+fn embed_tabs(kind: String) -> serde_json::Value {
+    crate::embed::tabs_of(&kind)
+}
+
+/// 开一个新标签页（`add_child` 要在工作线程里调，所以 async + spawn_blocking）
+#[tauri::command]
+async fn embed_new_tab(
+    app: tauri::AppHandle,
+    kind: String,
+    url: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> serde_json::Value {
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        crate::embed::new_tab(&app, &kind, &url, x, y, width, height)
+    })
+    .await;
+    match handle {
+        Ok(Ok(value)) => value,
+        Ok(Err(exc)) => json!({ "ok": false, "error": exc, "tabs": [] }),
+        Err(exc) => json!({ "ok": false, "error": format!("开新标签页失败：{exc}"), "tabs": [] }),
+    }
+}
+
+#[tauri::command]
+fn embed_select_tab(kind: String, index: usize) -> serde_json::Value {
+    match crate::embed::select_tab(&kind, index) {
+        Ok(value) => value,
+        Err(exc) => json!({ "ok": false, "error": exc }),
+    }
+}
+
+#[tauri::command]
+fn embed_close_tab(kind: String, index: usize) -> serde_json::Value {
+    match crate::embed::close_tab(&kind, index) {
+        Ok(value) => value,
+        Err(exc) => json!({ "ok": false, "error": exc }),
+    }
 }
 
 /// 在 WebView2 里打开某张卡的数据页，页面加载完由注入脚本把正文回传（见 `ehall_ingest`）
@@ -4404,8 +4521,17 @@ async fn uis_open_login(app: tauri::AppHandle) -> Result<(), String> {
 async fn uis_grab_profile(app: tauri::AppHandle) -> serde_json::Value {
     let handle = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let Some(win) = handle.get_webview_window("main") else {
-            return json!({ "ok": false, "error": "找不到主窗口" });
+        // 主窗口不一定叫 "main"（有的版本是普通 Window + add_child 的子 Webview），
+        // 所以退一步：拿当前任意一个窗口的 cookie 都算数（同一个 WebView2 profile）。
+        let win = handle.get_webview_window("main").or_else(|| {
+            handle
+                .webview_windows()
+                .into_iter()
+                .map(|(_, one)| one)
+                .next()
+        });
+        let Some(win) = win else {
+            return json!({ "ok": false, "error": "找不到窗口：先打开主界面再来抓会话" });
         };
         let jar = collect_cookies(&win);
         if jar.is_empty() {
@@ -5416,6 +5542,11 @@ pub fn run() {
             papers_search,
             papers_add,
             papers_download,
+            papers_links,
+            papers_databases,
+            library_access,
+            library_set_access,
+            library_access_url,
             papers_semantic_status,
             papers_semantic_index,
             papers_semantic_search,
@@ -5526,6 +5657,10 @@ pub fn run() {
             embed_reload,
             embed_navigate,
             embed_status,
+            embed_tabs,
+            embed_new_tab,
+            embed_select_tab,
+            embed_close_tab,
             ehall_open,
             ehall_ingest,
             ehall_ingest_pasted,
@@ -5988,6 +6123,9 @@ mod mail_summary_tests {
     }
 
     /// 模型给的日程 JSON：能从代码块里抠出来，字段也对得上
+    ///
+    /// 只有开始时间时按「结束时间」处理（用户 2026-11-14：日程要截止前 1 小时到截止），
+    /// 所以 12:00 → 11:00–12:00。
     #[test]
     fn parses_events_from_model_output() {
         let raw = "```json\n[{\"title\":\"提交复议材料\",\"date\":\"2026-11-18\",\
@@ -5996,9 +6134,25 @@ mod mail_summary_tests {
         assert_eq!(items.len(), 1, "{items:?}");
         assert_eq!(items[0]["title"], json!("提交复议材料"));
         assert_eq!(items[0]["date"], json!("2026-11-18"));
-        assert_eq!(items[0]["start_time"], json!("12:00"));
-        assert_eq!(items[0]["end_time"], json!(""), "没给结束时间就留空");
+        assert_eq!(items[0]["start_time"], json!("11:00"), "要往前推 1 小时");
+        assert_eq!(items[0]["end_time"], json!("12:00"));
         assert_eq!(items[0]["note"], json!("系统里提交"));
+    }
+
+    /// 邮件抽出来的日程：「截止前 1 小时 → 截止」；真给了时段的照原样
+    #[test]
+    fn events_are_anchored_to_the_deadline() {
+        // 只给一个时间点 → 当截止时间，往前推 1 小时
+        assert_eq!(anchor_hour_block("23:59", ""), ("22:59".to_string(), "23:59".to_string()));
+        assert_eq!(anchor_hour_block("", "15:00"), ("14:00".to_string(), "15:00".to_string()));
+        // 邮件里明说了时段 → 不动
+        assert_eq!(anchor_hour_block("14:00", "16:00"), ("14:00".to_string(), "16:00".to_string()));
+        // 两头一样 / 反了 / 长得不像真时段 → 按结束锚成 1 小时
+        assert_eq!(anchor_hour_block("23:59", "23:59"), ("22:59".to_string(), "23:59".to_string()));
+        assert_eq!(anchor_hour_block("16:00", "14:00"), ("13:00".to_string(), "14:00".to_string()));
+        assert_eq!(anchor_hour_block("00:30", "23:00"), ("22:00".to_string(), "23:00".to_string()));
+        // 什么时间都没有（邮件只写了日期）→ 不留时间，日历里当整天
+        assert_eq!(anchor_hour_block("", ""), (String::new(), String::new()));
     }
 
     /// 坏数据要丢掉：日期不是 YYYY-MM-DD、标题为空、时间不合法

@@ -913,6 +913,86 @@ export async function papersDownload(
   return invoke("papers_download", { id });
 }
 
+/* ------------------------------------------- 文献库下载链接 + 机构登录（M4）
+ *
+ * 用户 2026-11-14：「文献库能否增加下载链接，然后如果需要机构登录，可以弹窗一个
+ * DanLume 内置浏览器，让用户操作」。对应旧版 `lit.access_url()` + `library_page.py`。
+ */
+export type PaperLinks = {
+  ok: boolean;
+  error?: string;
+  title?: string;
+  source?: string;
+  url?: string;
+  pdf_url?: string;
+  doi?: string;
+  file_path?: string;
+  doi_link?: string;
+  /** 「下载链接」：优先真 PDF，没有就是 doi.org */
+  download?: string;
+  /** 「原文页面」：优先入库时的 url，再看 DOI */
+  page?: string;
+  /** 上面两个按当前访问方式（校内直连 / 校外前缀）改好的地址 */
+  download_url?: string;
+  page_url?: string;
+  /** 没有真 PDF 地址 = 大概要走学校权限 */
+  needs_login?: boolean;
+  mode?: string;
+  prefix?: string;
+};
+
+export async function papersLinks(id: number): Promise<PaperLinks> {
+  if (!isTauri) return { ok: false, error: "浏览器预览里没有链接" };
+  return invoke<PaperLinks>("papers_links", { id });
+}
+
+export type LibraryDatabase = {
+  id: string;
+  name: string;
+  url: string;
+  needs_login: boolean;
+};
+
+export async function papersDatabases(
+  query = "",
+): Promise<{ ok: boolean; items: LibraryDatabase[] }> {
+  if (!isTauri) return { ok: false, items: [] };
+  return invoke("papers_databases", { query });
+}
+
+export type LibraryAccess = {
+  ok: boolean;
+  /** campus = 校内直连；prefix = 校外访问前缀 */
+  mode: string;
+  prefix: string;
+  dbnav: string;
+  uis: string;
+  webvpn: string;
+};
+
+export async function libraryAccess(): Promise<LibraryAccess> {
+  if (!isTauri)
+    return {
+      ok: true,
+      mode: "campus",
+      prefix: "",
+      dbnav: "https://libdbnav.fudan.edu.cn/",
+      uis: "https://id.fudan.edu.cn/",
+      webvpn: "https://webvpn.fudan.edu.cn/",
+    };
+  return invoke<LibraryAccess>("library_access");
+}
+
+export async function librarySetAccess(mode: string, prefix: string): Promise<LibraryAccess> {
+  if (!isTauri) return libraryAccess();
+  return invoke<LibraryAccess>("library_set_access", { mode, prefix });
+}
+
+export async function libraryAccessUrl(url: string): Promise<{ ok: boolean; url: string }> {
+  if (!isTauri) return { ok: true, url };
+  return invoke("library_access_url", { url });
+}
+
 /** 参考文献（BibTeX / RIS / DOI）：对应旧版 `refs.py` */
 /* ---------------------------------------------------------------- 学生工作（通讯录 / 定时通知） */
 
@@ -3192,6 +3272,57 @@ export async function embedNavigate(kind: string, url: string): Promise<{ ok: bo
 export async function embedStatus(kind: string): Promise<{ open: boolean; url: string }> {
   if (!isTauri) return { open: false, url: "" };
   return invoke("embed_status", { kind });
+}
+
+/* ------------------------------------------------- 内嵌网页 · 多标签页（M5）
+ *
+ * 旧版 `web_panel.EmbeddedWebPanel` 用 `QTabBar` 做「Edge 式」多标签页：一个面板里
+ * 好几个网页，只有当前那个露出来，`+` 开新的、每个标签自带关闭按钮。
+ * Rust 这边对应「一个 kind 一组子 Webview」，前端每 1.5 秒问一次状态。
+ */
+export type EmbedTab = {
+  index: number;
+  title: string;
+  url: string;
+};
+
+export type EmbedTabsState = {
+  ok: boolean;
+  /** 设置里「多标签页」开着没有 */
+  enabled: boolean;
+  active: number;
+  /** 网页自己 window.open 出来的地址（非空就把它开成新标签页） */
+  pending: string;
+  tabs: EmbedTab[];
+  closed?: boolean;
+  error?: string;
+};
+
+export async function embedTabs(kind: string): Promise<EmbedTabsState> {
+  if (!isTauri) return { ok: false, enabled: false, active: 0, pending: "", tabs: [] };
+  return invoke<EmbedTabsState>("embed_tabs", { kind });
+}
+
+export async function embedNewTab(
+  kind: string,
+  url: string,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): Promise<EmbedTabsState> {
+  if (!isTauri) return { ok: false, enabled: false, active: 0, pending: "", tabs: [] };
+  return invoke<EmbedTabsState>("embed_new_tab", { kind, url, x, y, width, height });
+}
+
+export async function embedSelectTab(kind: string, index: number): Promise<EmbedTabsState> {
+  if (!isTauri) return { ok: false, enabled: false, active: 0, pending: "", tabs: [] };
+  return invoke<EmbedTabsState>("embed_select_tab", { kind, index });
+}
+
+export async function embedCloseTab(kind: string, index: number): Promise<EmbedTabsState> {
+  if (!isTauri) return { ok: false, enabled: false, active: 0, pending: "", tabs: [] };
+  return invoke<EmbedTabsState>("embed_close_tab", { kind, index });
 }
 
 /** 从主窗口 cookie 抓一次 UIS 会话（内嵌网页登录后调用，和登录窗口共用同一份 profile） */
