@@ -1253,6 +1253,65 @@ export async function examsImport(
   return invoke("exams_import", { commit, asImportant });
 }
 
+/* -------------------------------------------------------------- 盯邮箱（J2-6） */
+/*
+ * 对应旧版 `mail_watch.py`：只处理「指定发件人」的新邮件，把里面的待办抽出来，
+ * 等用户确认再加日程。后台每 N 分钟看一眼（Rust 里的线程），发现候选会发 `mail:watch`。
+ */
+export type MailWatchState = {
+  ok: boolean;
+  enabled: boolean;
+  senders: string[];
+  minutes: number;
+  seen: number;
+  summary: string;
+};
+
+export type MailWatchItem = MailEventSuggestion & {
+  /** 来源邮件的 uid（加入日程后把这封记成已处理） */
+  uid?: string;
+  subject?: string;
+  from?: string;
+};
+
+export async function mailWatchState(): Promise<MailWatchState> {
+  if (!isTauri)
+    return { ok: true, enabled: false, senders: [], minutes: 10, seen: 0, summary: "" };
+  return invoke<MailWatchState>("mail_watch_state");
+}
+
+export async function mailWatchCheck(): Promise<{
+  ok: boolean;
+  mails: { uid: string; subject: string; from: string; date: string }[];
+  items: MailWatchItem[];
+  errors: string[];
+  error?: string;
+}> {
+  if (!isTauri) return { ok: false, mails: [], items: [], errors: [] };
+  return invoke("mail_watch_check");
+}
+
+export async function mailWatchConsume(uids: string[]): Promise<{ ok: boolean; seen: number }> {
+  if (!isTauri) return { ok: false, seen: 0 };
+  return invoke("mail_watch_consume", { uids });
+}
+
+export async function mailWatchResetSeen(): Promise<{ ok: boolean; summary: string }> {
+  if (!isTauri) return { ok: false, summary: "" };
+  return invoke("mail_watch_reset_seen");
+}
+
+/** 后台盯到候选待办时发的事件 */
+export async function onMailWatch(
+  handler: (payload: { items: MailWatchItem[] }) => void,
+): Promise<() => void> {
+  if (!isTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ items: MailWatchItem[] }>("mail:watch", (event) =>
+    handler(event.payload as { items: MailWatchItem[] }),
+  );
+}
+
 /* -------------------------------------------------------------- VPN / 代理（J2-3） */
 /*
  * 后台请求（ureq）每次都现读设置，所以改完立刻生效；

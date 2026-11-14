@@ -23,6 +23,7 @@ mod ics;
 mod latex_export;
 mod mail;
 mod mail_identity;
+mod mail_watch;
 mod memory;
 mod net;
 mod notices;
@@ -1738,6 +1739,50 @@ async fn exams_import(
 fn homework_upcoming(days: Option<i64>, state: State<'_, AppState>) -> serde_json::Value {
     let _ = &state;
     elearn::upcoming(get_store(), days.unwrap_or(14))
+}
+
+// ---------------------------------------------------------------- 盯邮箱（J2-6）
+
+/// 盯邮箱：当前状态（开关 / 关键词 / 间隔 / 已处理多少封）
+#[tauri::command]
+fn mail_watch_state(state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    let store = get_store();
+    json!({
+        "ok": true,
+        "enabled": mail_watch::enabled(store),
+        "senders": mail_watch::senders(store),
+        "minutes": mail_watch::interval_minutes(store),
+        "seen": mail_watch::seen_count(store),
+        "summary": mail_watch::summary(store),
+    })
+}
+
+/// 盯邮箱：现在看一次（拉命中发件人的新邮件 → 抽候选待办）
+#[tauri::command]
+async fn mail_watch_check() -> Result<serde_json::Value, String> {
+    let handle = tauri::async_runtime::spawn_blocking(|| mail_watch::check(get_store())).await;
+    match handle {
+        Ok(value) => Ok(value),
+        Err(exc) => Ok(json!({ "ok": false, "error": format!("看邮箱的任务没跑起来：{exc}") })),
+    }
+}
+
+/// 用户看过这批了（记成已处理，别再提示）；`uids` 为空 = 全部命中的都算看过
+#[tauri::command]
+fn mail_watch_consume(uids: Vec<String>, state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    let store = get_store();
+    mail_watch::consume(store, &uids);
+    json!({ "ok": true, "seen": mail_watch::seen_count(store) })
+}
+
+/// 清空「已处理」记录（想让它重新看一遍旧邮件时用）
+#[tauri::command]
+fn mail_watch_reset_seen(state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    mail_watch::reset_seen(get_store());
+    json!({ "ok": true, "summary": mail_watch::summary(get_store()) })
 }
 
 /// 代理现在是什么状态（设置页那行小字）
@@ -5099,6 +5144,57 @@ pub fn run() {
                     }
                 });
             }
+            // 盯邮箱的后台闹钟（J2-6，对应旧版 MailWatcher）：每 60 秒看一眼「到点没」，
+            // 到点才真去拉信 + 抽待办；抽出候选就弹系统通知 + 发事件给前端确认。
+            // 第一次等 90 秒，别和开机时那一堆同步抢 IMAP 连接。
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(90));
+                    let mut last = std::time::Instant::now()
+                        - std::time::Duration::from_secs(3600);
+                    loop {
+                        let store = get_store();
+                        if mail_watch::enabled(store) && !mail_watch::senders(store).is_empty() {
+                            let minutes = mail_watch::interval_minutes(store);
+                            if last.elapsed().as_secs() >= (minutes as u64) * 60 {
+                                last = std::time::Instant::now();
+                                let found = std::panic::catch_unwind(|| {
+                                    mail_watch::check(get_store())
+                                })
+                                .unwrap_or_else(|_| json!({ "items": [] }));
+                                let items = found
+                                    .get("items")
+                                    .and_then(|one| one.as_array())
+                                    .cloned()
+                                    .unwrap_or_default();
+                                if !items.is_empty() {
+                                    let titles: Vec<String> = items
+                                        .iter()
+                                        .filter_map(|one| {
+                                            one.get("title").and_then(|t| t.as_str())
+                                        })
+                                        .take(3)
+                                        .map(|text| text.to_string())
+                                        .collect();
+                                    notify_desktop(
+                                        &handle,
+                                        &format!("邮箱里有 {} 件可能要加日程的事", items.len()),
+                                        &titles.join("\n"),
+                                    );
+                                    let mails = found.get("mails").cloned().unwrap_or_default();
+                                    let _ = handle.emit(
+                                        "mail:watch",
+                                        json!({ "items": items, "mails": mails }),
+                                    );
+                                    eprintln!("[mail-watch] 抽出 {} 条候选待办", items.len());
+                                }
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                    }
+                });
+            }
             // 作业截止的当天提醒（用户 2026-11-12）：早于设置里的小时不吵，
             // 到点以后每条每天只提一次；系统通知 + 事件（前端还能弹卡片）。
             {
@@ -5214,6 +5310,10 @@ pub fn run() {
             homework_mark_done,
             proxy_summary,
             proxy_probe,
+            mail_watch_state,
+            mail_watch_check,
+            mail_watch_consume,
+            mail_watch_reset_seen,
             elearn_due_reminders,
             exams_import,
             refs_list,

@@ -60,6 +60,9 @@ import {
   settingsSave,
   uisLogin,
   proxySummary,
+  mailWatchState,
+  mailWatchCheck,
+  mailWatchResetSeen,
   proxyProbe,
   uisLogout,
   canvasDownload,
@@ -106,6 +109,51 @@ function switchOn(key: string): boolean {
   const value = values[key] ?? "";
   if (OFF_BY_DEFAULT.has(key) && value === "") return false;
   return value !== "0";
+}
+
+/* ---------------- 盯邮箱（J2-6） ---------------- */
+const watchBusy = ref(false);
+const watchMsg = ref("");
+const watchSummary = ref("");
+const watchItems = ref<{ date: string; start_time?: string; title: string }[]>([]);
+
+async function loadWatchSummary() {
+  try {
+    const result = await mailWatchState();
+    watchSummary.value = result.summary || "";
+  } catch {
+    watchSummary.value = "";
+  }
+}
+
+async function watchCheckNow() {
+  if (watchBusy.value) return;
+  watchBusy.value = true;
+  watchMsg.value = "正在看邮箱…（拉命中发件人的新邮件并抽待办）";
+  watchItems.value = [];
+  try {
+    const result = await mailWatchCheck();
+    watchItems.value = result.items || [];
+    const errors = (result.errors || []).join("；");
+    watchMsg.value = result.items?.length
+      ? `抽到 ${result.items.length} 条候选待办，已放到右上角卡片里让你确认`
+      : errors || "这次没有需要加日程的事";
+    await loadWatchSummary();
+  } catch (err) {
+    watchMsg.value = `看邮箱失败：${String(err)}`;
+  } finally {
+    watchBusy.value = false;
+  }
+}
+
+async function watchResetSeen() {
+  try {
+    const result = await mailWatchResetSeen();
+    watchSummary.value = result.summary || "";
+    watchMsg.value = "已清空「已处理」记录，下次会重新看一遍旧邮件";
+  } catch (err) {
+    watchMsg.value = `清空失败：${String(err)}`;
+  }
 }
 
 /* ---------------- 代理：测一下能不能连校内服务 ---------------- */
@@ -753,6 +801,29 @@ const cards: CardDef[] = [
       { label: "只收未读", kind: "switch", key: "imap_unread_only" },
     ],
     actions: ["save", "imap-test"],
+  },
+  {
+    key: "mailwatch",
+    title: "盯邮箱（只盯指定发件人）",
+    subtitle:
+      "只处理这几个发件人的新邮件：把里面的待办抽出来，等你在右上角卡片里确认后再加进日程（对应旧版 mail_watch）",
+    category: "邮件",
+    fields: [
+      {
+        label: "开启盯邮箱",
+        kind: "switch",
+        key: "mail_watch_enabled",
+        hint: "开着才会每隔几分钟看一次；发现候选会弹系统通知",
+      },
+      {
+        label: "发件人关键词",
+        kind: "text",
+        key: "mail_watch_senders",
+        placeholder: "教务处, 辅导员, noreply@fudan.edu.cn（逗号分隔，匹配名字或地址）",
+      },
+      { label: "多久看一次（分钟，2–180）", kind: "text", key: "mail_watch_minutes", placeholder: "10" },
+    ],
+    actions: ["save"],
   },
   {
     key: "recipient",
@@ -1788,6 +1859,28 @@ async function refreshAdminFlag() {
                   @input="setValue(field, ($event.target as HTMLInputElement).value)"
                 />
                 <span v-if="field.hint" class="hint">{{ field.hint }}</span>
+              </div>
+            </div>
+          </template>
+
+          <!-- 盯邮箱：现在看一次 / 清空「已处理」 -->
+          <template v-if="card.key === 'mailwatch'">
+            <div class="field">
+              <div class="label">现在试一次</div>
+              <div class="control">
+                <div class="row-actions">
+                  <SoftButton :height="28" :font-size="12" :disabled="watchBusy" @click="watchCheckNow">
+                    {{ watchBusy ? "正在看…" : "现在看一次" }}
+                  </SoftButton>
+                  <SoftButton :height="28" :font-size="12" :disabled="watchBusy" @click="watchResetSeen">
+                    清空「已处理」
+                  </SoftButton>
+                </div>
+                <span class="hint">{{ watchSummary || "（还没读）" }}</span>
+                <span v-if="watchMsg" class="hint">{{ watchMsg }}</span>
+                <div v-for="item in watchItems" :key="`${item.date}-${item.title}`" class="hint">
+                  {{ item.date }} {{ item.start_time || "" }} · {{ item.title }}
+                </div>
               </div>
             </div>
           </template>

@@ -402,6 +402,22 @@ pub fn status(store: &Store) -> Value {
     })
 }
 
+/// 本机客户端真实数据库的路径（打包版用 `%LOCALAPPDATA%\DanLume\data_dir.txt` 指过去）
+///
+/// 只给「真数据」测试用（语义检索、盯邮箱），测试自己复制一份再动，绝不动真库。
+pub(crate) fn real_client_db() -> Option<std::path::PathBuf> {
+    let base = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+    let pointer = base.join("DanLume").join("data_dir.txt");
+    let text = std::fs::read_to_string(pointer).ok()?;
+    let dir = std::path::PathBuf::from(text.trim());
+    let db = dir.join("lumina.db");
+    if db.is_file() {
+        Some(db)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,19 +515,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 本机客户端真实数据库（打包版用 `%LOCALAPPDATA%\DanLume\data_dir.txt` 指过去）
-    fn real_client_db() -> Option<std::path::PathBuf> {
-        let base = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
-        let pointer = base.join("DanLume").join("data_dir.txt");
-        let text = std::fs::read_to_string(pointer).ok()?;
-        let dir = std::path::PathBuf::from(text.trim());
-        let db = dir.join("lumina.db");
-        if db.is_file() {
-            Some(db)
-        } else {
-            None
-        }
-    }
 
     /// 本地排序那半段：不联网也要能跑，而且要能**跑完**（以前这里自己把自己锁死了）
     #[test]
