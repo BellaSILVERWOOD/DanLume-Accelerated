@@ -1345,6 +1345,10 @@ async fn mail_summarize(
 ) -> Result<serde_json::Value, String> {
     let _ = &state;
     let store = get_store();
+    // 抽取规则升级过（`EVENTS_VERSION` 变了）就先把老结果作废，**必须在读缓存之前**做：
+    // 以前这句藏在 `mail_events_for` 里，而有摘要的邮件走的是上面那条「缓存命中」分支，
+    // 根本到不了那儿，于是提示词改了、用户看到的还是老结果（2026-11-14 又踩一次）。
+    mail::invalidate_old_event_cache(store);
     if force != Some(true) {
         let cached = mail::cached_summary(store, &uid);
         let (events, events_done) = mail::cached_events(store, &uid);

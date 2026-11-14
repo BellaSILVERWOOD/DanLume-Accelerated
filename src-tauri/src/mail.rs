@@ -896,6 +896,47 @@ pub fn write_debug(path: &str, data: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    /// 抽取规则一升级，**缓存必须先作废**，否则用户看到的还是老结果
+    /// （2026-11-14：提示词改成「截止前 1 小时」，可邮件页还是老样子，
+    ///  因为作废那句藏在了 `mail_events_for` 里，缓存命中时根本走不到）
+    #[test]
+    fn stale_event_cache_is_dropped_on_version_bump() {
+        let dir = std::env::temp_dir().join(format!("danlume-mailver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("LUMINA_DATA_DIR");
+        std::env::set_var("LUMINA_DATA_DIR", &dir);
+        let store = crate::store::Store::open().expect("临时库");
+        ensure_inbox_schema(&store);
+        {
+            // `save_events` 是 UPDATE，得先有一行邮件
+            let conn = store.connection();
+            let _ = conn.execute(
+                "INSERT INTO inbox_messages(uid, subject, sender, date, fetched_at)
+                 VALUES ('uid-1', '主题', 'a@b.c', '2026-11-14 10:00', '2026-11-14 10:00')",
+                [],
+            );
+        }
+        save_events(&store, "uid-1", &[serde_json::json!({ "title": "老结果" })]);
+        // 老版本号：假装上次是从 v2 抽的
+        let _ = store.set_setting("mail_events_version", "2");
+        let (_, done) = cached_events(&store, "uid-1");
+        assert!(done, "先要能读到「抽过」的标记");
+        invalidate_old_event_cache(&store);
+        let (_, done) = cached_events(&store, "uid-1");
+        assert!(!done, "版本号变了必须重抽");
+        // 同一个版本号再调一次不该反复清（每次打开邮件都重抽就太费 token 了）
+        save_events(&store, "uid-1", &[]);
+        invalidate_old_event_cache(&store);
+        let (_, done) = cached_events(&store, "uid-1");
+        assert!(done, "版本号没变就不该清");
+        match previous {
+            Some(value) => std::env::set_var("LUMINA_DATA_DIR", value),
+            None => std::env::remove_var("LUMINA_DATA_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 日期兜底：任何一步都不许返回空串（空串会让新邮件在列表里排到最后 = 看不见）
     #[test]
     fn mail_date_falls_back_and_never_empty() {
