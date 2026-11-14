@@ -3,10 +3,14 @@ use std::collections::HashSet;
 
 /// 返回 (标题, 绝对链接, 发布时间) —— 发布时间一般抓不到，给空串
 pub fn fetch(url: &str) -> Result<Vec<(String, String, String)>, String> {
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(12))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) DanLume/2.0")
-        .build();
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) DanLume/2.0"),
+     crate::get_store(),
+     url,
+ )
+ .build();
     let response = agent
         .get(url)
         .call()

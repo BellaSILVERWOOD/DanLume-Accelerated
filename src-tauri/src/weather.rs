@@ -58,10 +58,14 @@ pub fn format_text(payload: &Value) -> Option<String> {
 
 fn fetch() -> Result<String, String> {
     let url = format!("https://wttr.in/{CITY_QUERY}?format=j1");
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(6))
-        .user_agent("curl/8.0 (DanLume)")
-        .build();
+        .user_agent("curl/8.0 (DanLume)"),
+     crate::get_store(),
+     &url,
+ )
+ .build();
     let response = agent.get(&url).call().map_err(|err| err.to_string())?;
     let payload: Value = response.into_json().map_err(|err| err.to_string())?;
     format_text(&payload).ok_or_else(|| "天气数据格式不认识".to_string())

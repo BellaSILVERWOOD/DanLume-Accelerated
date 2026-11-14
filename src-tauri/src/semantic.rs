@@ -107,9 +107,13 @@ fn embed_remote(store: &Store, texts: &[String]) -> Result<(String, Vec<Vec<f64>
     }
     let url = format!("{base}/api/v1/embed");
     let body = json!({ "texts": texts });
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
-        .build();
+    let agent = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(TIMEOUT_SECS)),
+     crate::get_store(),
+     &url,
+ )
+ .build();
     let response = match agent
         .post(&url)
         .set("Content-Type", "application/json")

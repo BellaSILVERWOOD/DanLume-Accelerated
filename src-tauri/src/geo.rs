@@ -74,10 +74,14 @@ pub fn location(store: &Store) -> Value {
 }
 
 fn ip_location() -> Result<(f64, f64, String), String> {
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(8))
-        .user_agent("DanLume/2.0")
-        .build();
+        .user_agent("DanLume/2.0"),
+     crate::get_store(),
+     "https://ipapi.co/json/",
+ )
+ .build();
     let body: Value = agent
         .get("https://ipapi.co/json/")
         .call()

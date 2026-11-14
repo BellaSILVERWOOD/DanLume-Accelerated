@@ -28,12 +28,17 @@ pub struct PrintData {
     pub sniffed: bool,
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(20))
-        .redirects(5)
-        .user_agent(UA)
-        .build()
+fn agent(url: &str) -> ureq::Agent {
+    crate::net::with_proxy(
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(20))
+            .redirects(5)
+            .user_agent(UA)
+,
+        crate::get_store(),
+        url,
+    )
+    .build()
 }
 
 /// 学期号是不是纯数字（教务用数字 id，例如 527）
@@ -109,7 +114,7 @@ pub fn fetch_print_data(store: &Store, semester: &str) -> Result<PrintData, Stri
         }
     };
     let url = PRINT_DATA.replace("{sem}", &sem);
-    let response = agent()
+    let response = agent(&url)
         .get(&url)
         .set("Cookie", &cookie)
         .call()
@@ -130,7 +135,7 @@ fn resolve_semester(final_url: &str, cookie: &str) -> Option<String> {
     if let Some(found) = sniff_semester(final_url) {
         return Some(found);
     }
-    let body = agent()
+    let body = agent(COURSE_TABLE)
         .get(COURSE_TABLE)
         .set("Cookie", cookie)
         .call()

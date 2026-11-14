@@ -5,15 +5,20 @@ use crate::store::Store;
 
 const TIMEOUT: u64 = 25;
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(TIMEOUT))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) DanLume/2.0")
-        .build()
+fn agent(url: &str) -> ureq::Agent {
+    crate::net::with_proxy(
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(TIMEOUT))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) DanLume/2.0")
+,
+        crate::get_store(),
+        url,
+    )
+    .build()
 }
 
 fn get_text(url: &str) -> Result<String, String> {
-    let response = agent()
+    let response = agent(url)
         .get(url)
         .call()
         .map_err(|err| format!("请求失败：{err}"))?;
@@ -523,7 +528,7 @@ pub fn pdf_download(store: &Store, args: &Value) -> Value {
         }
     };
     let target = dir.join(&name);
-    let response = match agent().get(&url).call() {
+    let response = match agent(&url).get(&url).call() {
         Ok(value) => value,
         Err(err) => return fail(format!("下载失败：{err}")),
     };
@@ -782,7 +787,7 @@ pub fn elearning_download(store: &Store, args: &Value) -> Value {
             skipped += 1;
             continue;
         }
-        match agent().get(url).call() {
+        match agent(url).get(url).call() {
             Ok(response) => {
                 let mut bytes: Vec<u8> = Vec::new();
                 use std::io::Read;

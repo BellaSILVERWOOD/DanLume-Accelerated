@@ -16,15 +16,20 @@ const CARDS: [(&str, &str, &str); 6] = [
     ("empty_room", "空教室", "ehall_json_empty_room"),
 ];
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(25))
-        .redirects(5)
-        .user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-        )
-        .build()
+fn agent(url: &str) -> ureq::Agent {
+    crate::net::with_proxy(
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(25))
+            .redirects(5)
+            .user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            )
+,
+        crate::get_store(),
+        url,
+    )
+    .build()
 }
 
 fn card_url(store: &Store, source_key: &str) -> String {
@@ -41,7 +46,7 @@ fn card_url(store: &Store, source_key: &str) -> String {
 
 /// 用会话取一页（返回最终 URL 与正文）
 fn fetch_page(jar: &uis::Jar, url: &str) -> Result<(String, String), String> {
-    let response = agent()
+    let response = agent(url)
         .get(url)
         .set("Cookie", &jar.to_header())
         .call()

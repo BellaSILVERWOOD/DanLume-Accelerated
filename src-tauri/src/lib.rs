@@ -24,6 +24,7 @@ mod latex_export;
 mod mail;
 mod mail_identity;
 mod memory;
+mod net;
 mod notices;
 mod notices_auto;
 mod notify;
@@ -1737,6 +1738,28 @@ async fn exams_import(
 fn homework_upcoming(days: Option<i64>, state: State<'_, AppState>) -> serde_json::Value {
     let _ = &state;
     elearn::upcoming(get_store(), days.unwrap_or(14))
+}
+
+/// 代理现在是什么状态（设置页那行小字）
+#[tauri::command]
+fn proxy_summary(state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    let store = get_store();
+    json!({
+        "ok": true,
+        "summary": net::summary(store),
+        "webview_args": net::webview_args_string(store).unwrap_or_default(),
+    })
+}
+
+/// 测一下走当前设置能不能连到校内服务（对应旧版 `vpn.probe`）
+#[tauri::command]
+async fn proxy_probe() -> Result<serde_json::Value, String> {
+    let handle = tauri::async_runtime::spawn_blocking(|| net::probe(get_store())).await;
+    match handle {
+        Ok(value) => Ok(value),
+        Err(exc) => Ok(json!({ "ok": false, "error": format!("测试没跑起来：{exc}") })),
+    }
 }
 
 /// 把一条作业标成「已完成 / 已提交」（`done = false` 取消）
@@ -3874,18 +3897,22 @@ fn uis_logout(state: State<'_, AppState>) -> serde_json::Value {
 /// 用合并后的会话直接请求一次 Canvas API：200 才算「真的登录了」。
 fn verify_canvas_session(jar: &crate::uis::Jar) -> String {
     let url = "https://elearning.fudan.edu.cn/api/v1/courses?enrollment_state=active&per_page=1";
-    match ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .redirects(3)
-        .user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-        )
-        .build()
-        .get(url)
-        .set("Cookie", &jar.to_header())
-        .set("Accept", "application/json")
-        .call()
+    match crate::net::with_proxy(
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirects(3)
+            .user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            ),
+        get_store(),
+        url,
+    )
+    .build()
+    .get(url)
+    .set("Cookie", &jar.to_header())
+    .set("Accept", "application/json")
+    .call()
     {
         Ok(response) => format!("Canvas API {}", response.status()),
         Err(ureq::Error::Status(code, _)) => format!("Canvas API {code}（会话没被接受）"),
@@ -4904,6 +4931,12 @@ fn timetable_status(state: State<'_, AppState>) -> serde_json::Value {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 内嵌网页（WebView2）的代理：这个环境变量要在**任何 webview 创建之前**设好，
+    // 之后创建的所有 webview（主窗口、登录窗、看板娘、内嵌 eHall/eLearning…）都会继承。
+    // 改设置后要重启才生效（后台请求是每次现读设置的，不用重启）。
+    if let Some(args) = crate::net::webview_args_string(crate::get_store()) {
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", args);
+    }
         // 崩溃可查：把 panic 写到 %TEMP%\danlume-panic.log（release 版没有控制台，
         // 用户只会看到「程序退出了」，有这个文件才能知道是哪一行）。
         std::panic::set_hook(Box::new(|info| {
@@ -5179,6 +5212,8 @@ pub fn run() {
             papers_semantic_search,
             homework_upcoming,
             homework_mark_done,
+            proxy_summary,
+            proxy_probe,
             elearn_due_reminders,
             exams_import,
             refs_list,

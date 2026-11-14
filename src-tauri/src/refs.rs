@@ -302,9 +302,13 @@ pub fn fetch_doi(doi: &str) -> Result<Entry, String> {
         return Err("DOI 是空的".to_string());
     }
     let url = format!("https://api.crossref.org/works/{cleaned}");
-    let response = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
+    let response = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(15)),
+     crate::get_store(),
+     &url,
+ )
+ .build()
         .get(&url)
         .set("User-Agent", "DanLume/2.0 (mailto:noreply@example.com)")
         .call()

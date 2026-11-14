@@ -1253,6 +1253,32 @@ export async function examsImport(
   return invoke("exams_import", { commit, asImportant });
 }
 
+/* -------------------------------------------------------------- VPN / 代理（J2-3） */
+/*
+ * 后台请求（ureq）每次都现读设置，所以改完立刻生效；
+ * 内嵌网页（WebView2）靠进程启动参数，改完要重启一次。
+ */
+export async function proxySummary(): Promise<{
+  ok: boolean;
+  summary: string;
+  webview_args: string;
+}> {
+  if (!isTauri) return { ok: true, summary: "", webview_args: "" };
+  return invoke("proxy_summary");
+}
+
+export async function proxyProbe(): Promise<{
+  ok: boolean;
+  mode: string;
+  proxy: string;
+  summary: string;
+  results: { name: string; ok: boolean; status: number; ms: number; error?: string }[];
+}> {
+  if (!isTauri)
+    return { ok: false, mode: "直连", proxy: "", summary: "", results: [] };
+  return invoke("proxy_probe");
+}
+
 /** 后台提醒到点时 Rust 会发这个事件（前端弹出卡片） */
 export async function onElearnDue(
   handler: (payload: { items: DueAssignment[] }) => void,

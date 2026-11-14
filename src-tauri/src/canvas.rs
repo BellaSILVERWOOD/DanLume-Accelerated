@@ -19,15 +19,20 @@ pub const FILES: &str =
 /// dash 页右侧 To Do（最近要交什么）——旧版 `elearning.TODO_API`
 pub const TODO: &str = "/api/v1/users/self/todo?per_page=50";
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .redirects(5)
-        .user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-        )
-        .build()
+fn agent(url: &str) -> ureq::Agent {
+    crate::net::with_proxy(
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirects(5)
+            .user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            )
+,
+        crate::get_store(),
+        url,
+    )
+    .build()
 }
 
 /// 建立（或复用）Canvas 会话：先请求首页走完整 SSO
@@ -43,7 +48,7 @@ pub fn ensure_session(store: &Store) -> Result<uis::Jar, String> {
 
 fn get_json(jar: &uis::Jar, path: &str) -> Result<Value, String> {
     let url = format!("{BASE}{path}");
-    let response = agent()
+    let response = agent(&url)
         .get(&url)
         .set("Cookie", &jar.to_header())
         .set("Accept", "application/json")
@@ -418,7 +423,7 @@ pub fn download_course(store: &Store, course_id: &str, limit: usize) -> Value {
             skipped += 1;
             continue;
         }
-        let response = agent().get(url).set("Cookie", &jar.to_header()).call();
+        let response = agent(url).get(url).set("Cookie", &jar.to_header()).call();
         match response {
             Ok(res) => {
                 let mut bytes: Vec<u8> = Vec::new();

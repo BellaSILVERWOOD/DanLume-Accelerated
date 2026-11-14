@@ -581,10 +581,14 @@ fn post_stream(
         payload["tools"] = list.clone();
         payload["tool_choice"] = json!("auto");
     }
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(300))
-        .user_agent("DanLume/2.0")
-        .build();
+        .user_agent("DanLume/2.0"),
+     crate::get_store(),
+     &url,
+ )
+ .build();
     let response = match agent
         .post(&url)
         .set("Content-Type", "application/json")
@@ -824,10 +828,14 @@ fn context_message(store: &Store) -> Option<String> {
 }
 
 fn public_ip() -> Result<String, String> {
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(6))
-        .user_agent("DanLume/2.0")
-        .build();
+        .user_agent("DanLume/2.0"),
+     crate::get_store(),
+     "https://api.ipify.org",
+ )
+ .build();
     let text = agent
         .get("https://api.ipify.org")
         .call()
@@ -895,10 +903,14 @@ fn post(
         payload["tools"] = list.clone();
         payload["tool_choice"] = json!("auto");
     }
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(180))
-        .user_agent("DanLume/2.0")
-        .build();
+        .user_agent("DanLume/2.0"),
+     crate::get_store(),
+     &url,
+ )
+ .build();
     let response = agent
         .post(&url)
         .set("Content-Type", "application/json")

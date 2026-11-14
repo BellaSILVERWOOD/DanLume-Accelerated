@@ -59,6 +59,8 @@ import {
   settingsAll,
   settingsSave,
   uisLogin,
+  proxySummary,
+  proxyProbe,
   uisLogout,
   canvasDownload,
   canvasMigrate,
@@ -93,6 +95,54 @@ type CardDef = {
   fields: Field[];
   actions?: string[];
 };
+
+/**
+ * 开关类字段的当前状态。
+ * 约定是「值不是 '0' 就算开」，但代理（proxy_enabled）默认必须是**关**，
+ * 否则设置页会显示「已启用」而后台其实没走代理（2026-11-12 修）。
+ */
+const OFF_BY_DEFAULT = new Set(["proxy_enabled"]);
+function switchOn(key: string): boolean {
+  const value = values[key] ?? "";
+  if (OFF_BY_DEFAULT.has(key) && value === "") return false;
+  return value !== "0";
+}
+
+/* ---------------- 代理：测一下能不能连校内服务 ---------------- */
+const proxyBusy = ref(false);
+const proxyMsg = ref("");
+const proxySummaryText = ref("");
+const proxyResults = ref<{ name: string; ok: boolean; status: number; ms: number; error?: string }[]>([]);
+
+async function loadProxySummary() {
+  try {
+    const result = await proxySummary();
+    proxySummaryText.value = result.summary || "";
+  } catch {
+    proxySummaryText.value = "";
+  }
+}
+
+async function testProxy() {
+  if (proxyBusy.value) return;
+  proxyBusy.value = true;
+  proxyMsg.value = "正在测…（按当前设置连 eLearning 和教务处）";
+  proxyResults.value = [];
+  try {
+    const result = await proxyProbe();
+    proxyResults.value = (result.results || []) as typeof proxyResults.value;
+    proxySummaryText.value = result.summary || proxySummaryText.value;
+    proxyMsg.value = result.ok
+      ? `能连上（${result.mode}）`
+      : `连不上（${result.mode}）：${(result.results || [])
+          .map((one) => one.error || `${one.name} ${one.status}`)
+          .join("；")}`;
+  } catch (err) {
+    proxyMsg.value = `测试失败：${String(err)}`;
+  } finally {
+    proxyBusy.value = false;
+  }
+}
 
 const CATEGORIES = ["常规", "仪表板", "邮件", "日程", "AI", "其他"];
 const active = ref("常规");
@@ -884,12 +934,14 @@ const cards: CardDef[] = [
     subtitle: "校外访问走代理时填这里",
     category: "其他",
     fields: [
-      { label: "代理地址", kind: "text", key: "proxy_host" },
-      { label: "代理端口", kind: "text", key: "proxy_port" },
+      { label: "启用代理", kind: "switch", key: "proxy_enabled", hint: "开启后后台请求立刻生效；内嵌网页要重启一次" },
+      { label: "代理类型（http / socks5）", kind: "select", key: "proxy_kind", options: ["http", "socks5"] },
+      { label: "代理地址", kind: "text", key: "proxy_host", placeholder: "127.0.0.1" },
+      { label: "代理端口", kind: "text", key: "proxy_port", placeholder: "7890" },
       { label: "认证方式", kind: "select", key: "proxy_auth", options: ["账号密码", "免认证"] },
       { label: "账号", kind: "text", key: "proxy_user" },
       { label: "密码", kind: "password", secret: "proxy_password" },
-      { label: "不走代理的域名", kind: "textarea", key: "proxy_bypass", placeholder: "fudan.edu.cn, localhost" },
+      { label: "不走代理的域名", kind: "textarea", key: "proxy_bypass", placeholder: "fudan.edu.cn, localhost（本机永远直连）" },
     ],
     actions: ["save"],
   },
@@ -1702,7 +1754,7 @@ async function refreshAdminFlag() {
                 <label v-else-if="field.kind === 'switch'" class="switch">
                   <input
                     type="checkbox"
-                    :checked="(values[field.key || ''] ?? '') !== '0'"
+                    :checked="switchOn(field.key || '')"
                     @change="setValue(field, ($event.target as HTMLInputElement).checked ? '1' : '0')"
                   />
                   <span />
@@ -1736,6 +1788,24 @@ async function refreshAdminFlag() {
                   @input="setValue(field, ($event.target as HTMLInputElement).value)"
                 />
                 <span v-if="field.hint" class="hint">{{ field.hint }}</span>
+              </div>
+            </div>
+          </template>
+
+          <!-- 代理：测一下现在能不能连校内服务（对应旧版 vpn.probe） -->
+          <template v-if="card.key === 'vpn'">
+            <div class="field">
+              <div class="label">当前状态</div>
+              <div class="control">
+                <span class="hint">{{ proxySummaryText || "（还没读）" }}</span>
+                <SoftButton :height="28" :font-size="12" :disabled="proxyBusy" @click="testProxy">
+                  {{ proxyBusy ? "测试中…" : "测一下能不能连" }}
+                </SoftButton>
+                <span v-if="proxyMsg" class="hint">{{ proxyMsg }}</span>
+                <div v-for="item in proxyResults" :key="item.name" class="hint">
+                  {{ item.name }}：{{ item.ok ? "通" : "不通" }}
+                  {{ item.status ? `（HTTP ${item.status}，${item.ms} ms）` : item.error || "" }}
+                </div>
               </div>
             </div>
           </template>

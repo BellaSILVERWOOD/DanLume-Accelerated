@@ -16,15 +16,20 @@ pub const SESSION_KEY: &str = "uis_session";
 pub const USER_KEY: &str = "uis_username";
 pub const PASS_KEY: &str = "uis_password";
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(20))
-        .redirects(5)
-        .user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-        )
-        .build()
+fn agent(url: &str) -> ureq::Agent {
+    crate::net::with_proxy(
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(20))
+            .redirects(5)
+            .user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            )
+,
+        crate::get_store(),
+        url,
+    )
+    .build()
 }
 
 /// 简化 cookie jar：只保存 name=value，不处理 Domain/Path/过期（内部站点够用）
@@ -262,7 +267,7 @@ pub fn login(store: &Store, username: &str, password: &str) -> Result<Value, Str
         return Err("要填学号和密码".to_string());
     }
     let page_url = format!("{UIS_LOGIN_URL}?service={CANVAS_SERVICE}");
-    let page = agent()
+    let page = agent(&page_url)
         .get(&page_url)
         .call()
         .map_err(|exc| format!("打不开登录页：{exc}"))?
@@ -290,7 +295,7 @@ pub fn login(store: &Store, username: &str, password: &str) -> Result<Value, Str
         ])
         .collect::<Vec<_>>()
         .join("&");
-    let response = agent()
+    let response = agent(&page_url)
         .post(&page_url)
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&form);
@@ -316,7 +321,7 @@ pub fn login(store: &Store, username: &str, password: &str) -> Result<Value, Str
         } else {
             break;
         };
-        let follow = agent()
+        let follow = agent(&next_url)
             .get(&next_url)
             .set("Cookie", &jar.to_header())
             .call();
@@ -368,7 +373,7 @@ pub fn visit_with_session(store: &Store, url: &str) -> Result<(String, Jar), Str
     let session = load_session(store)
         .ok_or_else(|| "还没有登录会话：先点「打开登录窗口」再「抓取会话」".to_string())?;
     let mut jar = session.clone();
-    let mut current = agent()
+    let mut current = agent(url)
         .get(url)
         .set("Cookie", &jar.to_header())
         .call()
@@ -394,7 +399,7 @@ pub fn visit_with_session(store: &Store, url: &str) -> Result<(String, Jar), Str
         } else {
             break;
         };
-        let next = match agent()
+        let next = match agent(url)
             .get(&next_url)
             .set("Cookie", &jar.to_header())
             .call()

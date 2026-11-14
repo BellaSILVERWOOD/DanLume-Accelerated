@@ -127,10 +127,14 @@ pub fn send(store: &Store) -> Value {
     }
     let url = report_url(store);
     let payload = snapshot(store);
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(6))
-        .user_agent("DanLume/2.0")
-        .build();
+        .user_agent("DanLume/2.0"),
+     crate::get_store(),
+     &url,
+ )
+ .build();
     let response = agent
         .post(&url)
         .set("Content-Type", "application/json")

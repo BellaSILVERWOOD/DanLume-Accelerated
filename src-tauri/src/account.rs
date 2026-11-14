@@ -319,12 +319,17 @@ impl std::error::Error for ApiError {}
 
 // ---------------------------------------------------------------- HTTP 底层
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .timeout_connect(Duration::from_secs(TIMEOUT_SECS))
-        .user_agent(concat!("DanLume/", env!("CARGO_PKG_VERSION")))
-        .build()
+fn agent(url: &str) -> ureq::Agent {
+    crate::net::with_proxy(
+        ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .timeout_connect(Duration::from_secs(TIMEOUT_SECS))
+            .user_agent(concat!("DanLume/", env!("CARGO_PKG_VERSION")))
+,
+        crate::get_store(),
+        url,
+    )
+    .build()
 }
 
 /// 发一个请求，拿到 (状态码, 响应体)。4xx/5xx 也算成功返回，只有连不上才是 Err。
@@ -334,7 +339,7 @@ fn send(
     body: Option<&Value>,
     bearer: Option<&str>,
 ) -> Result<(u16, String), ApiError> {
-    let agent = agent();
+    let agent = agent(url);
     let mut request = match method {
         "GET" => agent.get(url),
         "POST" => agent.post(url),

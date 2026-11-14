@@ -184,9 +184,13 @@ fn search_crossref(query: &str, limit: usize, offset: usize) -> Result<(Vec<Valu
         "https://api.crossref.org/works?rows={limit}&offset={offset}&query={}",
         urlencode(query)
     );
-    let response = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
+    let response = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(15)),
+     crate::get_store(),
+     &url,
+ )
+ .build()
         .get(&url)
         .set("User-Agent", "DanLume/2.0 (mailto:noreply@example.com)")
         .call()
@@ -346,9 +350,13 @@ fn search_semantic(query: &str, limit: usize, offset: usize) -> Result<(Vec<Valu
         "https://api.semanticscholar.org/graph/v1/paper/search?query={}&limit={limit}&offset={offset}&fields=title,abstract,year,venue,authors,externalIds,openAccessPdf,paperId",
         urlencode(query)
     );
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(20))
-        .build();
+    let agent = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(20)),
+     crate::get_store(),
+     &url,
+ )
+ .build();
     let waits = [1_200_u64, 2_500_u64];
     let mut round = 0usize;
     loop {
@@ -554,9 +562,13 @@ fn run_pass(text: &str, terms: &[String], cap: usize, pool: usize, start: usize,
         "https://export.arxiv.org/api/query?search_query={}&start={start}&max_results={pool}&sortBy=relevance",
         arxiv_search_query_with(terms, join)
     );
-    match ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
+    match crate::net::with_proxy(
+     ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(20)),
+     crate::get_store(),
+     &arxiv_url,
+ )
+ .build()
         .get(&arxiv_url)
         .set("User-Agent", "DanLume/2.0")
         .call()
@@ -851,9 +863,13 @@ pub fn download_pdf(store: &Store, id: i64) -> Value {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return json!({ "ok": false, "summary": "PDF 地址不是 http(s)，不下载" });
     }
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(40))
-        .build();
+    let agent = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(40)),
+     crate::get_store(),
+     &url,
+ )
+ .build();
     let response = match agent
         .get(&url)
         .set("User-Agent", "DanLume/2.0 (mailto:noreply@example.com)")

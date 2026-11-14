@@ -398,10 +398,14 @@ fn post_json(url: &str, payload: &Value) -> Result<(), String> {
     if !(target.starts_with("http://") || target.starts_with("https://")) {
         return Err("webhook 地址要以 http(s):// 开头".to_string());
     }
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::net::with_proxy(
+     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent("DanLume/2.0")
-        .build();
+        .user_agent("DanLume/2.0"),
+     crate::get_store(),
+     target,
+ )
+ .build();
     match agent
         .post(target)
         .set("Content-Type", "application/json")

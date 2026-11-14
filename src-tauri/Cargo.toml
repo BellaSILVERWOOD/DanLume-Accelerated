@@ -26,7 +26,7 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 天气 / eHall / eLearning 这些都要发 HTTP 请求，用轻量的 ureq（自带 rustls）
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "2", features = ["json", "socks-proxy"] }
 # 服务器公告通道：曾尝试 tungstenite 走 WebSocket，但该依赖会让测试二进制
 # 加载失败（STATUS_ENTRYPOINT_NOT_FOUND），已回退为 5 秒轮询（见 notify.rs）。
 # 收件箱：IMAP 拉信 + MIME 解析（正文 / 内联图片 / 附件）
