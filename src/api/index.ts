@@ -2323,6 +2323,46 @@ export async function latexFormulaFromText(
   return invoke("latex_formula_from_text", { text, display });
 }
 
+/* --------------------------------------------- 公式页：快速输入 / 宏包勾选（J2-11）
+ *
+ * 旧版 `math_input.py`（AsciiMath 风格的线性输入）和 `latex_packages.py`（宏包勾选）
+ * 都已移植到 Rust 侧，前端只负责发文本、显示结果。
+ */
+
+/** 「随手敲的数学」→ LaTeX；出错了把原因给前端显示 */
+export async function mathToLatex(
+  text: string,
+): Promise<{ ok: boolean; latex: string; error: string }> {
+  if (!isTauri) return { ok: true, latex: text, error: "" };
+  return invoke("math_to_latex", { text });
+}
+
+export type LatexPackageItem = {
+  id: string;
+  name: string;
+  line: string;
+  default: boolean;
+  checked: boolean;
+};
+
+export type LatexPackagesState = {
+  ok: boolean;
+  items: LatexPackageItem[];
+  selected: string[];
+  defaults: string[];
+  preamble: string;
+};
+
+export async function latexPackagesState(): Promise<LatexPackagesState> {
+  if (!isTauri) return { ok: false, items: [], selected: [], defaults: [], preamble: "" };
+  return invoke<LatexPackagesState>("latex_packages_state");
+}
+
+export async function latexPackagesSet(ids: string[]): Promise<LatexPackagesState> {
+  if (!isTauri) return { ok: false, items: [], selected: [], defaults: [], preamble: "" };
+  return invoke<LatexPackagesState>("latex_packages_set", { ids });
+}
+
 /* ---------------------------------------------------------------- 窗口 */
 
 export async function windowMinimize(): Promise<void> {

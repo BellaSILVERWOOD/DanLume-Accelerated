@@ -7,33 +7,21 @@ pub fn wrap_document(body: &str) -> String {
     wrap_document_with("", "", body)
 }
 
-/// 带自定义导言区：`latex_packages`（逗号/空格分隔的宏包）+ `latex_preamble`（原样插入）
+/// 带自定义导言区：`packages` 是**宏包 id**（逗号/空格分隔，旧版 `latex_packages` 同一套名字），
+/// `preamble` 原样插在导言区末尾。空着就用默认那 8 个宏包（旧版 `DEFAULT_PACKAGES`）。
+///
+/// 具体怎么排（geometry 带选项、hyperref 永远最后）都在 `latex_packages` 里，和旧版
+/// `latex_builder.preamble()` 逐条一致；认不出的名字原样写 `\usepackage{名字}`。
 pub fn wrap_document_with(packages: &str, preamble: &str, body: &str) -> String {
-    let extra: String = packages
-        .split([',', '，', ';', ' ', '\n'])
-        .map(|one| one.trim())
-        .filter(|one| !one.is_empty())
-        .map(|one| format!("\\usepackage{{{one}}}\n"))
-        .collect();
-    let preamble = preamble.trim();
-    let preamble_block = if preamble.is_empty() {
-        String::new()
-    } else {
-        format!("{preamble}\n")
+    let ids = {
+        let parsed = crate::latex_packages::parse_ids(packages);
+        if parsed.is_empty() {
+            crate::latex_packages::default_ids()
+        } else {
+            parsed
+        }
     };
-    format!(
-        r#"\documentclass[11pt,a4paper]{{ctexart}}
-\usepackage{{amsmath,amssymb,bm}}
-\usepackage{{xcolor}}
-\usepackage[margin=2.4cm]{{geometry}}
-\usepackage{{enumitem}}
-{extra}{preamble_block}\setlength{{\parindent}}{{0pt}}
-\setlength{{\parskip}}{{0.62em}}
-\begin{{document}}
-{body}
-\end{{document}}
-"#
-    )
+    crate::latex_packages::build_document(body, &ids, preamble, "ctexart", "11pt,a4paper")
 }
 
 fn build_dir() -> PathBuf {

@@ -8,7 +8,17 @@ import katex from "katex";
 import "katex/dist/katex.min.css";
 import SoftButton from "../components/SoftButton.vue";
 import PdfViewer from "../components/PdfViewer.vue";
-import { latexFormulaFromText, latexPdf, readFileBase64, settingsAll, settingsSave } from "../api";
+import {
+  latexFormulaFromText,
+  latexPackagesSet,
+  latexPackagesState,
+  latexPdf,
+  mathToLatex,
+  readFileBase64,
+  settingsAll,
+  settingsSave,
+  type LatexPackagesState,
+} from "../api";
 
 const source = ref(`\\section*{特征值与特征向量}
 
@@ -379,6 +389,15 @@ function unwrapBold(text: string): string {
 }
 
 function blockOf(el: HTMLElement): string {
+  // 公式芯片直接挂在编辑区顶层时（光标在开头就插公式，会插到第一段前面）：
+  // 以前只有 `display === "1"` 的分支，行内公式就走到下面的兜底，
+  // 把 KaTeX 渲染出来的文字（`a+(b)/2`）当成正文写进了源码 → 编译直接报错
+  //（2026-11-14 从「公式…」对话框插一行内公式后实测到）。
+  if (el.classList.contains("fchip")) {
+    const latex = el.dataset.latex || "";
+    if (!latex) return "";
+    return el.dataset.display === "1" ? `$$ ${latex} $$` : `$${latex}$`;
+  }
   const tag = el.tagName;
   if (/^H[1-6]$/.test(tag)) {
     const level = Number(tag.slice(1));
@@ -598,8 +617,175 @@ function insertMatrix() {
   matrixOpen.value = false;
 }
 
+// ---- 公式对话框（旧版 latex_mathdialog.MathDialog，J2-11 剩下的那块）
+//
+// 两种输入方式：**快速输入**（`(a+b)/2`、`sum_(i=1)^n a_i` 这种，走后端 `math_to_latex`）
+// 和 **LaTeX 源码**；下面实时 KaTeX 预览，右下角插入行内 / 行间公式。
+const mathDialogOpen = ref(false);
+const mathMode = ref<"quick" | "latex">("quick");
+const mathQuick = ref("");
+const mathLatexDraft = ref("");
+const mathDisplayDraft = ref(false);
+const mathConvertMsg = ref("");
+const mathConvertBad = ref(false);
+let mathConvertTimer = 0;
+/** 矩阵弹窗这次是给「工具栏输入框」还是给「公式对话框」用 */
+const matrixTarget = ref<"doc" | "dialog">("doc");
+
+/** 弹窗遮罩：直接用行内样式。
+ *
+ *  为什么不用 class：`.matrix-modal` 本来是**文档流里的小卡片**，加个 class 改
+ *  `position: fixed` 实测没生效（渲染出来还是被挤到编辑区下面），行内样式优先级最高、
+ *  也不受主题样式影响，所以这两块直接给行内样式。
+ */
+const dialogOverlay = {
+  display: "flex",
+  position: "fixed",
+  top: "0",
+  right: "0",
+  bottom: "0",
+  left: "0",
+  zIndex: "60",
+  margin: "0",
+  padding: "24px",
+  justifyContent: "center",
+  alignItems: "center",
+  background: "rgba(0, 0, 0, 0.32)",
+} as const;
+
+function openMathDialog() {
+  mathDialogOpen.value = true;
+  mathMode.value = "quick";
+  mathQuick.value = "";
+  mathLatexDraft.value = "";
+  mathConvertMsg.value = "";
+  mathConvertBad.value = false;
+  mathDisplayDraft.value = mathDisplay.value;
+}
+
+/** 快速输入：停手 320ms 转一次（旧版是 450ms 的 QTimer） */
+function scheduleConvert() {
+  window.clearTimeout(mathConvertTimer);
+  mathConvertTimer = window.setTimeout(() => {
+    void convertQuickNow();
+  }, 320);
+}
+
+async function convertQuickNow() {
+  const text = mathQuick.value.trim();
+  if (!text) {
+    mathConvertMsg.value = "";
+    mathConvertBad.value = false;
+    mathLatexDraft.value = "";
+    return;
+  }
+  try {
+    const result = await mathToLatex(text);
+    if (result.ok) {
+      mathLatexDraft.value = result.latex;
+      mathConvertMsg.value = `→ ${result.latex}`;
+      mathConvertBad.value = false;
+    } else {
+      mathConvertMsg.value = `暂时看不懂：${result.error}`;
+      mathConvertBad.value = true;
+    }
+  } catch (err) {
+    mathConvertMsg.value = `转换失败：${String(err)}`;
+    mathConvertBad.value = true;
+  }
+}
+
+/** 切输入方式：从 LaTeX 反推「快速输入」不现实，所以回到空（和旧版一样） */
+function switchMathMode() {
+  mathConvertMsg.value = "";
+  mathConvertBad.value = false;
+  if (mathMode.value === "quick") {
+    mathQuick.value = "";
+    mathLatexDraft.value = "";
+  }
+}
+
+const mathDraftPreview = computed(() => {
+  const text = mathLatexDraft.value.trim();
+  return text ? katexHtml(text, mathDisplayDraft.value) : "";
+});
+
+function applyMathDialog() {
+  const latex = mathLatexDraft.value.trim();
+  if (!latex) {
+    mathConvertMsg.value = "公式不能为空";
+    mathConvertBad.value = true;
+    return;
+  }
+  insertFormula(latex, mathDisplayDraft.value);
+  mathDialogOpen.value = false;
+}
+
+/** 对话框里的「矩阵 / 行列式…」：先把矩阵弹窗对着对话框开 */
+function matrixIntoDialog() {
+  matrixTarget.value = "dialog";
+  matrixOpen.value = true;
+}
+
+// ---- 宏包勾选（旧版 latex_packages.PackagesDialog，J2-11 的另一块）
+const packagesOpen = ref(false);
+const packagesState = ref<LatexPackagesState | null>(null);
+const packagesChecked = ref<string[]>([]);
+const packagesMsg = ref("");
+
+async function openPackages() {
+  packagesOpen.value = true;
+  packagesMsg.value = "";
+  try {
+    const state = await latexPackagesState();
+    packagesState.value = state;
+    packagesChecked.value = [...state.selected];
+  } catch (err) {
+    packagesMsg.value = `读不到宏包清单：${String(err)}`;
+  }
+}
+
+function togglePackage(id: string) {
+  packagesChecked.value = packagesChecked.value.includes(id)
+    ? packagesChecked.value.filter((one) => one !== id)
+    : [...packagesChecked.value, id];
+}
+
+/** 勾选结果按宏包表顺序排（hyperref 永远最后，和导出时一致） */
+const packagesPreamblePreview = computed(() => {
+  const items = packagesState.value?.items || [];
+  const chosen = items.filter((one) => packagesChecked.value.includes(one.id));
+  const early = chosen.filter((one) => one.id !== "hyperref").map((one) => one.line);
+  const late = chosen.filter((one) => one.id === "hyperref").map((one) => one.line);
+  return [...early, ...late].join("\n");
+});
+
+async function savePackages() {
+  try {
+    const state = await latexPackagesSet(packagesChecked.value);
+    packagesState.value = state;
+    packagesChecked.value = [...state.selected];
+    packagesMsg.value = `已保存 ${state.selected.length} 个宏包，下次导出 PDF 就按这个导言区来`;
+  } catch (err) {
+    packagesMsg.value = `保存失败：${String(err)}`;
+  }
+}
+
+async function resetPackages() {
+  packagesChecked.value = [...(packagesState.value?.defaults || [])];
+  await savePackages();
+}
+
 function useMatrixSource() {
-  addMacro(buildMatrix());
+  const code = buildMatrix();
+  if (matrixTarget.value === "dialog") {
+    // 从「公式对话框」里点进来的：代码放进对话框的 LaTeX 框，别丢进工具栏那个输入框
+    mathLatexDraft.value = code;
+    mathConvertMsg.value = "矩阵代码已放进公式框";
+    mathConvertBad.value = false;
+  } else {
+    addMacro(code);
+  }
   matrixOpen.value = false;
 }
 
@@ -1332,7 +1518,15 @@ onMounted(async () => {
         <button v-for="macro in macros" :key="macro.label" class="tool" @click="addMacro(macro.latex)">
           {{ macro.label }}
         </button>
-        <button class="tool" title="填格子生成矩阵 / 行列式" @click="openMatrix">矩阵…</button>
+        <button class="tool" title="填格子生成矩阵 / 行列式" @click="matrixTarget = 'doc', openMatrix()">
+          矩阵…
+        </button>
+        <button class="tool wide" title="公式对话框：随便敲数学或写 LaTeX，带实时预览" @click="openMathDialog">
+          公式…
+        </button>
+        <button class="tool wide" title="勾选要加载的宏包（导出 PDF 的导言区）" @click="openPackages">
+          宏包…
+        </button>
         <span class="gap" />
         <!-- 选中文字一键变公式（Ctrl+Shift+M）／交给 AI 转（Ctrl+Shift+E） -->
         <button class="tool wide" title="把选中的内容变成行内公式（Ctrl+Shift+M）" @click="convertSelection()">
@@ -1489,8 +1683,109 @@ onMounted(async () => {
         <div class="matrix-foot">
           <code class="matrix-preview">{{ buildMatrix() }}</code>
           <span class="spacer" />
-          <button class="tool" @click="useMatrixSource">放进输入框</button>
+          <button class="tool" @click="useMatrixSource">
+            {{ matrixTarget === "dialog" ? "放进公式框" : "放进输入框" }}
+          </button>
           <button class="tool primary" @click="insertMatrix">插到文档</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 公式对话框（旧版 latex_mathdialog.MathDialog）：快速输入 / LaTeX 源码 + 实时预览 -->
+    <div v-if="mathDialogOpen" class="matrix-modal" :style="dialogOverlay">
+      <div class="matrix-card math-card">
+        <div class="matrix-head">
+          <b>插入公式</b>
+          <span class="tiny">直接敲数学就行（如 (a+b)/2、sum_(i=1)^n a_i）；也可以写 LaTeX</span>
+          <span class="spacer" />
+          <button class="tool" @click="mathDialogOpen = false">关闭</button>
+        </div>
+        <div class="matrix-tools">
+          <label>
+            输入方式
+            <select v-model="mathMode" @change="switchMathMode">
+              <option value="quick">快速输入（不用写 LaTeX）</option>
+              <option value="latex">LaTeX 源码</option>
+            </select>
+          </label>
+          <label>
+            形式
+            <select v-model="mathDisplayDraft">
+              <option :value="false">行内公式 $…$</option>
+              <option :value="true">行间公式 \[…\]</option>
+            </select>
+          </label>
+          <button class="tool wide" @click="matrixIntoDialog">矩阵 / 行列式…</button>
+        </div>
+        <template v-if="mathMode === 'quick'">
+          <input
+            v-model="mathQuick"
+            class="math-quick"
+            placeholder="例如：(a+b)/2 、x^2 、sqrt(2) 、sum_(i=1)^n a_i 、λ^2-4λ+3=0"
+            spellcheck="false"
+            @input="scheduleConvert"
+            @keydown.enter.prevent="applyMathDialog"
+          />
+          <div class="math-note">
+            支持：a/b 分数、x^2 与 a_i 上下标、sqrt() 根号、sum/int/lim、|x| 绝对值、
+            [[1,2],[3,4]] 矩阵、alpha / λ 之类希腊字母，以及 &lt;= &gt;= -&gt; oo 等符号
+          </div>
+        </template>
+        <textarea
+          v-else
+          v-model="mathLatexDraft"
+          class="math-source"
+          spellcheck="false"
+          placeholder="\frac{a}{b}"
+        />
+        <div v-if="mathConvertMsg" class="math-note" :class="{ bad: mathConvertBad }">
+          {{ mathConvertMsg }}
+        </div>
+        <div class="math-preview">
+          <div v-if="mathDraftPreview" v-html="mathDraftPreview" />
+          <span v-else class="tiny muted">在下面输入公式后这里会显示渲染结果</span>
+        </div>
+        <div class="matrix-foot">
+          <span class="tiny">插入到光标处；行间公式会单独占一行</span>
+          <span class="spacer" />
+          <button class="tool" @click="mathDialogOpen = false">取消</button>
+          <button class="tool primary" :disabled="!mathLatexDraft.trim()" @click="applyMathDialog">
+            插入
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 宏包勾选（旧版 latex_packages.PackagesDialog）：勾完自动写进导言区 -->
+    <div v-if="packagesOpen" class="matrix-modal" :style="dialogOverlay">
+      <div class="matrix-card packages-card">
+        <div class="matrix-head">
+          <b>选择宏包</b>
+          <span class="tiny">勾选后会自动写进导言区，顺序由程序安排（hyperref 放最后）</span>
+          <span class="spacer" />
+          <button class="tool" @click="packagesOpen = false">关闭</button>
+        </div>
+        <div class="packages-grid">
+          <label v-for="item in packagesState?.items || []" :key="item.id" class="package-row">
+            <input
+              type="checkbox"
+              :checked="packagesChecked.includes(item.id)"
+              @change="togglePackage(item.id)"
+            />
+            <span class="package-name">{{ item.name }}</span>
+          </label>
+        </div>
+        <div class="packages-preamble">
+          <div class="tiny">将要写进导言区：</div>
+          <pre>{{ packagesPreamblePreview || "（一个都没勾）" }}</pre>
+        </div>
+        <div v-if="packagesMsg" class="math-note">{{ packagesMsg }}</div>
+        <div class="matrix-foot">
+          <button class="tool" @click="resetPackages">恢复默认</button>
+          <span class="tiny">当前 {{ packagesChecked.length }} 个</span>
+          <span class="spacer" />
+          <button class="tool" @click="packagesOpen = false">取消</button>
+          <button class="tool primary" @click="savePackages">保存</button>
         </div>
       </div>
     </div>
@@ -1779,10 +2074,10 @@ onMounted(async () => {
   font-size: 12.5px;
   padding: 20px;
 }
-</style>
 
 /* 矩阵输入弹层（旧版 latex_matrix.py 的图形化矩阵） */
-/* 矩阵弹层：不浮在整个窗口上（WebView 里 fixed 会被外壳盖住），直接排在页面里 */
+/* 注意：这段以前被一个**多余的 style 结束标签**挡在样式块外面，等于整段没生效
+   （矩阵弹窗没有卡片样式、`math-card` / `packages-grid` 全丢）——2026-11-14 修。 */
 .matrix-modal {
   display: flex;
   justify-content: center;
@@ -1891,3 +2186,83 @@ onMounted(async () => {
   border-color: var(--accent);
   color: var(--accent);
 }
+/* 公式对话框（J2-11）：快速输入 + LaTeX 源码 + 预览 */
+.math-card {
+  width: min(640px, 94vw);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.math-quick,
+.math-source {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  padding: 7px 9px;
+  border-radius: 9px;
+  border: 1px solid var(--border-soft);
+  background: var(--card);
+  color: var(--text);
+}
+.math-source {
+  min-height: 76px;
+  resize: vertical;
+}
+.math-note {
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--muted);
+  word-break: break-all;
+}
+.math-note.bad {
+  color: var(--danger);
+}
+.math-preview {
+  min-height: 96px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px dashed var(--border);
+  background: var(--card-alt, transparent);
+  overflow-x: auto;
+}
+/* 宏包勾选（J2-11）：两列清单 + 生成的导言区 */
+.packages-card {
+  width: min(620px, 94vw);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.packages-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 12px;
+}
+.package-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.package-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.packages-preamble pre {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-soft);
+  background: var(--card-alt, transparent);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-soft);
+  max-height: 120px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+</style>

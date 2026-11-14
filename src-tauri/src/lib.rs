@@ -21,9 +21,11 @@ mod focus;
 mod geo;
 mod ics;
 mod latex_export;
+mod latex_packages;
 mod mail;
 mod mail_identity;
 mod mail_watch;
+mod math_input;
 mod memory;
 mod net;
 mod notices;
@@ -2524,6 +2526,31 @@ fn ehall_ingest_pasted(
 }
 
 // ------------------------------------------------------------- 公式导出
+
+/// 把「随手敲的数学」转成 LaTeX（J2-11：AsciiMath 风格的线性输入）
+///
+/// 旧版是 `math_input.to_latex()`（Python 侧同步移植，规则逐条对齐）。
+/// 出错时把原因原样给前端显示（「看不懂这个字符：中」这类），不要静默给出半个公式。
+#[tauri::command]
+fn math_to_latex(text: String) -> serde_json::Value {
+    match crate::math_input::to_latex(&text) {
+        Ok(latex) => json!({ "ok": true, "latex": latex, "error": "" }),
+        Err(exc) => json!({ "ok": false, "latex": "", "error": exc }),
+    }
+}
+
+/// 宏包勾选（J2-11）：清单 + 当前勾选 + 现在的导言区
+#[tauri::command]
+fn latex_packages_state(state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    crate::latex_packages::state(get_store())
+}
+
+#[tauri::command]
+fn latex_packages_set(ids: Vec<String>, state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    crate::latex_packages::set_selected(get_store(), &ids)
+}
 
 /// 把公式页的 LaTeX 编成 PDF（调本机 XeLaTeX）；返回 PDF 路径
 ///
@@ -5669,6 +5696,9 @@ pub fn run() {
             ehall_ingest,
             ehall_ingest_pasted,
             latex_pdf,
+            math_to_latex,
+            latex_packages_state,
+            latex_packages_set,
             latex_formula_from_text,
             due_reminders,
             mark_notified,
