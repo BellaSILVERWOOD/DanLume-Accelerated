@@ -7,9 +7,11 @@ import IconGlyph from "../components/IconGlyph.vue";
 import MetricLine from "../components/MetricLine.vue";
 import Pill from "../components/Pill.vue";
 import {
+  examsImport,
   eventIndex,
   eventSeriesDone,
   eventSetDone,
+  homeworkMarkDone,
   homeworkSync,
   homeworkUpcoming,
   importantDelete,
@@ -22,6 +24,7 @@ import {
   type EventRow,
   type ImportantDate,
 } from "../api";
+import { openInAppBrowser } from "../lib/appBus";
 import EventEditor from "../components/EventEditor.vue";
 import ConfirmDialog from "../components/ConfirmDialog.vue";
 
@@ -355,6 +358,60 @@ function openEdit(event: EventRow) {
 
 // 每分钟重读一次：过期日程会被「过期自动完成」勾掉（旧版 refresh_all 也是定时刷）
 let refreshTimer: number | null = null;
+// ---- 导入考试安排（J2-1）：教务「我的考试」→ 日历 + 重要日
+const examItems = ref<import("../api").ExamItem[]>([]);
+const examBusy = ref(false);
+const examMsg = ref("");
+const examOpen = ref(false);
+
+/** 先读一遍（不写），把结果摆出来给人确认 */
+async function previewExams() {
+  if (examBusy.value) return;
+  examBusy.value = true;
+  examMsg.value = "正在打开教务的「我的考试」…（弹出的窗口里如果要求登录，先登录一次）";
+  examOpen.value = true;
+  examItems.value = [];
+  try {
+    const result = await examsImport(false, true);
+    if (!result.ok) {
+      examMsg.value = result.error || "没读到考试安排";
+      return;
+    }
+    examItems.value = result.items || [];
+    examMsg.value = examItems.value.length
+      ? `读到 ${examItems.value.length} 场考试，确认后写进日历（提前 1 小时提醒）和「重要日」`
+      : "这个学期还没读到考试安排";
+  } catch (err) {
+    examMsg.value = `读取失败：${String(err)}`;
+  } finally {
+    examBusy.value = false;
+  }
+}
+
+/** 确认写入 */
+async function commitExams() {
+  if (examBusy.value) return;
+  examBusy.value = true;
+  examMsg.value = "正在写入日历…";
+  try {
+    const result = await examsImport(true, true);
+    if (!result.ok) {
+      examMsg.value = result.error || "写入失败";
+      return;
+    }
+    const added = result.result?.added ?? 0;
+    const skipped = result.result?.skipped ?? 0;
+    examMsg.value = `写好了：新增 ${added} 条，跳过 ${skipped} 条（已存在的）`;
+    await load();
+    await loadImportant();
+    examOpen.value = false;
+  } catch (err) {
+    examMsg.value = `写入失败：${String(err)}`;
+  } finally {
+    examBusy.value = false;
+  }
+}
+
 // ---- 作业截止（用户 2026-11-12：eLearning 的 /dash 上有截止时间，摆到日历页右侧）
 const assignments = ref<AssignmentDue[]>([]);
 const assignmentMsg = ref("");
@@ -399,13 +456,33 @@ async function syncAssignments() {
   }
 }
 
+/** 刷新：只重读本地缓存（不联网）；要拉最新数据用「同步」 */
+async function refreshAssignments() {
+  await loadAssignments();
+  assignmentMsg.value = assignments.value.length
+    ? `已刷新：${assignments.value.length} 个待交作业`
+    : "已刷新：没有待交作业";
+}
+
+/** 标成「已完成/已提交」：从卡片移除，并且不再提醒 */
+async function markAssignmentDone(item: AssignmentDue) {
+  try {
+    await homeworkMarkDone(item.key, true);
+    await loadAssignments();
+    assignmentMsg.value = `「${item.title}」已标记完成，不再提醒`;
+  } catch (err) {
+    assignmentMsg.value = `标记失败：${String(err)}`;
+  }
+}
+
 /** 「还有 5 小时 / 还有 2 天 3 小时 / 已过 30 分钟」—— 文案由 Rust 统一给，前后端一致 */
 function dueText(item: AssignmentDue): string {
   return item.left_text || (item.overdue ? "已过期" : "");
 }
 
 function openAssignment(item: AssignmentDue) {
-  if (item.url) void openUrl(item.url);
+  // 用户 2026-11-12：用应用内置的浏览器（作业页里那个内嵌 eLearning），不弹系统浏览器
+  if (item.url) openInAppBrowser(item.url);
 }
 
 onMounted(async () => {
@@ -666,6 +743,9 @@ function onWheel(event: WheelEvent) {
         <div class="side-head">
           <span class="h2">重要日</span>
           <span class="spacer" />
+          <SoftButton :height="24" :font-size="11" :disabled="examBusy" @click="previewExams">
+            {{ examBusy ? "读取中…" : "导入考试" }}
+          </SoftButton>
           <Pill :text="`${importantItems.length} 个`" :font-size="11.5" />
         </div>
         <div v-if="!importantItems.length" class="muted empty">
@@ -700,6 +780,9 @@ function onWheel(event: WheelEvent) {
         <div class="side-head">
           <span class="h2">作业截止</span>
           <span class="spacer" />
+          <SoftButton :height="24" :font-size="11" :disabled="assignmentBusy" @click="refreshAssignments">
+            刷新
+          </SoftButton>
           <Pill :text="`${assignments.length} 个待交`" :font-size="11.5" />
         </div>
         <div v-if="!assignments.length" class="muted empty">
@@ -722,6 +805,14 @@ function onWheel(event: WheelEvent) {
           <span class="assign-left" :class="{ soon: item.minutes_left > 0 && item.minutes_left <= 1440 }">
             {{ dueText(item) }}
           </span>
+          <!-- 已经交了就别再提醒（用户 2026-11-12） -->
+          <button
+            class="assign-done"
+            title="标记已完成/已提交（不再提醒）"
+            @click.stop="markAssignmentDone(item)"
+          >
+            ✓
+          </button>
         </div>
         <div class="assign-foot">
           <SoftButton :height="28" :font-size="12" :disabled="assignmentBusy" @click="syncAssignments">
@@ -740,6 +831,43 @@ function onWheel(event: WheelEvent) {
       @close="editorOpen = false"
       @saved="load()"
     />
+
+    <!-- 导入考试：先读出来给人看，确认后才写日历 -->
+    <div v-if="examOpen" class="exam-mask" @click.self="examOpen = false">
+      <div class="exam-card">
+        <div class="exam-head">
+          <b>导入考试安排</b>
+          <span class="spacer" />
+          <button class="exam-x" title="关闭" @click="examOpen = false">×</button>
+        </div>
+        <div class="hint">{{ examMsg }}</div>
+        <div v-if="examItems.length" class="exam-list">
+          <div v-for="item in examItems" :key="`${item.title}-${item.date}-${item.start_time}`" class="exam-row">
+            <div class="exam-main">
+              <b>{{ item.title }}</b>
+              <span class="exam-meta">
+                {{ item.date }} {{ item.start_time }}–{{ item.end_time || "?" }}
+                <template v-if="item.location"> · {{ item.location }}</template>
+                <template v-if="item.seat"> · 座位 {{ item.seat }}</template>
+              </span>
+            </div>
+            <span class="exam-tag">{{ item.confidence === "table" ? "表格" : "正文" }}</span>
+          </div>
+        </div>
+        <div class="exam-foot">
+          <SoftButton :height="30" :font-size="12" @click="examOpen = false">取消</SoftButton>
+          <SoftButton
+            variant="primary"
+            :height="30"
+            :font-size="12"
+            :disabled="examBusy || !examItems.length"
+            @click="commitExams"
+          >
+            加入日历 + 重要日
+          </SoftButton>
+        </div>
+      </div>
+    </div>
 
     <!-- 删重要日：先确认 -->
     <ConfirmDialog
@@ -819,6 +947,81 @@ function onWheel(event: WheelEvent) {
 .side-stack .side-card {
   width: auto;
 }
+/* 导入考试的弹层 */
+.exam-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.32);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 80;
+}
+.exam-card {
+  width: 560px;
+  max-width: calc(100vw - 80px);
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: var(--card);
+  box-shadow: var(--shadow-pop, 0 12px 32px rgba(0, 0, 0, 0.25));
+}
+.exam-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+.exam-x {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.exam-list {
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.exam-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+}
+.exam-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.exam-main b {
+  font-size: 12.5px;
+}
+.exam-meta {
+  font-size: 11px;
+  color: var(--muted);
+}
+.exam-tag {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+.exam-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* 作业截止卡片 */
 .assignment-card .assign-row {
   display: flex;
@@ -874,6 +1077,23 @@ function onWheel(event: WheelEvent) {
 }
 .assign-left.soon {
   color: var(--rose, #c0392b);
+}
+.assign-done {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+.assign-done:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 .assign-foot {
   display: flex;

@@ -1152,6 +1152,8 @@ export async function homeworkWriteDeadlines(
  * `homework_assignments`；这里读缓存，不联网。
  */
 export type AssignmentDue = {
+  /** 「课程|标题|截止」：标记「已完成」时用它 */
+  key: string;
   title: string;
   course: string;
   /** "YYYY-MM-DD HH:MM"（本地时间） */
@@ -1179,6 +1181,18 @@ export async function homeworkUpcoming(days = 14): Promise<{
   return invoke("homework_upcoming", { days });
 }
 
+/**
+ * 把一条作业标成「已完成 / 已提交」（`done=false` 取消）。
+ * 标了之后卡片里不再出现，也不会再提醒（用户 2026-11-12）。
+ */
+export async function homeworkMarkDone(
+  key: string,
+  done = true,
+): Promise<{ ok: boolean; done_keys: string[] }> {
+  if (!isTauri) return { ok: false, done_keys: [] };
+  return invoke("homework_mark_done", { key, done });
+}
+
 /** 今天该提醒的作业（`mark=true` 记成「今天提过」，默认只用来看） */
 export async function elearnDueReminders(mark = false): Promise<{
   ok: boolean;
@@ -1204,6 +1218,40 @@ export type DueAssignment = {
   /** 直接给卡片用的一句话：「课程 · 作业 还有 5 小时（11-12 23:59 截止）」 */
   text: string;
 };
+
+/* -------------------------------------------------------------- 考试安排（J2-1） */
+/*
+ * 教务「我的考试」是统一身份认证 + SPA：在登录窗口里落到考试页，把页面已经渲染出来的
+ * 表格读回来再解析（对应旧版 exams.py / exam_dialog.py）。
+ */
+export type ExamItem = {
+  title: string;
+  /** "YYYY-MM-DD" */
+  date: string;
+  start_time: string;
+  end_time: string;
+  location: string;
+  seat: string;
+  note: string;
+  /** "table" = 从表格读的，"text" = 扫正文兜底 */
+  confidence: string;
+};
+
+export async function examsImport(
+  commit = false,
+  asImportant = true,
+): Promise<{
+  ok: boolean;
+  items?: ExamItem[];
+  committed?: boolean;
+  url?: string;
+  title?: string;
+  result?: { ok: boolean; added: number; skipped: number };
+  error?: string;
+}> {
+  if (!isTauri) return { ok: false, error: "浏览器预览里读不了教务" };
+  return invoke("exams_import", { commit, asImportant });
+}
 
 /** 后台提醒到点时 Rust 会发这个事件（前端弹出卡片） */
 export async function onElearnDue(

@@ -485,6 +485,11 @@ pub fn write_deadlines(store: &Store, force: bool) -> Value {
 
 /// 提醒总开关（"0" = 关）
 const REMIND_SWITCH_KEY: &str = "elearn_remind";
+/// 用户手动标成「已完成 / 已提交」的作业（`["课程|标题|截止", ...]`）
+///
+/// 用户 2026-11-12：「有的时候可能已经提交了，就不要一直提醒」——
+/// 标了之后不再出现在卡片里，也不再提醒。
+const DONE_KEYS_KEY: &str = "elearn_done_keys";
 /// 提前多少分钟开始提醒（用户 2026-11-12：改成「到期前 24 小时」）
 const REMIND_AHEAD_MINUTES: i64 = 24 * 60;
 /// 已经提醒过的记录：{"keys": ["课程|标题|2026-11-12 23:59", ...]}
@@ -514,6 +519,57 @@ fn due_parts(item: &Value) -> Option<(NaiveDate, String)> {
     Some((day, clock))
 }
 
+/// 一条作业的稳定标识（和提醒用的那个一致：课程|标题|截止）
+fn item_key(item: &Value) -> String {
+    let due = item
+        .get("due")
+        .or_else(|| item.get("deadline"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .replace('T', " ");
+    format!("{}|{}|{}", item_course(item), item_title(item), due)
+}
+
+/// 已经手工标成「已完成/已提交」的清单
+pub fn done_keys(store: &Store) -> Vec<String> {
+    let raw = store.setting(DONE_KEYS_KEY).unwrap_or_default();
+    let Ok(stored) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    stored
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|one| one.as_str().map(|text| text.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_done_keys(store: &Store, keys: &[String]) {
+    let payload = Value::Array(keys.iter().map(|one| json!(one)).collect());
+    let _ = store.set_setting(DONE_KEYS_KEY, &payload.to_string());
+}
+
+/// 把一条作业标成「已完成/已提交」（`done = false` 取消）；返回新的清单
+pub fn mark_done(store: &Store, key: &str, done: bool) -> Vec<String> {
+    let key = key.trim().to_string();
+    let mut keys = done_keys(store);
+    if key.is_empty() {
+        return keys;
+    }
+    if done {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    } else {
+        keys.retain(|one| one != &key);
+    }
+    save_done_keys(store, &keys);
+    keys
+}
+
 fn item_title(item: &Value) -> String {
     item.get("title")
         .or_else(|| item.get("name"))
@@ -538,10 +594,14 @@ pub fn upcoming(store: &Store, days: i64) -> Value {
     let today = chrono::Local::now().date_naive();
     let horizon = today + Duration::days(days.clamp(1, 180));
     let mut rows: Vec<Value> = Vec::new();
+    let done = done_keys(store);
     for item in cached_items(store) {
         let Some((day, clock)) = due_parts(&item) else {
             continue;
         };
+        if done.contains(&item_key(&item)) {
+            continue;
+        }
         if day > horizon {
             continue;
         }
@@ -552,6 +612,7 @@ pub fn upcoming(store: &Store, days: i64) -> Value {
             continue;
         }
         rows.push(json!({
+            "key": item_key(&item),
             "title": item_title(&item),
             "course": item_course(&item),
             "due": format!("{day} {clock}"),
@@ -647,11 +708,15 @@ pub fn due_reminders(store: &Store, mark: bool) -> Vec<Value> {
         return Vec::new();
     }
     let mut sent = sent_keys(store);
+    let done = done_keys(store);
     let mut out: Vec<Value> = Vec::new();
     for item in cached_items(store) {
         let Some((day, clock)) = due_parts(&item) else {
             continue;
         };
+        if done.contains(&item_key(&item)) {
+            continue;
+        }
         let minutes = minutes_left(day, &clock);
         if minutes <= 0 || minutes > REMIND_AHEAD_MINUTES {
             continue;
@@ -779,6 +844,37 @@ mod tests {
         assert_eq!(left_text(-30), "已过 30 分钟");
         assert_eq!(left_text(-3 * 60), "已过 3 小时");
         assert_eq!(left_text(-50 * 60), "已过 2 天");
+    }
+
+    /// 手工标「已完成」之后：卡片里不出现、也不再提醒；取消标记又能回来
+    #[test]
+    fn done_keys_hide_and_mute() {
+        let _temp = Temp::new("done");
+        let store = Store::open().expect("临时库");
+        let now = chrono::Local::now().naive_local();
+        let soon = now + Duration::hours(2);
+        let due_text = soon.format("%Y-%m-%d %H:%M").to_string();
+        seed(
+            &store,
+            json!([
+                { "course": "程序设计", "title": "实验四", "due": due_text }
+            ]),
+        );
+        // 正常：卡片里有一条、提醒也会提
+        assert_eq!(upcoming(&store, 14)["items"].as_array().unwrap().len(), 1);
+        assert_eq!(due_reminders(&store, false).len(), 1);
+        // 标成已完成
+        let key = upcoming(&store, 14)["items"][0]["key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        mark_done(&store, &key, true);
+        assert_eq!(upcoming(&store, 14)["items"].as_array().unwrap().len(), 0);
+        assert!(due_reminders(&store, false).is_empty(), "已提交的别再提醒");
+        // 取消标记：又回来
+        mark_done(&store, &key, false);
+        assert_eq!(upcoming(&store, 14)["items"].as_array().unwrap().len(), 1);
+        assert_eq!(due_reminders(&store, false).len(), 1);
     }
 
     /// 提醒：进入「截止前 24 小时」才提，同一份作业只提一次（跨过半夜也不重复）

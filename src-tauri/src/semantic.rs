@@ -379,16 +379,22 @@ pub fn rank(store: &Store, query_f32: &[f32], limit: usize) -> Value {
 pub fn status(store: &Store) -> Value {
     ensure_schema(store);
     let indexed = count(store);
-    let conn = store.connection();
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM papers", [], |row| row.get(0))
-        .unwrap_or(0);
+    // ⚠️ 这里的连接必须自己用完就放：`store.connection()` 是**不可重入**的锁，
+    // 手里拿着它再去 `count()` / `account::logged_in()`（内部都会再要一次连接）
+    // 会直接死锁 —— 2026-11-12 用户报「进文献库后点什么都卡死」就是这个原因：
+    // `papers_semantic_status` 一挂，全局那把锁不释放，后面所有命令都排队等死。
+    let total: i64 = {
+        let conn = store.connection();
+        conn.query_row("SELECT COUNT(*) FROM papers", [], |row| row.get(0))
+            .unwrap_or(0)
+    };
+    let logged_in = crate::account::logged_in(store);
     json!({
         "ok": true,
         "indexed": indexed,
         "papers": total,
         "need_index": (indexed as i64) < total,
-        "logged_in": crate::account::logged_in(store),
+        "logged_in": logged_in,
     })
 }
 
@@ -576,6 +582,31 @@ mod tests {
 
         match previous {
             Some(value) => std::env::set_var("LUMINA_DATA_DIR", value),
+            None => std::env::remove_var("LUMINA_DATA_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `status()` 曾因为「拿着连接又去要连接」而永久阻塞，连带把整个 App 卡死。
+    /// 这个用例只要挂住就说明又犯了同一个毛病（= 回归）。
+    #[test]
+    fn status_does_not_deadlock() {
+        let dir = std::env::temp_dir().join(format!(
+            "danlume-semantic-status-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("LUMINA_DATA_DIR");
+        std::env::set_var("LUMINA_DATA_DIR", &dir);
+        let store = Store::open().expect("临时库");
+        ensure_schema(&store);
+        // 真死锁的话这一行永远不会返回（用例挂住 = 回归）
+        let value = status(&store);
+        assert_eq!(value["ok"], json!(true), "{value}");
+        assert_eq!(value["indexed"], json!(0));
+        match previous {
+            Some(saved) => std::env::set_var("LUMINA_DATA_DIR", saved),
             None => std::env::remove_var("LUMINA_DATA_DIR"),
         }
         let _ = std::fs::remove_dir_all(&dir);

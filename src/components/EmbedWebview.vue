@@ -35,7 +35,13 @@ function watchSlowLoad() {
   window.clearTimeout(slowTimer);
   slow.value = false;
   slowTimer = window.setTimeout(() => {
-    if (ready.value) slow.value = true;
+    if (!ready.value) return;
+    slow.value = true;
+    // 这条只是提醒，别一直挂着：8 秒是「可能被挡」，再过 12 秒就自己收掉
+    // （页面其实已经出来了、但 embed:loaded 事件没收到时会一直停在那里 —— 2026-11-12 实测）
+    window.setTimeout(() => {
+      slow.value = false;
+    }, 12000);
   }, 8000);
 }
 

@@ -4,16 +4,11 @@
 //! 不需要任何 Tauri 权限。这里只剩一件事后端才做得动：
 //! 「被站点禁止嵌入（X-Frame-Options / CSP）时，用系统默认浏览器打开」。
 
-/// 用系统默认浏览器打开一个 http(s) 地址。
+/// 校验一个地址能不能打开（**纯函数**：不碰系统、不开浏览器，方便单测）
 ///
 /// 只收 http / https：别的协议（file:、javascript:…）一律拒绝，
 /// 免得设置里写错一行就变成「随便执行点什么」。
-///
-/// Windows 上不再走 `cmd /C start "" "<url>"`：`std::process::Command` 会自己给参数加引号，
-/// 于是那对人工加的引号变成了字面上的 `\"`，用户看到的是
-/// 「Windows 找不到文件 '\https://…\ '」（2026-11-12 用户实测截图）。
-/// 改成直接调 ShellExecuteW：参数原样交给系统，地址里的 `&` 也不会被当成命令分隔符。
-pub fn open_url(url: &str) -> Result<(), String> {
+pub fn validate_url(url: &str) -> Result<&str, String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Err("地址是空的：先在 设置 → AI → 网页版面板 里填一个 http(s) 地址".to_string());
@@ -25,6 +20,17 @@ pub fn open_url(url: &str) -> Result<(), String> {
     if trimmed.contains('\n') || trimmed.contains('\r') {
         return Err("地址里有换行，不打开".to_string());
     }
+    Ok(trimmed)
+}
+
+/// 用系统默认浏览器打开一个 http(s) 地址。
+///
+/// Windows 上不再走 `cmd /C start "" "<url>"`：`std::process::Command` 会自己给参数加引号，
+/// 于是那对人工加的引号变成了字面上的 `\"`，用户看到的是
+/// 「Windows 找不到文件 '\https://…\ '」（2026-11-12 用户实测截图）。
+/// 改成直接调 ShellExecuteW：参数原样交给系统，地址里的 `&` 也不会被当成命令分隔符。
+pub fn open_url(url: &str) -> Result<(), String> {
+    let trimmed = validate_url(url)?;
     #[cfg(windows)]
     {
         use windows::core::HSTRING;
@@ -55,17 +61,27 @@ pub fn open_url(url: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// 只测**校验**，绝对不要在这几个用例里真调 `open_url`：
+    /// 那会在用户桌面上弹浏览器（2026-11-12 用户：「干什么老在浏览器里访问 a.com」）。
     #[test]
-    fn rejects_non_http_urls() {
-        for bad in ["", "   ", "file:///C:/Windows/System32", "javascript:alert(1)", "chat.deepseek.com"] {
-            let result = open_url(bad);
-            println!("{bad:?} → {result:?}");
-            assert!(result.is_err(), "{bad:?} 应该被拒绝");
+    fn validate_rejects_non_http_urls() {
+        for bad in [
+            "",
+            "   ",
+            "file:///C:/Windows/System32",
+            "javascript:alert(1)",
+            "chat.deepseek.com",
+        ] {
+            assert!(validate_url(bad).is_err(), "{bad:?} 应该被拒绝");
         }
         // 换行要挡掉
-        assert!(open_url("https://a.com/\nx").is_err());
+        assert!(validate_url("https://a.com/\nx").is_err());
         // 带引号和 & 的地址不该被我们自己拦掉（现在没走 cmd，不需要人工加引号）
-        assert!(open_url("https://a.com/\"x").is_ok());
-        assert!(open_url("https://a.com/?a=1&b=2").is_ok());
+        assert!(validate_url("https://a.com/\"x").is_ok());
+        assert!(validate_url("https://a.com/?a=1&b=2").is_ok());
+        assert_eq!(
+            validate_url("  https://elearning.fudan.edu.cn/courses/1  ").unwrap(),
+            "https://elearning.fudan.edu.cn/courses/1"
+        );
     }
 }

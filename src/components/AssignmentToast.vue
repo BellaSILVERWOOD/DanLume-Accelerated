@@ -6,7 +6,8 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import SoftButton from "../components/SoftButton.vue";
 import IconBadge from "../components/IconBadge.vue";
-import { elearnDueReminders, onElearnDue, openUrl, type DueAssignment } from "../api";
+import { elearnDueReminders, onElearnDue, type DueAssignment } from "../api";
+import { openInAppBrowser } from "../lib/appBus";
 
 import type { DueAssignment as DueItem } from "../api";
 
@@ -22,8 +23,9 @@ function push(rows: DueItem[]) {
   if (items.value.length > 3) items.value = items.value.slice(-3);
 }
 
-async function open(item: DueItem) {
-  if (item.url) void openUrl(item.url);
+function open(item: DueItem) {
+  // 用户 2026-11-12：这里要用**应用内置**的浏览器打开，不是系统浏览器
+  if (item.url) openInAppBrowser(item.url);
   dismiss(item);
 }
 

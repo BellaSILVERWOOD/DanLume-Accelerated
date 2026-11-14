@@ -26,6 +26,7 @@ import Placeholder from "./pages/Placeholder.vue";
 import { apply as applyTheme, loadFromSettings } from "./theme";
 import { panelFullscreen, setPanelFullscreen } from "./layout/fullscreen";
 import { pendingMascot } from "./lib/mascotBus";
+import { pendingPage } from "./lib/appBus";
 import { accountState, bootInfo, eventsOn, focusStart, focusStatus, focusStop, mailAccountState, mascotOpen, onMascotSend, settingsAll, settingsSave, upcomingEvents, type UpcomingItem } from "./api";
 
 /**
@@ -104,6 +105,17 @@ onMounted(async () => {
 
 
 const current = ref<PageKey>("dashboard");
+
+// 别处（作业提醒卡片等）想让界面切到某一页时，走这条信箱
+watch(pendingPage, (value) => {
+  if (!value) return;
+  current.value = value as PageKey;
+  if (!middleVisible.value) {
+    middleVisible.value = true;
+    void settingsSave({ sidebar_open: "1" });
+  }
+  pendingPage.value = null;
+});
 const middleVisible = ref(true);
 const dockVisible = ref(true);
 // 窗口布局记忆（旧版 sidebar_open / middle_width / pane_dock / agenda_*）

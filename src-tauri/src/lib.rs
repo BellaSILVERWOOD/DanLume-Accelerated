@@ -14,6 +14,7 @@ mod docs;
 mod elearn;
 mod ehall_grab;
 mod embed;
+mod exams;
 mod endnote;
 mod ehall_remote;
 mod focus;
@@ -1648,6 +1649,87 @@ fn homework_write_deadlines(force: Option<bool>, state: State<'_, AppState>) -> 
     elearn::write_deadlines(get_store(), force.unwrap_or(true))
 }
 
+/// 导入考试安排：在已登录的窗口里打开教务「我的考试」，把表格行读出来（J2-1）
+///
+/// 和课程表一样：教务的票是页面自己换的，进程内复现会被弹回登录页，
+/// 所以在**登录窗口**里落到考试页，用 JS 把页面已经渲染出来的表格读回来
+/// （对应旧版 `exam_dialog.py` + `exams.py` 的 `PAGE_JS`）。
+///
+/// * `commit = false`：只把读到的条目返回（前端先摆给人看，确认后再写）；
+/// * `commit = true`：写进日历（提前 60 分钟提醒）+ 建「重要日」倒计时。
+#[tauri::command]
+async fn exams_import(
+    app: tauri::AppHandle,
+    commit: Option<bool>,
+    as_important: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let handle = app.clone();
+    let handle_for_task = app.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        open_uis_window(&handle_for_task)?;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let Some(window) = handle_for_task.get_webview_window("uis-login") else {
+            return Err("登录窗口没起来".to_string());
+        };
+        let mut last_error = String::new();
+        for url in crate::exams::EXAM_URLS {
+            let target: tauri::Url = match url.parse() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if window.navigate(target).is_err() {
+                continue;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(4500));
+            let landed = window
+                .url()
+                .map(|one| one.to_string())
+                .unwrap_or_default();
+            uis_log(&format!("[exams] 考试页落地：{}", shorten_url(&landed)));
+            if landed.contains("id.fudan.edu.cn") {
+                last_error =
+                    "教务又跳到统一身份认证了：先在弹出的登录窗口里登录一次，再点「导入考试」"
+                        .to_string();
+                break;
+            }
+            let Some(raw) = eval_json(&window, crate::exams::PAGE_JS) else {
+                last_error = format!("考试页没响应（{url}）");
+                continue;
+            };
+            let items = crate::exams::parse_exams(&raw);
+            if items.is_empty() {
+                last_error = format!("{url} 上没读到考试行（这个学期可能还没排考试）");
+                continue;
+            }
+            if !commit.unwrap_or(false) {
+                return Ok(json!({
+                    "ok": true,
+                    "items": items,
+                    "committed": false,
+                    "url": landed,
+                    "title": raw.get("title").and_then(|one| one.as_str()).unwrap_or(""),
+                }));
+            }
+            let written = crate::exams::add_exams(get_store(), &items, as_important.unwrap_or(true));
+            return Ok(json!({
+                "ok": true,
+                "items": items,
+                "committed": true,
+                "result": written,
+                "url": landed,
+            }));
+        }
+        Err(last_error)
+    })
+    .await;
+    let _ = handle;
+    match outcome {
+        // 内层已经是 Result<Value, String>：读不到考试页就把那句人话原样交给前端
+        Ok(inner) => inner,
+        Err(exc) => Ok(json!({ "ok": false, "error": format!("导入考试的任务没跑起来：{exc}") })),
+    }
+}
+
 /// 日历页右侧「作业截止」卡：未来 N 天内的截止时间（数据是缓存里的，不联网）
 ///
 /// 用户 2026-11-12：eLearning 的 `/dash` 上有作业截止时间，想直接摆在日历页。
@@ -1655,6 +1737,16 @@ fn homework_write_deadlines(force: Option<bool>, state: State<'_, AppState>) -> 
 fn homework_upcoming(days: Option<i64>, state: State<'_, AppState>) -> serde_json::Value {
     let _ = &state;
     elearn::upcoming(get_store(), days.unwrap_or(14))
+}
+
+/// 把一条作业标成「已完成 / 已提交」（`done = false` 取消）
+///
+/// 用户 2026-11-12：有时候其实已经交了，不想再被提醒 —— 标掉就不再出现在卡片里、也不再提醒。
+#[tauri::command]
+fn homework_mark_done(key: String, done: Option<bool>, state: State<'_, AppState>) -> serde_json::Value {
+    let _ = &state;
+    let keys = elearn::mark_done(get_store(), &key, done.unwrap_or(true));
+    json!({ "ok": true, "done_keys": keys })
 }
 
 /// 快到截止时间的作业（`mark = true` 就记成「这条提过了」）
@@ -5086,7 +5178,9 @@ pub fn run() {
             papers_semantic_index,
             papers_semantic_search,
             homework_upcoming,
+            homework_mark_done,
             elearn_due_reminders,
+            exams_import,
             refs_list,
             refs_import,
             refs_add_doi,

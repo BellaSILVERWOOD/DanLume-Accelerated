@@ -4,11 +4,12 @@
 // 旧版是「网页页 / 列表页」两页切换，默认停在网页页（作业要提交就得在网页里点），
 // 这里用同样的做法：`view = 'web'` 时贴一个子 Webview，`view = 'list'` 时显示清单。
 // 「打开」按 索引 → 附件名 → 作业名 → 同课程编号 找本地文件；截止时间一键写进日程。
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import SoftButton from "../components/SoftButton.vue";
 import Pill from "../components/Pill.vue";
 import IconBadge from "../components/IconBadge.vue";
 import EmbedWebview from "../components/EmbedWebview.vue";
+import { pendingEmbedUrl } from "../lib/appBus";
 import {
   homeworkClassify,
   homeworkItems,
@@ -24,6 +25,8 @@ import {
 // 的入口（注入的自动填表脚本会把学号密码填好并点登录）。`/` 在未登录时只是欢迎页，
 // 已登录时却停在欢迎页上（用户看到「欢迎使用 eLearning」会以为没登进去）。
 const ELEARNING_URL = "https://elearning.fudan.edu.cn/login";
+// 内置浏览器当前地址：默认 eLearning 首页；别处（作业提醒卡片）可以指定打开某次作业
+const embedUrl = ref(ELEARNING_URL);
 
 const courses = ref<HomeworkCourse[]>([]);
 const total = ref(0);
@@ -34,6 +37,18 @@ const busy = ref(false);
 const syncedAt = ref("");
 /** 和旧版一样：默认看网页（交作业、看课件都在网页里），点「看列表」才切到清单 */
 const view = ref<"web" | "list">("web");
+
+// 信箱：作业提醒卡片让我「打开某次作业」时，用内置浏览器直接落到那个地址。
+// 注意顺序 —— 这段必须放在 `view` / `embedUrl` 都定义好之后，
+// 否则 `takePendingUrl()` 里给 `view` 赋值会踩 TDZ，整个页面白屏（2026-11-12 踩过）。
+const takePendingUrl = () => {
+  if (!pendingEmbedUrl.value) return;
+  embedUrl.value = pendingEmbedUrl.value;
+  pendingEmbedUrl.value = "";
+  view.value = "web";
+};
+takePendingUrl();
+watch(pendingEmbedUrl, takePendingUrl);
 
 /**
  * 没归类的文件：从浏览器里手动下载的那些（`03《物种起源》.pdf`、Canvas 用附件 id 当
@@ -214,7 +229,7 @@ onMounted(load);
     </div>
 
     <div v-if="view === 'web'" class="web-host">
-      <EmbedWebview :key="'elearn'" kind="elearning" :url="ELEARNING_URL" home-label="eLearning 首页" />
+      <EmbedWebview :key="'elearn'" kind="elearning" :url="embedUrl" home-label="eLearning 首页" />
     </div>
 
     <div v-else class="list">
