@@ -328,6 +328,13 @@ const focus = ref<{ active: boolean; remaining: number; label: string; over: boo
   over: false,
 });
 
+// 全屏倒计时（用户 2026-11-15：AI 用工具开了专注之后要能看见计时，且可以全屏）
+const focusFull = ref(false);
+// 选时长的小面板（方案 A）与自定义输入
+const focusPick = ref(false);
+const focusCustom = ref("25");
+const FOCUS_PRESETS = [15, 25, 45, 60];
+
 async function refreshFocus() {
   try {
     const state = await focusStatus();
@@ -337,6 +344,8 @@ async function refreshFocus() {
       label: state.label || "",
       over: state.over,
     };
+    // 一轮结束后自动退出全屏，别把整屏留在那儿
+    if (!state.active) focusFull.value = false;
   } catch {
     // 读不到就不显示
   }
@@ -348,16 +357,32 @@ async function toggleFocus() {
     await refreshFocus();
     return;
   }
-  let minutes = 25;
+  // 用户 2026-11-15：点左侧按钮先选时长（方案 A），不再闷着用 25 分钟
+  focusPick.value = !focusPick.value;
+}
+
+/** 选好时长就开一轮，并把这次的选择记回 focus_minutes（下次默认用它） */
+async function startFocus(minutes: number) {
+  const value = Math.min(600, Math.max(1, Math.round(minutes || 25)));
+  focusPick.value = false;
+  await focusStart(value);
+  void settingsSave({ focus_minutes: String(value) });
+  await refreshFocus();
+}
+
+function toggleFocusFull() {
+  focusFull.value = !focusFull.value;
+}
+
+/** 拉设置里的默认时长（面板里的输入框初值） */
+async function loadFocusDefaults() {
   try {
     const all = await settingsAll();
     const given = Number((all.values || {})["focus_minutes"] || 0);
-    if (given > 0) minutes = given;
+    if (given > 0) focusCustom.value = String(given);
   } catch {
-    // 用默认
+    // 用默认 25
   }
-  await focusStart(minutes);
-  await refreshFocus();
 }
 
 function focusText(): string {
@@ -370,11 +395,26 @@ function focusText(): string {
 let focusTimer: number | null = null;
 onMounted(() => {
   void refreshFocus();
-  focusTimer = window.setInterval(refreshFocus, 15000);
+  void loadFocusDefaults();
+  // 1 秒一次：以前 15 秒一跳，AI 用工具开了专注之后要等半天才出现，计时也像卡住
+  focusTimer = window.setInterval(refreshFocus, 1000);
+  // Esc 退出全屏：挂在 window 上，焦点在页面任何地方都灵（2026-11-15）
+  window.addEventListener("keydown", onFocusKey);
 });
 onUnmounted(() => {
   if (focusTimer !== null) window.clearInterval(focusTimer);
+  window.removeEventListener("keydown", onFocusKey);
 });
+
+function onFocusKey(event: KeyboardEvent) {
+  if (event.key !== "Escape") return;
+  if (focusFull.value) {
+    event.preventDefault();
+    focusFull.value = false;
+  } else if (focusPick.value) {
+    focusPick.value = false;
+  }
+}
 
 /**
  * 栏开关：中栏是页面内容、右栏是 AI/日程。
@@ -538,13 +578,38 @@ onUnmounted(() => window.removeEventListener("keydown", onFullscreenKey));
       />
     </div>
 <button
-  v-if="focus.active"
+  v-if="focus.active && !focusFull"
   class="focus-chip"
   :title="focus.label || '专注中'"
   @click="toggleFocus"
 >
-  {{ focusText() }}
+  <span class="fc-dot" :class="{ over: focus.over }" />
+  <span class="fc-time">{{ focusText() }}</span>
+  <span class="fc-label">{{ focus.label || "专注中" }}</span>
+  <span class="fc-full" title="全屏计时" @click.stop="focusFull = true">⛶</span>
 </button>
+<!-- 点左侧「专注模式」先选时长（方案 A：15/25/45/60 + 自定义，选完记进 focus_minutes） -->
+<div v-if="focusPick && !focus.active" class="focus-pick" @click.self="focusPick = false">
+  <div class="fp-title">这一轮专注多久？</div>
+  <div class="fp-presets">
+    <button v-for="m in FOCUS_PRESETS" :key="m" class="fp-btn" @click="startFocus(m)">{{ m }} 分钟</button>
+  </div>
+  <div class="fp-custom">
+    <input v-model="focusCustom" type="number" min="1" max="600" class="fp-input" />
+    <button class="fp-btn primary" @click="startFocus(Number(focusCustom))">开始</button>
+  </div>
+  <div class="fp-hint">选过的时长会记住，下次点「专注模式」直接用它</div>
+</div>
+<!-- 全屏倒计时（Esc 或点「退出全屏」回来；结束本轮才真结束） -->
+<div v-if="focus.active && focusFull" class="focus-full" @click.self="toggleFocusFull">
+  <div class="ff-label">{{ focus.label || "专注中" }}</div>
+  <div class="ff-time" :class="{ over: focus.over }">{{ focusText() }}</div>
+  <div class="ff-hint">{{ focus.over ? "已经走神了，回来吧" : "专心做事；Esc 或点空白退出全屏" }}</div>
+  <div class="ff-actions">
+    <button class="ff-btn" @click="toggleFocusFull">退出全屏</button>
+    <button class="ff-btn danger" @click="toggleFocus">结束本轮</button>
+  </div>
+</div>
     <Mascot
       v-if="mascotOn"
       :style="mascotStyle"
@@ -670,4 +735,176 @@ onUnmounted(() => window.removeEventListener("keydown", onFullscreenKey));
 .workspace {
   width: 100%;
   align-self: stretch;
-}</style>
+}
+
+/* 专注计时胶囊：固定在右上角（用户 2026-11-15：以前这里完全没样式，等于看不见） */
+.focus-chip {
+  position: fixed;
+  right: 18px;
+  top: 52px;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 16px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 12%, var(--card));
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+}
+.focus-chip .fc-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: fc-blink 1.6s ease-in-out infinite;
+}
+.focus-chip .fc-dot.over {
+  background: var(--danger);
+}
+.focus-chip .fc-time {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.focus-chip .fc-label {
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-soft);
+}
+.focus-chip .fc-full {
+  padding: 0 2px;
+  color: var(--muted);
+}
+.focus-chip .fc-full:hover {
+  color: var(--accent);
+}
+@keyframes fc-blink {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+/* 全屏倒计时（点胶囊上的 ⛶ 进来，Esc 退出） */
+.focus-full {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  /* 跟着主题走：浅色就用浅底，别再写死深色（用户 2026-11-15） */
+  background: color-mix(in srgb, var(--card) 96%, transparent);
+  backdrop-filter: blur(10px);
+  color: var(--text);
+}
+.focus-full .ff-label {
+  font-size: 15px;
+  color: var(--text-soft);
+  letter-spacing: 1px;
+}
+.focus-full .ff-time {
+  font-size: 118px;
+  line-height: 1;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 2px;
+  color: var(--accent);
+}
+.focus-full .ff-time.over {
+  color: var(--danger);
+}
+.focus-full .ff-hint {
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.focus-full .ff-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 6px;
+}
+.focus-full .ff-btn {
+  height: 34px;
+  padding: 0 16px;
+  border-radius: 17px;
+  border: 1px solid var(--border-soft);
+  background: var(--card);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.focus-full .ff-btn.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+/* 选专注时长的小面板（方案 A） */
+.focus-pick {
+  position: fixed;
+  inset: 0;
+  z-index: 210;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: color-mix(in srgb, var(--card) 88%, transparent);
+  backdrop-filter: blur(8px);
+  color: var(--text);
+}
+.focus-pick .fp-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+.focus-pick .fp-presets {
+  display: flex;
+  gap: 10px;
+}
+.focus-pick .fp-btn {
+  height: 36px;
+  padding: 0 18px;
+  border-radius: 18px;
+  border: 1px solid var(--border-soft);
+  background: var(--card);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.focus-pick .fp-btn:hover,
+.focus-pick .fp-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.focus-pick .fp-custom {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.focus-pick .fp-input {
+  width: 92px;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border-soft);
+  background: var(--card);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: center;
+}
+.focus-pick .fp-hint {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+</style>

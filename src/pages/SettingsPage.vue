@@ -77,6 +77,9 @@ import {
   uisOpenLogin,
   uisStatus,
   setSetting,
+  usageStatus,
+  usageReportNow,
+  onUsageNotice,
   type AiProfile,
   type AiState,
   type DataImportResult,
@@ -157,6 +160,76 @@ async function closeMascot() {
     mascotMsg.value = "已关掉梅子";
   } catch (err) {
     mascotMsg.value = `关掉失败：${String(err)}`;
+  }
+}
+
+/* ---------------- 使用上报（J2-16） ---------------- */
+const usageMsg = ref("");
+const usageBusy = ref(false);
+const usageInfo = ref<{
+  enabled: boolean;
+  logged_in?: boolean;
+  last_at?: string;
+  action?: string;
+  flag_count?: number;
+  ban_reason?: string;
+  snapshot?: { used_seconds?: number; requests?: number; day?: string };
+} | null>(null);
+
+function usageClock(seconds?: number): string {
+  const total = Math.max(0, Math.round(seconds || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.round((total % 3600) / 60);
+  if (!hours) return `${minutes} 分钟`;
+  return minutes ? `${hours} 小时 ${minutes} 分钟` : `${hours} 小时`;
+}
+
+const usageText = computed(() => {
+  const info = usageInfo.value;
+  if (!info) return "（还没读）";
+  const used = usageClock(info.snapshot?.used_seconds);
+  const parts = [`今天 ${info.snapshot?.day || ""} 用了 ${used}`, `请求 ${info.snapshot?.requests ?? 0} 次`];
+  if (!info.enabled) parts.push("上报已关闭");
+  else if (info.logged_in) parts.push("会发到 DanLume 账号服务器");
+  else parts.push("没登录账号，只在本机记着");
+  if (info.last_at) parts.push(`上次上报 ${info.last_at.slice(5, 16)}`);
+  if (info.action && info.action !== "ok") {
+    const word = info.action === "ban" ? "已封号" : info.action === "warn" ? "被警告" : "被提醒";
+    parts.push(`${word}（累计 ${info.flag_count ?? 0} 次）`);
+  }
+  return parts.join(" · ");
+});
+
+async function loadUsage() {
+  try {
+    usageInfo.value = await usageStatus();
+  } catch {
+    usageInfo.value = null;
+  }
+}
+
+async function usageNow() {
+  if (usageBusy.value) return;
+  usageBusy.value = true;
+  usageMsg.value = "正在上报…";
+  try {
+    const result = await usageReportNow();
+    const word =
+      result.action === "ban"
+        ? "服务器判了封号"
+        : result.action === "warn"
+          ? "服务器给了警告"
+          : result.action === "remind"
+            ? "服务器给了提醒"
+            : result.action === "ok"
+              ? "上报完成，一切正常"
+              : "没发出去";
+    usageMsg.value = `${word}：${result.message || ""}`.trim();
+    await loadUsage();
+  } catch (err) {
+    usageMsg.value = `上报失败：${String(err)}`;
+  } finally {
+    usageBusy.value = false;
   }
 }
 
@@ -868,6 +941,22 @@ const cards: CardDef[] = [
     actions: ["save"],
   },
   {
+    key: "usage",
+    title: "使用上报",
+    subtitle:
+      "只报「今天用了多久、点了多少次」；判罚只有三条：时长超限 / 同一台设备换账号 / 账号名对不上令牌。不限制 AI 接口调用",
+    category: "其他",
+    fields: [
+      {
+        label: "允许上报",
+        kind: "switch",
+        key: "report_enabled",
+        hint: "关掉就完全不上报（本机统计还在）；登录了 DanLume 账号才会真的发到服务器",
+      },
+    ],
+    actions: ["save"],
+  },
+  {
     key: "mailwatch",
     title: "盯邮箱（只盯指定发件人）",
     subtitle:
@@ -1324,6 +1413,13 @@ onMounted(async () => {
   await refreshMemories();
   info.value = await dataInfo();
   void refreshAdminFlag();
+  void loadUsage();
+  // 后台线程报上去、服务器判了提醒/警告/封号时会把结果推过来：卡片跟着刷新
+  void onUsageNotice((payload) => {
+    const data = payload as { action?: string; message?: string } | null;
+    if (data && data.message) usageMsg.value = data.message;
+    void loadUsage();
+  });
 });
 
 /**
@@ -1928,6 +2024,27 @@ async function refreshAdminFlag() {
             </div>
           </template>
 
+          <!-- 使用上报（J2-16）：状态 + 立刻上报一次 -->
+          <template v-if="card.key === 'usage'">
+            <div class="field">
+              <div class="label">现在</div>
+              <div class="control">
+                <span class="hint">{{ usageText }}</span>
+                <span v-if="usageMsg" class="hint">{{ usageMsg }}</span>
+                <div class="row-actions">
+                  <SoftButton :height="28" :font-size="12" :disabled="usageBusy" @click="usageNow">
+                    {{ usageBusy ? "正在上报…" : "立刻上报一次" }}
+                  </SoftButton>
+                  <SoftButton :height="28" :font-size="12" @click="loadUsage">刷新状态</SoftButton>
+                </div>
+                <span class="hint">
+                  判罚只有三条：当天时长超过服务器的上限、同一台设备短时间换账号、上报的账号名和令牌对不上。
+                  第 1 次提醒、第 2–3 次警告、第 4 次起封号（服务器封了这里也能看到）
+                </span>
+              </div>
+            </div>
+          </template>
+
           <!-- 看板娘：立即应用大小 / 打开 / 关掉 -->
           <template v-if="card.key === 'mascot'">
             <div class="field">
@@ -1940,7 +2057,12 @@ async function refreshAdminFlag() {
                   <SoftButton :height="28" :font-size="12" @click="openMascot">打开梅子</SoftButton>
                   <SoftButton :height="28" :font-size="12" @click="closeMascot">关掉梅子</SoftButton>
                 </div>
-                <span class="hint">{{ mascotMsg || "改完大小记得点「立即应用大小」；也可以直接关了重开" }}</span>
+                <span class="hint"
+                  >{{
+                    mascotMsg ||
+                    "改完大小记得点「立即应用大小」；也可以直接关了重开。开着的时候关主窗口只会缩到托盘，梅子仍留在桌面上（下次启动也会自己出来）"
+                  }}</span
+                >
               </div>
             </div>
           </template>

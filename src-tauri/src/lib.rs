@@ -2757,11 +2757,35 @@ async fn student_notice_send(id: i64, state: State<'_, AppState>) -> Result<Valu
 
 // ---------------------------------------------------------------- 看板娘悬浮球（T2）
 
+/// 桌面看板娘「开着」的状态（用户 2026-11-15：关主窗口缩到托盘时，梅子要留在桌面上；
+/// 下次启动也自己回来）。默认关，从设置 / 托盘打开一次就记住。
+const MASCOT_DESKTOP_KEY: &str = "mascot_desktop";
+
+fn mascot_desktop_on(store: &Store) -> bool {
+    mascot_flag_on(store.setting(MASCOT_DESKTOP_KEY))
+}
+
+/// 设置原文 → 布尔（没设过 / 空 = 关；"0" = 关；其它 = 开）
+fn mascot_flag_on(raw: Option<String>) -> bool {
+    match raw {
+        Some(text) => {
+            let text = text.trim().to_string();
+            !text.is_empty() && text != "0"
+        }
+        None => false,
+    }
+}
+
+fn remember_mascot_desktop(on: bool) {
+    let _ = get_store().set_setting(MASCOT_DESKTOP_KEY, if on { "1" } else { "0" });
+}
+
 /// 打开/显示桌面的看板娘小窗（置顶、无边框、不占任务栏）
 ///
 /// 用户 2026-11-12：要一个悬浮球，把文件或文字拖到上面就能直接发给 AI。
 #[tauri::command]
 fn mascot_open(app: tauri::AppHandle) -> Result<(), String> {
+    remember_mascot_desktop(true);
     if let Some(win) = app.get_webview_window("mascot") {
         let _ = win.show();
         let _ = win.set_focus();
@@ -2828,6 +2852,7 @@ fn mascot_resize(app: tauri::AppHandle, state: State<'_, AppState>) -> serde_jso
 /// 关掉看板娘小窗
 #[tauri::command]
 fn mascot_close(app: tauri::AppHandle) -> Result<(), String> {
+    remember_mascot_desktop(false);
     if let Some(win) = app.get_webview_window("mascot") {
         let _ = win.close();
     }
@@ -3983,15 +4008,29 @@ fn usage_report_now(state: State<'_, AppState>) -> serde_json::Value {
 }
 
 /// 后台每 5 分钟看一次，到点（默认 10 分钟）才真的发
-fn spawn_usage_watcher() {
-    std::thread::spawn(|| {
+///
+/// J2-16：服务器判了「提醒 / 警告 / 封号」要**立刻让用户知道** —— 弹系统通知，
+/// 同时发 `usage:notice` 事件给前端（缩在托盘里也看得到）。
+fn spawn_usage_watcher(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(90));
         loop {
             {
                 let store = get_store();
                 if crate::usage::due(store) {
                     let result = crate::usage::send(store);
-                    if result["ok"] != true {
+                    let action = result["action"].as_str().unwrap_or("ok").to_string();
+                    if crate::usage::needs_notice(&action) {
+                        let title = if action == "ban" {
+                            "DanLume 账号已被停用"
+                        } else {
+                            "DanLume 使用提醒"
+                        };
+                        let body = result["message"].as_str().unwrap_or("").to_string();
+                        notify_desktop(&app, title, &body);
+                        let _ = app.emit_to("main", "usage:notice", result.clone());
+                        println!("[上报] {action}：{body}");
+                    } else if result["ok"] != true {
                         println!("[上报] {}", result["message"]);
                     }
                 }
@@ -5274,7 +5313,6 @@ pub fn run() {
     }
     spawn_timetable_watcher();
     spawn_notice_watcher();
-    spawn_usage_watcher();
     let _ = NaiveTime::from_hms_opt(9, 0, 0);
 
     tauri::Builder::default()
@@ -5282,6 +5320,8 @@ pub fn run() {
         .setup(|app| {
             // 服务器公告：登录后按 20 秒长轮询拉 /announcements，新公告走 danlume://announcement 事件
             crate::notify::spawn(app.handle().clone());
+            // 使用上报的后台线程（J2-16：服务器判了提醒/警告/封号就弹通知）
+            spawn_usage_watcher(app.handle().clone());
             // 验收钩子：DANLUME_GRAB_TEST=<key> 时启动就抓一次，验证整条回传链路
             if let Ok(key) = std::env::var("DANLUME_GRAB_TEST") {
                 let handle = app.handle().clone();
@@ -5337,11 +5377,13 @@ pub fn run() {
                             "quit" => quit_handle.exit(0),
                             // 看板娘白屏时页面上没有可点的 ×，这里一定关得掉（2026-11-14）
                             "mascot-close" => {
+                                remember_mascot_desktop(false);
                                 if let Some(win) = menu_handle.get_webview_window("mascot") {
                                     let _ = win.close();
                                 }
                             }
                             "mascot" => {
+                                remember_mascot_desktop(true);
                                 if let Some(win) = menu_handle.get_webview_window("mascot") {
                                     let _ = win.show();
                                     let _ = win.set_focus();
@@ -5386,10 +5428,43 @@ pub fn run() {
                                 if let Some(win) = handle.get_webview_window("main") {
                                     let _ = win.hide();
                                 }
+                                // 看板娘留在桌面上（用户 2026-11-15）：窗口还在就亮一下；
+                                // 不在了（被关过/崩过）就重开一个 —— 开窗口必须离开事件回调线程，
+                                // 在主线程里 build webview 会把消息泵卡住（_待办清单.md「坑」）。
+                                if mascot_desktop_on(get_store()) {
+                                    match handle.get_webview_window("mascot") {
+                                        Some(win) => {
+                                            let _ = win.show();
+                                            let _ = win.set_always_on_top(true);
+                                        }
+                                        None => {
+                                            let again = handle.clone();
+                                            std::thread::spawn(move || {
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_millis(150),
+                                                );
+                                                if let Err(err) = mascot_open(again) {
+                                                    eprintln!("[mascot] 缩托盘后重开失败：{err}");
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
                             }
                         }
                     });
                 }
+            }
+            // 上次是「开着看板娘」的状态 → 这次启动自己回来（配合关窗缩托盘）
+            if mascot_desktop_on(get_store()) {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    match mascot_open(handle) {
+                        Ok(()) => eprintln!("[mascot] 上次是开着的，已自动恢复"),
+                        Err(err) => eprintln!("[mascot] 启动恢复失败：{err}"),
+                    }
+                });
             }
             // 验收/调试钩子：DANLUME_OPEN_MASCOT=1 时启动 2 秒后自动弹出看板娘小窗
             // （小窗没有侧边栏，靠界面设置脚本找不到入口时就靠它）
@@ -6154,6 +6229,17 @@ mod mail_summary_tests {
         let raw = "```\n## 摘要\n· 教务处通知选课\n**要做：** 周五前选课\n---\n```";
         let text = mail_clean_summary(raw);
         assert_eq!(text, "摘要\n· 教务处通知选课\n要做： 周五前选课", "{text}");
+    }
+
+    /// 看板娘「开着」的状态（用户 2026-11-15 要的：关窗缩托盘时梅子留在桌面上，
+    /// 下次启动自己回来）：设置缺省 / 空 / "0" 都算关，其余算开
+    #[test]
+    fn mascot_desktop_flag_parsing() {
+        assert!(!mascot_flag_on(None), "没设过 = 关");
+        assert!(!mascot_flag_on(Some("0".to_string())));
+        assert!(!mascot_flag_on(Some("   ".to_string())), "空串当没设");
+        assert!(mascot_flag_on(Some("1".to_string())));
+        assert!(mascot_flag_on(Some(" 1 ".to_string())), "带空格也认");
     }
 
     /// 模型给的日程 JSON：能从代码块里抠出来，字段也对得上

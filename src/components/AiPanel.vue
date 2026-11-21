@@ -62,12 +62,28 @@ import { pendingMascot, takeMascot, type MascotPayload } from "../lib/mascotBus"
  * 梅子现在是什么状态（用户 2026-11-14）：
  * * 模型还没出字 / 在调工具 → 「思考中」，放 kanban_thinking
  * * 已经开始出字 → 「回答中」，放恍然大悟那张
- * 都没有就返回空串（聊天区不挂图）。
+ * 都没有就返回空串（空闲）。
  */
 const meiziState = computed<"" | "think" | "answer">(() => {
   const last = messages.value[messages.value.length - 1];
   if (!last || !last.streaming) return "";
   return last.text && last.text.trim() ? "answer" : "think";
+});
+
+/**
+ * 顶端那条梅子**常驻**（用户 2026-11-15：「梅子一直留在页面上方」）：
+ * 待机用会动的 idle 图，思考 / 回答换那两张，文字跟着走。
+ */
+const meiziFace = computed(() => {
+  if (meiziState.value === "answer") return "/mascot/meizi-answer.webp";
+  if (meiziState.value === "think") return "/mascot/meizi-thinking.webp";
+  // 待机就用那张立绘（用户 2026-11-15：顶上的梅子别缩成小图标）
+  return "/mascot/meizi-ai.png";
+});
+const meiziLine = computed(() => {
+  if (meiziState.value === "answer") return "正在回答…";
+  if (meiziState.value === "think") return "正在思考…";
+  return "我在，想做点什么？";
 });
 
 const ATTACH_KEY = "ai_attach_paths";
@@ -671,14 +687,70 @@ async function copyText(text: string) {
   }
 }
 
-function speak(text: string) {
+/**
+ * 朗读：点了开始播，按钮就地变成「暂停」（用户 2026-11-15 要的）；
+ * 暂停后再点回到「继续」，播完自动变回喇叭。
+ * `speakAt` 记的是正在朗读的那条消息的下标，-1 = 没在朗读。
+ */
+const speakAt = ref(-1);
+const speakPaused = ref(false);
+
+function speak(index: number, text: string) {
+  const synth = window.speechSynthesis;
+  if (!synth) {
+    note.value = "这台机器没法朗读";
+    return;
+  }
+  // 再点同一条：暂停 / 继续来回切
+  if (speakAt.value === index) {
+    if (speakPaused.value) {
+      synth.resume();
+      speakPaused.value = false;
+    } else {
+      synth.pause();
+      speakPaused.value = true;
+    }
+    return;
+  }
   try {
+    synth.cancel();
+    speakAt.value = index;
+    speakPaused.value = false;
     const utter = new SpeechSynthesisUtterance(text.slice(0, 600));
     utter.lang = "zh-CN";
-    window.speechSynthesis.speak(utter);
+    const done = () => {
+      if (speakAt.value === index) {
+        speakAt.value = -1;
+        speakPaused.value = false;
+      }
+    };
+    utter.onend = done;
+    utter.onerror = done;
+    synth.speak(utter);
+    // 没装中文语音时 speak() 会静默什么都不做，图标就会一直卡在「暂停」——
+    // 0.8 秒后还在不进不退，就当没法朗读，把图标还原并说一句
+    window.setTimeout(() => {
+      if (speakAt.value === index && !synth.speaking && !synth.pending) {
+        speakAt.value = -1;
+        speakPaused.value = false;
+        note.value = "这台机器没有可用的中文语音";
+      }
+    }, 800);
   } catch {
+    speakAt.value = -1;
+    speakPaused.value = false;
     note.value = "这台机器没法朗读";
   }
+}
+
+/** 朗读按钮上的图标 / 提示：没播 = 🔊 朗读；播放中 = ⏸ 暂停；暂停中 = ▶ 继续 */
+function speakIcon(index: number): string {
+  if (speakAt.value !== index) return "🔊";
+  return speakPaused.value ? "▶" : "⏸";
+}
+function speakTitle(index: number): string {
+  if (speakAt.value !== index) return "朗读";
+  return speakPaused.value ? "继续" : "暂停";
 }
 
 function formatSeconds(seconds?: number): string {
@@ -795,12 +867,23 @@ onBeforeUnmount(() => {
   unlistenDelta = null;
   unlistenConfirm?.();
   unlistenConfirm = null;
+  // 面板关了就别还在念
+  window.speechSynthesis?.cancel();
 });
 </script>
 
 <template>
   <div class="ai-panel" :class="{ dragging }">
     <div v-if="dragging" class="drop-hint">松手就加进对话附件</div>
+
+    <!-- 梅子常驻页面最顶端（用户 2026-11-15）：一直在，思考/回答时换张图、换句话 -->
+    <div class="meizi-top" :class="meiziState || 'idle'">
+      <img :src="meiziFace" alt="梅子" draggable="false" />
+      <div class="meizi-text">
+        <span class="meizi-name">梅子</span>
+        <span class="meizi-state">{{ meiziLine }}</span>
+      </div>
+    </div>
 
     <div class="tabs">
       <button class="tab" :class="{ on: tab === 'api' }" @click="tab = 'api'">API 服务</button>
@@ -877,19 +960,9 @@ onBeforeUnmount(() => {
           <div v-if="!history.length" class="empty">还没有历史会话</div>
         </div>
 
-        <!-- 梅子在思考 / 在回答：右下角一张小图（用户 2026-11-14 指定用哪两张） -->
-        <div v-if="meiziState" class="meizi-live">
-          <img
-            :src="meiziState === 'answer' ? '/mascot/meizi-answer.webp' : '/mascot/meizi-thinking.webp'"
-            :alt="meiziState === 'answer' ? '梅子在回答' : '梅子在思考'"
-            draggable="false"
-          />
-          <span>{{ meiziState === "answer" ? "梅子在回答…" : "梅子在思考…" }}</span>
-        </div>
         <div ref="scroller" class="chat" @scroll.passive="onScroll">
-          <!-- 空对话时摆梅子的立绘（用户 2026-11-14：第一张图放 AI 页面） -->
+          <!-- 空对话时只留一行提示：梅子本人在页面顶上，别在这儿再放一张 -->
           <div v-if="!messages.length" class="empty ai-empty">
-            <img class="ai-portrait" src="/mascot/meizi-ai.png" alt="梅子" draggable="false" />
             <div class="ai-greet">我是梅子，有什么要做？</div>
             <div class="ai-sub">可以直接把 PDF / Word / 图片拖进来当上下文，也可以让我帮你写日程、改公式。</div>
           </div>
@@ -929,7 +1002,13 @@ onBeforeUnmount(() => {
               </div>
               <div class="actions-line">
                 <button title="复制" @click="copyText(message.text)">⧉</button>
-                <button title="朗读" @click="speak(message.text)">🔊</button>
+                <button
+                  :title="speakTitle(index)"
+                  :class="{ speaking: speakAt === index }"
+                  @click="speak(index, message.text)"
+                >
+                  {{ speakIcon(index) }}
+                </button>
                 <button title="更多" @click="showMore = !showMore">⋯</button>
               </div>
             </template>
@@ -1092,27 +1171,63 @@ onBeforeUnmount(() => {
   max-width: 260px;
 }
 
-/* 梅子状态图：贴在聊天区右下角，不挡文字 */
-.meizi-live {
-  position: absolute;
-  right: 6px;
-  bottom: 6px;
+/* 梅子：钉在整页最顶端且**常驻**（用户 2026-11-15：不要放右下角，也别只在生成时出现） */
+.meizi-top {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 6%, var(--card));
+  border-radius: 12px;
+  overflow: hidden;
+}
+.meizi-top img {
+  /* 用户 2026-11-15：这是页面的主角，别缩成小图标 */
+  height: 104px;
+  width: auto;
+  max-width: 150px;
+  object-fit: contain;
+  border-radius: 10px;
+  pointer-events: none;
+  transition: transform 0.2s ease;
+}
+.meizi-top.think img,
+.meizi-top.answer img {
+  animation: meizi-bob 1.6s ease-in-out infinite;
+}
+@keyframes meizi-bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+.meizi-text {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  pointer-events: none;
-  opacity: 0.96;
+  gap: 1px;
+  min-width: 0;
+  line-height: 1.3;
 }
-.meizi-live img {
-  height: 96px;
-  width: auto;
-  border-radius: 10px;
-  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.18));
+.meizi-name {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-soft);
 }
-.meizi-live span {
-  font-size: 10.5px;
+.meizi-state {
+  font-size: 11px;
   color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.meizi-top.think .meizi-state,
+.meizi-top.answer .meizi-state {
+  color: var(--accent);
 }
 
 .ai-panel {
@@ -1344,6 +1459,10 @@ onBeforeUnmount(() => {
 .actions-line button:hover {
   color: var(--accent);
   background: var(--card-alt);
+}
+/* 正在朗读的那一条：图标是暂停键，顺便标一下是它在播 */
+.actions-line button.speaking {
+  color: var(--accent);
 }
 .reasoning {
   border-left: 2px solid var(--border-soft);
@@ -1736,5 +1855,42 @@ onBeforeUnmount(() => {
 .ai-panel .md ul,
 .ai-panel .md ol {
   margin: 4px 0 4px 18px;
+}
+/* 表格（markdown.ts 里的 takeTable）：窄面板里横向滚动，不撑破气泡 */
+.ai-panel .md .md-table {
+  margin: 6px 0;
+  overflow-x: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+}
+.ai-panel .md .md-table table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.ai-panel .md .md-table th,
+.ai-panel .md .md-table td {
+  padding: 5px 9px;
+  border-bottom: 1px solid var(--border-soft);
+  text-align: left;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+.ai-panel .md .md-table th {
+  background: var(--card-alt);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.ai-panel .md .md-table tbody tr:last-child td {
+  border-bottom: none;
+}
+.ai-panel .md .md-table th.md-center,
+.ai-panel .md .md-table td.md-center {
+  text-align: center;
+}
+.ai-panel .md .md-table th.md-right,
+.ai-panel .md .md-table td.md-right {
+  text-align: right;
 }
 </style>

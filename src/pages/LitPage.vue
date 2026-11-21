@@ -747,6 +747,10 @@ onMounted(async () => {
         >
           命中 {{ hit.matched_terms }}/{{ hit.total_terms }} 个词
         </span>
+        <!-- J7-4：Crossref 报的被引次数，挑论文时先看这个 -->
+        <span v-if="hit.citations" class="coverage" :title="`Crossref 记录的被引 ${hit.citations} 次`">
+          被引 {{ hit.citations }}
+        </span>
         <span class="ref-doi">{{ hit.source }}</span>
         <SoftButton :height="26" :font-size="11.5" @click="addHit(hit)">加入文献库</SoftButton>
       </div>

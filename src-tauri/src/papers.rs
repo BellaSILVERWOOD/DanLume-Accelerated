@@ -178,12 +178,36 @@ fn parse_arxiv(xml: &str, limit: usize) -> Vec<Value> {
     out
 }
 
+/// Crossref 检索用的查询串（单独拎出来是为了能写单测：不许悄悄退回「什么都不过滤」）
+///
+/// J7-4：以前只有 `query=`，Crossref 会把书章节、数据集、同行评审记录、勘误都塞进来
+/// （用户看到的就是「搜出来的东西跟论文没关系」）。现在：
+/// * `filter=type:…`（同名多个 filter 是 **或** 关系）只留期刊论文 / 会议论文 / 预印本；
+/// * `select=` 只要用得上的字段，响应小一半、也少解析一堆没用的；
+/// * `sort=score` 明说按相关度（Crossref 默认就是它，写出来免得以后改了不知道）。
+fn crossref_url(query: &str, limit: usize, offset: usize) -> String {
+    format!(
+        "https://api.crossref.org/works?rows={limit}&offset={offset}\
+         &filter=type:journal-article,type:proceedings-article,type:posted-content\
+         &select=DOI,title,author,issued,container-title,URL,type,is-referenced-by-count\
+         &sort=score&order=desc&query={}",
+        urlencode(query)
+    )
+}
+
+/// Crossref 返回的 `type` 值：只留这几种（配置里已经筛过一次，这里再兜一道，
+/// 免得 Crossref 哪天改了 filter 语义又把数据集放进来）
+fn crossref_kind_ok(kind: &str) -> bool {
+    match kind.trim().to_lowercase().as_str() {
+        "" => true,
+        "journal-article" | "proceedings-article" | "posted-content" => true,
+        _ => false,
+    }
+}
+
 /// Crossref 按关键词检索（JSON，不用 Key）。返回 (条目, Crossref 报的总数)
 fn search_crossref(query: &str, limit: usize, offset: usize) -> Result<(Vec<Value>, usize), String> {
-    let url = format!(
-        "https://api.crossref.org/works?rows={limit}&offset={offset}&query={}",
-        urlencode(query)
-    );
+    let url = crossref_url(query, limit, offset);
     let response = crate::net::with_proxy(
      ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(15)),
@@ -207,6 +231,10 @@ fn search_crossref(query: &str, limit: usize, offset: usize) -> Result<(Vec<Valu
         .and_then(|one| one.as_array())
     {
         for item in items.iter().take(limit) {
+            let kind = item.get("type").and_then(|one| one.as_str()).unwrap_or("");
+            if !crossref_kind_ok(kind) {
+                continue;
+            }
             let title = item
                 .get("title")
                 .and_then(|one| one.as_array())
@@ -240,6 +268,10 @@ fn search_crossref(query: &str, limit: usize, offset: usize) -> Result<(Vec<Valu
                 .map(|one| one.to_string().trim_matches('"').to_string())
                 .unwrap_or_default();
             let doi = item.get("DOI").and_then(|one| one.as_str()).unwrap_or("");
+            let citations = item
+                .get("is-referenced-by-count")
+                .and_then(|one| one.as_u64())
+                .unwrap_or(0);
             out.push(json!({
                 "source": "crossref",
                 "source_id": if doi.is_empty() { title.clone() } else { doi.to_string() },
@@ -254,6 +286,9 @@ fn search_crossref(query: &str, limit: usize, offset: usize) -> Result<(Vec<Valu
                 "url": item.get("URL").and_then(|one| one.as_str()).unwrap_or(""),
                 "pdf_url": "",
                 "doi": doi,
+                // J7-4：被引次数（Crossref 给的 is-referenced-by-count），排序用得上
+                "citations": citations,
+                "kind": kind,
             }));
         }
     }
@@ -699,8 +734,14 @@ pub fn search_online(query: &str, limit: usize, offset: usize) -> Value {
         })
         .collect();
     if relaxed {
-        rows.sort_by_key(|item| {
-            std::cmp::Reverse(item.get("matched_terms").and_then(|one| one.as_u64()).unwrap_or(0))
+        // 放宽那次：先按「命中几个词」，一样多的时候**被引多的在前**（J7-4）——
+        // 以前完全按来源顺序排，Crossref 那些被引几十上百的经典论文会沉到底下。
+        rows.sort_by(|left, right| {
+            let hits = |item: &Value| item.get("matched_terms").and_then(|one| one.as_u64()).unwrap_or(0);
+            let citations = |item: &Value| item.get("citations").and_then(|one| one.as_u64()).unwrap_or(0);
+            hits(right)
+                .cmp(&hits(left))
+                .then_with(|| citations(right).cmp(&citations(left)))
         });
     }
     let found = dedupe(rows);
@@ -1220,6 +1261,32 @@ mod tests {
         assert_eq!(scholar["needs_login"], json!(false));
         let cnki = items.iter().find(|one| one["id"] == json!("cnki")).unwrap();
         assert_eq!(cnki["needs_login"], json!(true));
+    }
+
+    /// J7-4：Crossref 的请求要带上类型过滤和字段裁剪，别退化成「什么都不过滤」
+    #[test]
+    fn crossref_url_filters_types() {
+        let url = crossref_url("MRI crossfield", 20, 0);
+        assert!(url.starts_with("https://api.crossref.org/works?"), "{url}");
+        assert!(url.contains("rows=20"), "{url}");
+        assert!(url.contains("filter=type:journal-article"), "{url}");
+        assert!(url.contains("type:proceedings-article"), "会议论文不能漏掉：{url}");
+        assert!(url.contains("select=DOI,title"), "{url}");
+        assert!(url.contains("sort=score"), "{url}");
+        assert!(url.contains("query=MRI+crossfield"), "{url}");
+    }
+
+    /// 只留期刊 / 会议 / 预印本；数据集、组件、同行评审记录一律丢掉
+    #[test]
+    fn crossref_kind_filter() {
+        assert!(crossref_kind_ok("journal-article"));
+        assert!(crossref_kind_ok("proceedings-article"));
+        assert!(crossref_kind_ok("posted-content"));
+        assert!(crossref_kind_ok(""), "Crossref 没给 type 时别误杀");
+        assert!(!crossref_kind_ok("dataset"));
+        assert!(!crossref_kind_ok("component"));
+        assert!(!crossref_kind_ok("peer-review"));
+        assert!(!crossref_kind_ok("book-chapter"));
     }
 
     /// 多关键词：arXiv 上 `all:MRI crossfield` 会退化成「只要有一个词」，

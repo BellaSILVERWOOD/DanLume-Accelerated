@@ -19,8 +19,9 @@ use crate::store::Store;
 pub const SETTING_KEY: &str = "prompts_json";
 /// 文档版本（与旧版 `prompts.VERSION = 1` 一致）
 pub const VERSION: i64 = 1;
-/// 助手人格（与旧版 `prompts.PERSONA` 一致）
-pub const PERSONA: &str = "你是 Lume（卢梅），DanLume 里的写作与学习助手。";
+/// 助手人格（用户 2026-11-15：AI 直接叫「梅子」，和桌面上的看板娘同名；
+/// 不要在提示词里写日语注音，用户说「不用写出日语」）
+pub const PERSONA: &str = "你是梅子，DanLume 里的写作与学习助手。";
 /// 文档里的说明（与旧版 `DEFAULTS["note"]` 一致）
 pub const DEFAULT_NOTE: &str = "这里是 DanLume 的提示词配置，可以自己改；改完重启软件生效。";
 /// 单条提示词的长度上限（旧版 prompt_gen 的 `MAX_CHARS = 8000`）
@@ -41,7 +42,7 @@ pub const BUILTIN_SYSTEM: &[Builtin] = &[
     Builtin {
         key: "assistant",
         title: "通用助手",
-        text: "你是 Lume（卢梅），DanLume 里的写作与学习助手。回答用简体中文，简洁直接，\
+        text: "你是梅子，DanLume 里的写作与学习助手。回答用简体中文，简洁直接，\
                先给结论再给要点；不确定的地方要说明不确定，不要编造。",
     },
     Builtin {
@@ -645,7 +646,7 @@ mod tests {
         assert_eq!(items[0]["title"], "通用助手");
         assert!(items[0]["builtin"].as_bool().unwrap());
         let assistant = items[0]["text"].as_str().unwrap();
-        assert!(assistant.starts_with("你是 Lume（卢梅），DanLume 里的写作与学习助手。"));
+        assert!(assistant.starts_with("你是梅子，DanLume 里的写作与学习助手。"));
         assert!(assistant.contains("回答用简体中文，简洁直接"));
 
         // `system()` 直接取（旧版 prompts.system("assistant") 的等价物）

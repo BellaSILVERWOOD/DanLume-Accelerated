@@ -821,6 +821,10 @@ export type PaperSearchPage = {
 export type PaperSearchHitWithCoverage = PaperSearchHit & {
   matched_terms?: number;
   total_terms?: number;
+  /** J7-4：Crossref 的 is-referenced-by-count（别的来源没有，就是 0） */
+  citations?: number;
+  /** Crossref 的 type（journal-article / proceedings-article / posted-content） */
+  kind?: string;
 };
 
 /**
@@ -1059,6 +1063,42 @@ export async function mascotResize(): Promise<{
 export async function mascotClose(): Promise<void> {
   if (!isTauri) return;
   await invoke("mascot_close");
+}
+
+/** 使用上报的状态（今日时长 / 请求数 / 最近一次处置） */
+export type UsageStatus = {
+  enabled: boolean;
+  bypass: boolean;
+  url: string;
+  server?: string;
+  logged_in?: boolean;
+  interval_minutes: number;
+  daily_limit_hours: number;
+  snapshot?: { used_seconds?: number; requests?: number; day?: string; over_limit?: boolean };
+  last_at?: string;
+  fail_count?: number;
+  action?: string;
+  action_at?: string;
+  flag_count?: number;
+  ban_at?: string;
+  ban_reason?: string;
+};
+
+export async function usageStatus(): Promise<UsageStatus | null> {
+  if (!isTauri) return null;
+  return invoke("usage_status");
+}
+
+export async function usageReportNow(): Promise<{ ok: boolean; action: string; message: string; count?: number }> {
+  if (!isTauri) return { ok: false, action: "off", message: "浏览器预览里没有上报" };
+  return invoke("usage_report_now");
+}
+
+/** 服务器判了提醒/警告/封号时，后端会发这个事件 */
+export async function onUsageNotice(handler: (payload: unknown) => void): Promise<() => void> {
+  if (!isTauri) return () => undefined;
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<unknown>("usage:notice", (event) => handler(event.payload));
 }
 
 /** 悬浮球收到的东西交给主窗口的 AI 面板（文件走路径，文字走 text） */
@@ -3194,7 +3234,7 @@ function mockTemplates(): PromptTemplate[] {
       key: "assistant",
       kind: "system",
       title: "通用助手",
-      text: "你是 Lume（卢梅），DanLume 里的写作与学习助手。（浏览器预览里的假数据）",
+      text: "你是梅子，DanLume 里的写作与学习助手。（浏览器预览里的假数据）",
       enabled: true,
       builtin: true,
     },

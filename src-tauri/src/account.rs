@@ -467,7 +467,7 @@ pub fn refresh(store: &Store) -> Result<Value, ApiError> {
 }
 
 /// 带 Bearer 的请求：401 时自动 refresh 一次再重试一次
-fn authed(store: &Store, method: &str, path: &str, body: Option<&Value>) -> Result<Value, ApiError> {
+pub(crate) fn authed(store: &Store, method: &str, path: &str, body: Option<&Value>) -> Result<Value, ApiError> {
     let url = endpoint(store, path)?;
     let current = token(store);
     if current.is_empty() {
@@ -490,6 +490,11 @@ fn authed(store: &Store, method: &str, path: &str, body: Option<&Value>) -> Resu
 }
 
 // ---------------------------------------------------------------- 对外的几个调用
+
+/// 带令牌的 POST（给使用上报等模块用；401 会自动 refresh 一次）
+pub fn post_authed(store: &Store, path: &str, body: &Value) -> Result<Value, ApiError> {
+    authed(store, "POST", path, Some(body))
+}
 
 /// 探测服务器：`GET /health`（5 秒超时），返回 `{ok,online,version,uptime_seconds,latency_ms}`
 pub fn health() -> Result<Value, ApiError> {
