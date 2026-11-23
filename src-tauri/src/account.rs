@@ -80,7 +80,61 @@ pub fn refresh_token(store: &Store) -> String {
 }
 
 pub fn logged_in(store: &Store) -> bool {
+    enforce_session_expiry(store);
     !token(store).is_empty()
+}
+
+// ---------------------------------------------------------------- 「记住这台设备」（J2-14）
+//
+// 用户口径（2026-11-22）：勾了「记住这台设备」就**直接保存、不要过期**。
+// * 勾上（默认）：登录请求带 `remember: true`，服务器签发的 refresh token 不写 `exp`；
+// * 不勾：refresh token 按服务器默认（30 天）过期，本地再按 `session_days` 记一个到期日，
+//   到点按 `relogin_on_expire` 决定要不要清掉令牌、要求重新输入口令。
+
+/// 有没有勾「记住这台设备」。默认开 —— 老版本本来就一直保存令牌，关掉才是新行为。
+pub fn remember_device(store: &Store) -> bool {
+    store
+        .setting("remember_device")
+        .map(|text| text.trim() != "0")
+        .unwrap_or(true)
+}
+
+/// 不记住时的会话天数（默认 30）
+pub fn session_days(store: &Store) -> i64 {
+    store
+        .setting("session_days")
+        .and_then(|text| text.trim().parse::<i64>().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(30)
+}
+
+/// 到期后要不要重新输入口令（默认要）
+pub fn relogin_on_expire(store: &Store) -> bool {
+    store
+        .setting("relogin_on_expire")
+        .map(|text| text.trim() != "0")
+        .unwrap_or(true)
+}
+
+/// 本地会话到期就清令牌（只在「没勾记住」时生效）
+pub fn enforce_session_expiry(store: &Store) {
+    if remember_device(store) {
+        return;
+    }
+    let at = store.setting("server_session_expires_at").unwrap_or_default();
+    let at = at.trim();
+    if at.is_empty() {
+        return;
+    }
+    let Ok(deadline) = chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M:%S") else {
+        return;
+    };
+    if chrono::Local::now().naive_local() < deadline {
+        return;
+    }
+    if relogin_on_expire(store) {
+        clear_tokens(store);
+    }
 }
 
 /// 写 token（DPAPI 加密后存 settings 表）；空字符串表示清掉
@@ -97,6 +151,8 @@ pub fn clear_tokens(store: &Store) {
     let _ = set_token(store, TOKEN_KEY, "");
     let _ = set_token(store, REFRESH_KEY, "");
     let _ = store.set_setting("server_token_expires_at", "");
+    // 「不记住」模式下的本地到期日：退出/到期后要清掉，下次登录重新算
+    let _ = store.set_setting("server_session_expires_at", "");
     let _ = store.set_setting("server_devices_used", "0");
     let _ = store.set_setting("server_device_limit", "0");
 }
@@ -402,8 +458,11 @@ fn endpoint(store: &Store, path: &str) -> Result<String, ApiError> {
 
 // ---------------------------------------------------------------- token 处理
 
-/// 把 register / login / refresh 返回的 token 存下来，并记下账号信息
-fn apply_session(store: &Store, value: &Value) -> Result<(), ApiError> {
+/// 把 register / login / refresh 返回的 token 存下来，并记下账号信息。
+///
+/// `fresh_login`：这次是不是用户主动登录/注册（刷新令牌续期传 false）。
+/// 只有主动登录才重算本地到期日，否则每 30 分钟续期一次，「不记住」就永远不会到期。
+fn apply_session(store: &Store, value: &Value, fresh_login: bool) -> Result<(), ApiError> {
     let access = value
         .get("token")
         .and_then(|one| one.as_str())
@@ -444,6 +503,28 @@ fn apply_session(store: &Store, value: &Value) -> Result<(), ApiError> {
     if let Some(limit) = value.get("device_limit").and_then(|one| one.as_i64()) {
         let _ = store.set_setting("server_device_limit", &limit.to_string());
     }
+    // 「记住这台设备」（J2-14）：服务器认 `remember`；老服务器没这个字段就按本地设置算。
+    // 记住 → 不算到期日（刷新令牌本身也不过期）；不记住 → 主动登录时记 now + session_days。
+    let remembered = value
+        .get("remember")
+        .and_then(|one| one.as_bool())
+        .unwrap_or_else(|| remember_device(store));
+    let _ = store.set_setting("server_remember", if remembered { "1" } else { "0" });
+    if remembered {
+        let _ = store.set_setting("server_session_expires_at", "");
+    } else if fresh_login
+        || store
+            .setting("server_session_expires_at")
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+    {
+        let at = chrono::Local::now() + chrono::Duration::days(session_days(store));
+        let _ = store.set_setting(
+            "server_session_expires_at",
+            &at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -462,7 +543,7 @@ pub fn refresh(store: &Store) -> Result<Value, ApiError> {
         Some(&json!({ "refresh_token": token })),
         None,
     )?;
-    apply_session(store, &value)?;
+    apply_session(store, &value, false)?;
     Ok(value)
 }
 
@@ -622,6 +703,8 @@ fn register_body(
         "device_fingerprint": device_fingerprint(store),
         "device_name": device_name(),
         "platform": platform(),
+        // 「记住这台设备」：true = 服务器签发的刷新令牌不过期（J2-14）
+        "remember": remember_device(store),
     });
     if let Some(invite) = invite_code.map(|one| one.trim()).filter(|one| !one.is_empty()) {
         body["invite_code"] = json!(invite);
@@ -656,7 +739,7 @@ pub fn register(
     let url = endpoint(&store, "/api/v1/register")?;
     let body = register_body(&store, username, email, password, invite_code, code);
     let value = request_json("POST", &url, Some(&body), None)?;
-    apply_session(&store, &value)?;
+    apply_session(&store, &value, true)?;
     Ok(with_session_echo(&store, value))
 }
 
@@ -674,9 +757,11 @@ pub fn login(username_or_email: &str, password: &str) -> Result<Value, ApiError>
         "device_fingerprint": device_fingerprint(&store),
         "device_name": device_name(),
         "platform": platform(),
+        // 「记住这台设备」：true = 服务器签发的刷新令牌不过期（J2-14）
+        "remember": remember_device(&store),
     });
     let value = request_json("POST", &url, Some(&body), None)?;
-    apply_session(&store, &value)?;
+    apply_session(&store, &value, true)?;
     Ok(with_session_echo(&store, value))
 }
 
@@ -1174,5 +1259,87 @@ mod tests {
         assert_eq!(bad.kind, "unauthorized");
 
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("danlume-account-live-test"));
+    }
+
+    // ------------------------------------------------------------ J2-14「记住这台设备」
+    #[test]
+    fn remember_device_defaults_on_and_parses_switch() {
+        let store = temp_store("danlume-account-remember");
+        // 没设过 → 开（老版本本来就一直保存令牌）
+        assert!(remember_device(&store));
+        let _ = store.set_setting("remember_device", "0");
+        assert!(!remember_device(&store));
+        let _ = store.set_setting("remember_device", "1");
+        assert!(remember_device(&store));
+
+        // 会话天数：没填/填错/填负数都回默认 30
+        assert_eq!(session_days(&store), 30);
+        let _ = store.set_setting("session_days", "7");
+        assert_eq!(session_days(&store), 7);
+        let _ = store.set_setting("session_days", "abc");
+        assert_eq!(session_days(&store), 30);
+        // 到期后默认要重新输入口令
+        assert!(relogin_on_expire(&store));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("danlume-account-remember"));
+    }
+
+    #[test]
+    fn register_body_carries_remember_flag() {
+        let store = temp_store("danlume-account-remember-body");
+        let body = register_body(&store, "alice", "alice@m.fudan.edu.cn", "password123", None, None);
+        assert_eq!(body["remember"], json!(true), "默认记住这台设备");
+        let _ = store.set_setting("remember_device", "0");
+        let body = register_body(&store, "alice", "alice@m.fudan.edu.cn", "password123", None, None);
+        assert_eq!(body["remember"], json!(false));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("danlume-account-remember-body"));
+    }
+
+    #[test]
+    fn apply_session_records_expiry_only_when_not_remembered() {
+        let store = temp_store("danlume-account-remember-expiry");
+        let session = json!({ "token": "t-1", "refresh_token": "r-1", "remember": true });
+        apply_session(&store, &session, true).unwrap();
+        assert_eq!(store.setting("server_remember").unwrap_or_default(), "1");
+        assert!(store
+            .setting("server_session_expires_at")
+            .unwrap_or_default()
+            .is_empty());
+
+        let _ = store.set_setting("remember_device", "0");
+        let session = json!({ "token": "t-2", "refresh_token": "r-2", "remember": false });
+        apply_session(&store, &session, true).unwrap();
+        let at = store.setting("server_session_expires_at").unwrap_or_default();
+        assert!(!at.is_empty(), "不记住时要落一个本地到期日");
+        assert_eq!(store.setting("server_remember").unwrap_or_default(), "0");
+
+        // 续期（fresh_login=false）不把到期日往后推
+        let _ = store.set_setting("server_session_expires_at", "2026-01-01 00:00:00");
+        apply_session(&store, &session, false).unwrap();
+        assert_eq!(
+            store.setting("server_session_expires_at").unwrap_or_default(),
+            "2026-01-01 00:00:00"
+        );
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("danlume-account-remember-expiry"));
+    }
+
+    #[test]
+    fn session_expiry_clears_tokens_when_not_remembered() {
+        let store = temp_store("danlume-account-remember-clear");
+        let _ = set_token(&store, TOKEN_KEY, "access-token");
+        let _ = set_token(&store, REFRESH_KEY, "refresh-token");
+        let _ = store.set_setting("remember_device", "0");
+        let _ = store.set_setting("relogin_on_expire", "1");
+        let _ = store.set_setting("server_session_expires_at", "2026-01-01 00:00:00");
+        enforce_session_expiry(&store);
+        assert!(!logged_in(&store), "过期后应当要求重新登录");
+        assert!(token(&store).is_empty());
+
+        // 勾了「记住」就不受本地到期日影响
+        let _ = set_token(&store, TOKEN_KEY, "access-token-2");
+        let _ = store.set_setting("remember_device", "1");
+        let _ = store.set_setting("server_session_expires_at", "2026-01-01 00:00:00");
+        enforce_session_expiry(&store);
+        assert!(logged_in(&store));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("danlume-account-remember-clear"));
     }
 }

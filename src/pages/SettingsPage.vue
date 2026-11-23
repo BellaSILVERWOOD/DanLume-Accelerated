@@ -110,7 +110,7 @@ type CardDef = {
  * 约定是「值不是 '0' 就算开」，但代理（proxy_enabled）默认必须是**关**，
  * 否则设置页会显示「已启用」而后台其实没走代理（2026-11-12 修）。
  */
-const OFF_BY_DEFAULT = new Set(["proxy_enabled"]);
+const OFF_BY_DEFAULT = new Set(["proxy_enabled", "focus_full_auto"]);
 function switchOn(key: string): boolean {
   const value = values[key] ?? "";
   if (OFF_BY_DEFAULT.has(key) && value === "") return false;
@@ -362,8 +362,31 @@ const uisState = ref<{
   has_service_session?: boolean;
   has_saved_password: boolean;
   saved_at?: string;
+  cookie_domains?: string[];
+  verify?: { status: number; at: string; body_head: string };
   remember_password?: boolean;
 } | null>(null);
+
+/**
+ * 会话三态：只看 has_session 会把「登录前抓到的游客会话」也显示成成功（2026-11-22 的 401）。
+ * 真正的判据是后端拿这份会话打 Canvas API 的状态码：200 能用，非 0 非 200 不能用，0 = 还没验过。
+ */
+const uisVerifyStatus = computed(() => uisState.value?.verify?.status ?? 0);
+const uisDotClass = computed(() => {
+  const status = uisVerifyStatus.value;
+  if (status === 200) return "ok";
+  if (status !== 0) return "bad";
+  return "off";
+});
+const uisStateText = computed(() => {
+  const state = uisState.value;
+  if (!state) return "";
+  if (!state.has_session) return "还没有会话";
+  const status = state.verify?.status ?? 0;
+  if (status === 200) return "会话可用（已验证）";
+  if (status !== 0) return `Canvas ${status}：去点「重新抓取会话」，完整登录一次`;
+  return "会话已抓取，但还没验证";
+});
 
 // AI 记忆库（Rust 侧 memory.rs，旧版是 data/memory.md）：
 // 列表 / 搜索 / 新增 / 编辑 / 删除 / 清空，全部走 memory_* 命令。
@@ -706,21 +729,23 @@ async function doUisOpen() {
     return;
   }
   uisMsg.value = "已打开登录页：学号密码会自动填好并点「登录」；登录成功后会话会自动保存…";
-  // 登录成功后是后端自动抓会话的，这里轮询一下状态把结果告诉用户
+  // 登录成功后是后端自动抓会话的，这里轮询一下状态把结果告诉用户。
+  // 判据是「Canvas API 200」，不是 has_session —— 游客会话也有 cookie，但接口会 401。
   for (let i = 0; i < 60; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 2000));
     await refreshUis();
     const state = uisState.value;
-    if (state && state.has_session) {
-      uisMsg.value = `会话已保存：${state.cookies} 个 cookie${
-        state.has_service_session ? "（含业务站会话）" : "（还没拿到业务站会话，可点「重新抓取会话」）"
-      }`;
+    if (state && state.verify?.status === 200) {
+      uisMsg.value = `会话已保存并验证通过（Canvas API 200）：${state.cookies} 个 cookie`;
       return;
     }
   }
+  const status = uisState.value?.verify?.status ?? 0;
   uisMsg.value =
-    "还没拿到会话：确认已在窗口里完成登录（有二次验证要过一次）；" +
-    "实在不行点「重新抓取会话」手动兜底";
+    status !== 0 && status !== 200
+      ? `会话抓到了但 Canvas 仍 ${status}：去点「重新抓取会话」完整登录一次`
+      : "还没拿到会话：确认已在窗口里完成登录（有二次验证要过一次）；" +
+        "实在不行点「重新抓取会话」手动兜底";
 }
 
 /** 「检查自动填充」：只报告账号、密码、开关与开关状态，不联网（Python 版 `uis_login.test` 的等价） */
@@ -743,9 +768,10 @@ async function doUisCapture() {
   uisBusy.value = true;
   try {
     const result = await uisCapture();
+    // ok 只代表「Canvas 200 且已落库」；失败时后端会给状态码 + 返回体头，别把它吞掉
     uisMsg.value = result.ok
-      ? `已抓取 ${result.cookies} 个 cookie${result.verdict ? ` · ${result.verdict}` : ""}：${(result.names || []).join(", ")}`
-      : String(result.error);
+      ? `会话可用（Canvas ${result.status ?? 200}）：已抓取 ${result.cookies} 个 cookie：${(result.names || []).join(", ")}`
+      : [result.status ? `Canvas ${result.status}` : "", String(result.error || "")].filter(Boolean).join("：");
   } catch (err) {
     uisMsg.value = String(err);
   } finally {
@@ -1060,6 +1086,7 @@ const cards: CardDef[] = [
       { label: "休息时长（分钟）", kind: "text", key: "focus_break", placeholder: "5" },
       { label: "离开多久提醒（分钟）", kind: "text", key: "focus_away", placeholder: "10" },
       { label: "悬浮计时器位置", kind: "select", key: "focus_pos", options: ["右下", "右上", "左下", "左上"] },
+      { label: "进入即全屏", kind: "switch", key: "focus_full_auto" },
       { label: "结束提示音", kind: "switch", key: "focus_sound" },
     ],
     actions: ["save"],
@@ -2137,13 +2164,16 @@ async function refreshAdminFlag() {
             <div class="label">登录会话</div>
             <div class="uis-status">
               <template v-if="uisState">
-                <span class="dot" :class="uisState.has_session ? 'ok' : 'off'" />
+                <span class="dot" :class="uisDotClass" />
                 <span>
-                  {{ uisState.has_session ? "会话已就绪" : "还没有会话" }}
+                  {{ uisStateText }}
                   <template v-if="uisState.has_session">
                     · {{ uisState.cookies }} 个 cookie ·
                     {{ uisState.has_service_session ? "已含业务站会话" : "缺业务站会话（点「重新抓取会话」走一遍 eLearning / eHall）" }}
                     <template v-if="uisState.saved_at">· 抓取于 {{ uisState.saved_at }}</template>
+                    <template v-if="uisState.cookie_domains?.length">
+                      · cookie 域 {{ uisState.cookie_domains.join("、") }}
+                    </template>
                   </template>
                   · 学号 {{ uisState.username || "未填" }}
                   · 自动填表 {{ uisState.remember_password ? "开" : "关" }}
@@ -2730,6 +2760,10 @@ async function refreshAdminFlag() {
 }
 .uis-status .dot.off {
   background: var(--warning, #c98a1a);
+}
+/* 抓到了但 Canvas 不认（401 等）：红点，别再用「已就绪」误导人 */
+.uis-status .dot.bad {
+  background: var(--danger, #d14343);
 }
 .uis-pwd {
   width: 180px;  min-width: 0;

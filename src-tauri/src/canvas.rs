@@ -10,8 +10,12 @@ use crate::store::Store;
 use crate::uis;
 
 pub const BASE: &str = "https://elearning.fudan.edu.cn";
+/// Cookie 按域发送时用的主机名（`uis::Jar::to_header_for`）
+pub const HOST: &str = "elearning.fudan.edu.cn";
 pub const COURSES: &str =
     "/api/v1/courses?enrollment_state=active&per_page=100";
+/// 自检用：只要 1 条，够判断这份会话到底能不能用
+pub const CHECK: &str = "/api/v1/courses?enrollment_state=active&per_page=1";
 pub const ASSIGNMENTS: &str =
     "/api/v1/courses/{cid}/assignments?per_page=100";
 pub const FILES: &str =
@@ -35,22 +39,182 @@ fn agent(url: &str) -> ureq::Agent {
     .build()
 }
 
-/// 建立（或复用）Canvas 会话：先请求首页走完整 SSO
+/// 拿这份会话打一个 Canvas 接口，只要 **HTTP 状态 + 返回体头**（不解析）。
+///
+/// `0` = 请求根本没发出去（断网 / 代理挂了），跟 401 要分开看。
+///
+/// `pub(crate)`：`lib.rs` 抓会话时的自检也要用同一个探针（同一个 HOST + 同一个代理设置），
+/// 免得两处对「什么算 200」理解不一致。
+pub(crate) fn probe_status(
+    jar: &uis::Jar,
+    path: &str,
+    extra: Option<(&str, String)>,
+) -> (u16, String) {
+    let url = format!("{BASE}{path}");
+    let mut request = agent(&url)
+        .get(&url)
+        .set("Cookie", &jar.to_header_for(HOST))
+        .set("Accept", "application/json");
+    if let Some((name, value)) = extra {
+        request = request.set(name, &value);
+    }
+    match request.call() {
+        Ok(response) => {
+            let status = response.status();
+            let text = response.into_string().unwrap_or_default();
+            (status, text.chars().take(300).collect())
+        }
+        Err(ureq::Error::Status(code, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            (code, text.chars().take(300).collect())
+        }
+        Err(exc) => (0, format!("请求没发出去：{exc}")),
+    }
+}
+
+/// 建立（或复用）Canvas 会话：先请求首页走完整 SSO，**再真打一次接口确认 200**。
+///
+/// 2026-11-22 之前这里只做到「落地地址不是统一身份认证」就算成功，
+/// 而游客会话也满足这个条件 —— 于是游客 cookie 被当成登录会话用了很久，
+/// 作业同步一路 401。现在：
+/// * 200 → 把**换过票之后的**会话回写进库（以前从不回写，每次同步都在赌旧会话还能用）；
+/// * 非 200 → 直接把状态码和返回体交给调用方，不再让 401 留到同步时才爆。
 pub fn ensure_session(store: &Store) -> Result<uis::Jar, String> {
     let (final_url, jar) = uis::visit_with_session(store, BASE)?;
     if final_url.contains("id.fudan.edu.cn") {
         return Err(format!(
-            "会话对 Canvas 无效（被重定向到统一身份认证）：先在「打开登录窗口」里登录，再点「抓取会话」。落地地址：{final_url}"
+            "会话对 Canvas 无效（被重定向到统一身份认证）：先在「打开登录窗口」里登录，再点「重新抓取会话」。落地地址：{final_url}"
         ));
     }
+    let (status, body) = probe_status(&jar, CHECK, None);
+    if status != 200 {
+        uis::record_verdict(store, status, &body);
+        let head = if body.trim().is_empty() {
+            "空返回".to_string()
+        } else {
+            body
+        };
+        return Err(format!(
+            "eLearning 会话不可用（Canvas API {status}：{head}）——去「设置 → 统一身份认证」点「重新抓取会话」，完整登录一次"
+        ));
+    }
+    let user = store.setting(uis::USER_KEY).unwrap_or_default();
+    if let Err(exc) = uis::save_session_with(store, &jar, &user, Some(200)) {
+        // 回写失败不影响这次同步，下次再试
+        crate::uis_log(&format!("[canvas] 会话回写失败：{exc}"));
+    }
     Ok(jar)
+}
+
+/// 诊断（2026-11-22，2026-11-22 晚扩充）：把「手里的会话」直接打几次 Canvas，回报真实状态码。
+///
+/// 只返回 **cookie 的名字 / 所在的域**（绝不返回值）、各接口的 HTTP 状态、返回体前 300 字。
+///
+/// 一条命令分清三种根因：
+/// * `courses_status` = 200 但 `todo_status` = 401 → 会话是好的，是 ToDo 接口要额外头
+///   （看 `todo_status_with_csrf`）；
+/// * `courses_status` / `todo_status` 都 401，且 `saved_at` 早于最后一次登录 → 存的是过期/游客会话；
+/// * `http_status` = 0 / `body_head` 以「请求没发出去」开头 → 是网络或代理，不是会话。
+pub fn diagnose(store: &Store) -> Value {
+    let mut out = serde_json::json!({
+        "base": BASE,
+        "todo_path": TODO,
+        "saved_at": uis::session_saved_at(store),
+        "has_session": false,
+        "verified": uis::verdict(store),
+        "cookie_names": Vec::<String>::new(),
+        "cookie_domains": Vec::<String>::new(),
+        "has_service_cookie": false,
+        "courses_status": 0,
+        "todo_status": 0,
+        "todo_status_with_csrf": 0,
+        "http_status": 0,
+        "body_head": "",
+        "uv_final_url": "",
+    });
+    let Some(jar) = uis::load_session(store) else {
+        out["body_head"] = serde_json::json!("库里没有 uis_session（没抓过会话）");
+        return out;
+    };
+    let names = jar.names();
+    let service = names.iter().any(|name| {
+        name.contains("_normandy_session")
+            || name.contains("_legacy_normandy_session")
+            || name.contains("log_session_id")
+            || name.contains("SESS_ID")
+    });
+    out["has_session"] = serde_json::json!(true);
+    out["cookie_names"] = serde_json::json!(names);
+    out["cookie_domains"] = serde_json::json!(jar.domains());
+    out["has_service_cookie"] = serde_json::json!(service);
+    // 先看访一次首页，记录落地地址（被踢回登录页会露馅）
+    if let Ok((final_url, _)) = uis::visit_with_session(store, BASE) {
+        out["uv_final_url"] = serde_json::json!(final_url);
+    }
+    // 课程接口：这才是「会话到底能不能用」的判据
+    let (courses_status, _) = probe_status(&jar, CHECK, None);
+    out["courses_status"] = serde_json::json!(courses_status);
+    // To Do：作业同步真正用到的那个接口
+    let (todo_status, todo_body) = probe_status(&jar, TODO, None);
+    out["todo_status"] = serde_json::json!(todo_status);
+    out["http_status"] = serde_json::json!(todo_status);
+    out["body_head"] = serde_json::json!(todo_body);
+    // 对照：带上 `_csrf_token` 再打一次。两次不一样 → 接口要这个头，不是会话的问题
+    match jar.get("_csrf_token") {
+        Some(token) => {
+            let (with_csrf, _) =
+                probe_status(&jar, TODO, Some(("X-CSRF-Token", token.to_string())));
+            out["todo_status_with_csrf"] = serde_json::json!(with_csrf);
+        }
+        None => out["todo_status_with_csrf"] = serde_json::json!(-1),
+    }
+    out
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    /// 用本机真实的 `uis_session` 打一次 Canvas todo，把结果打出来（默认跳过）：
+    /// `cargo test canvas::diag_tests::real_canvas_diagnose -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn real_canvas_diagnose() {
+        let store = crate::testdata::real_store("canvas-diag");
+        let out = diagnose(&store);
+        println!(
+            "=== Canvas 诊断 ===\n{}",
+            serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
+        );
+    }
+
+    /// 用本机真实会话拉一次 To Do（作业页「同步」走的就是这条），打印条数和前 3 条：
+    /// `cargo test canvas::diag_tests::real_todo_items -- --ignored --nocapture --test-threads=1`
+    ///
+    /// 2026-11-23 用它坐实 401 修复：诊断里 `todo_status` 200 只说明接口通了，
+    /// 这一条才证明「解析出来的是非空作业数组」。
+    #[test]
+    #[ignore]
+    fn real_todo_items() {
+        let store = crate::testdata::real_store("canvas-todo");
+        match todo_items(&store) {
+            Ok(rows) => {
+                println!("To Do 条数：{}", rows.len());
+                for row in rows.iter().take(3) {
+                    println!("  {}", serde_json::to_string(row).unwrap_or_default());
+                }
+                assert!(!rows.is_empty(), "To Do 是空的：会话可用但确实没有待办");
+            }
+            Err(exc) => panic!("拉 To Do 失败：{exc}"),
+        }
+    }
 }
 
 fn get_json(jar: &uis::Jar, path: &str) -> Result<Value, String> {
     let url = format!("{BASE}{path}");
     let response = agent(&url)
         .get(&url)
-        .set("Cookie", &jar.to_header())
+        .set("Cookie", &jar.to_header_for(HOST))
         .set("Accept", "application/json")
         .call()
         .map_err(|exc| format!("请求 {path} 失败：{exc}"))?;
@@ -423,7 +587,10 @@ pub fn download_course(store: &Store, course_id: &str, limit: usize) -> Value {
             skipped += 1;
             continue;
         }
-        let response = agent(url).get(url).set("Cookie", &jar.to_header()).call();
+        let response = agent(url)
+            .get(url)
+            .set("Cookie", &jar.to_header_for(HOST))
+            .call();
         match response {
             Ok(res) => {
                 let mut bytes: Vec<u8> = Vec::new();

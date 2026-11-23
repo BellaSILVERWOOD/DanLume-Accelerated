@@ -2098,6 +2098,8 @@ export interface FocusState {
   label: string;
   minutes: number;
   remaining: number;
+  /** 这一轮开始的时间；没在专注且从没开始过时后端不返回（判断「自然结束」用） */
+  started_at?: string;
   away_seconds: number;
   away_threshold: number;
   away_enabled: boolean;
@@ -2431,6 +2433,16 @@ export interface UisState {
   has_castgc: boolean;
   remember_password: boolean;
   has_saved_password: boolean;
+  has_service_session?: boolean;
+  saved_at?: string;
+  /** cookie 分在哪些域下（老会话没有域，是 `(未知)`） */
+  cookie_domains?: string[];
+  /**
+   * 最近一次「拿这份会话打一次 Canvas」的结果。
+   * `status`：0 = 没验证过，200 = 会话可用，401 = Canvas 401（游客/过期会话就是这个）。
+   * 只看 `has_session` 会把登录前的游客会话也显示成成功，所以卡片要读这个。
+   */
+  verify?: { status: number; at: string; body_head: string };
 }
 
 export async function uisStatus(): Promise<UisState> {
@@ -2442,6 +2454,8 @@ export async function uisStatus(): Promise<UisState> {
       has_castgc: false,
       remember_password: false,
       has_saved_password: false,
+      cookie_domains: [],
+      verify: { status: 0, at: "", body_head: "" },
     };
   }
   return invoke<UisState>("uis_status");
@@ -2477,6 +2491,10 @@ export async function uisCapture(): Promise<{
   has_castgc?: boolean;
   has_service_session?: boolean;
   verdict?: string;
+  /** 落库前那次自检的 HTTP 状态：200 = 会话可用；401 = 抓到了但 Canvas 不认，没落库 */
+  status?: number;
+  /** 401 时 Canvas 返回体前 300 字（排查用） */
+  body_head?: string;
   error?: string;
 }> {
   if (!isTauri) return { ok: false, error: "browser preview" };
@@ -2700,6 +2718,11 @@ export type NotifyStatus = {
   unsupported: boolean;
   backoff_secs: number;
   next_delay_secs: number;
+  /** WS 是否连着；连着时 interval_secs 会变成 60（轮询降级为兜底） */
+  ws_connected?: boolean;
+  ws_connects?: number;
+  ws_last_error?: string;
+  ws_last_frame_at?: string;
   event: string;
 };
 
@@ -2791,6 +2814,10 @@ const MOCK_ACCOUNT_STATE: AccountState = {
     unsupported: false,
     backoff_secs: 0,
     next_delay_secs: 0,
+    ws_connected: false,
+    ws_connects: 0,
+    ws_last_error: "",
+    ws_last_frame_at: "",
     event: "danlume://announcement",
   },
 };

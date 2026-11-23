@@ -76,6 +76,24 @@ pub fn today_str() -> String {
     Local::now().format("%Y-%m-%d").to_string()
 }
 
+/// 兜底隐藏：Tauri 内部缓存「窗口是否可见」，缓存与实际状态一旦不一致，
+/// `hide()` 会变成空操作（用户 2026-11-23 报「× 关不掉」就是这种表现）。
+/// 这里直接按窗口句柄调 Win32 `ShowWindow(SW_HIDE)`，绕开缓存。
+#[cfg(windows)]
+fn force_hide(window: &tauri::WebviewWindow) {
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                windows::Win32::Foundation::HWND(hwnd.0),
+                windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn force_hide(_window: &tauri::WebviewWindow) {}
+
 /// 提醒时间 = 开始时间 - 提前分钟（与旧版 store.compute_remind_at 一致）
 pub fn compute_remind_at(date: &str, start: &str, minutes: i64) -> String {
     let base = format!("{} {}", date, start);
@@ -4224,32 +4242,37 @@ fn uis_logout(state: State<'_, AppState>) -> serde_json::Value {
 /// 让浏览器完成一次真正的 SSO，页面才会带上登录态。
 
 /// 用合并后的会话直接请求一次 Canvas API：200 才算「真的登录了」。
-fn verify_canvas_session(jar: &crate::uis::Jar) -> String {
-    let url = "https://elearning.fudan.edu.cn/api/v1/courses?enrollment_state=active&per_page=1";
-    match crate::net::with_proxy(
-        ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(30))
-            .redirects(3)
-            .user_agent(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-            ),
-        get_store(),
-        url,
-    )
-    .build()
-    .get(url)
-    .set("Cookie", &jar.to_header())
-    .set("Accept", "application/json")
-    .call()
-    {
-        Ok(response) => format!("Canvas API {}", response.status()),
-        Err(ureq::Error::Status(code, _)) => format!("Canvas API {code}（会话没被接受）"),
-        Err(exc) => format!("Canvas API 请求失败：{exc}"),
-    }
+///
+/// 返回的是**状态码本身**（不是一句文案）：调用方只有拿到 200 才允许把会话写进库。
+/// 2026-11-22 之前这里只把结果写日志、401 也照样 `save_session`，于是登录前的
+/// 游客会话被存了下来，作业同步一路 401。
+struct CanvasVerdict {
+    status: u16,
+    body_head: String,
 }
 
-static TOUR_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn verify_canvas_session(jar: &crate::uis::Jar) -> CanvasVerdict {
+    let (status, body_head) = crate::canvas::probe_status(jar, crate::canvas::CHECK, None);
+    CanvasVerdict { status, body_head }
+}
+
+/// 「同一时刻只允许一轮抓取」的互斥标记。
+///
+/// 以前这里是 `TOUR_DONE` 一次性开关：`open_uis_window` 里只要页面开始加载（`Started`）就抓，
+/// 那次过早的抓取把它置位，真正登录完成时反而不再抓。现在改成互斥 + 守卫，
+/// 由 `TourGuard` 在函数结束 / 提前 return / panic 时复位。
+static TOUR_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 上一次「自动触发」的抓取时间（毫秒时间戳）；只用来防环，手动抓取不读它。
+static AUTO_TOUR_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+struct TourGuard;
+
+impl Drop for TourGuard {
+    fn drop(&mut self) {
+        TOUR_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// 读一段 JS 的返回值（失败/超时给一句说明，不 panic）
 fn eval_text(window: &tauri::WebviewWindow, js: &str) -> String {
@@ -4345,12 +4368,16 @@ fn start_cas_login(window: &tauri::WebviewWindow) {
 
 fn run_cookie_tour(window: &tauri::WebviewWindow, reset_login: bool) {
     use std::sync::atomic::Ordering;
-    if TOUR_DONE.swap(true, Ordering::SeqCst) {
-        return; // 每次登录只走一遍，免得来回跳
+    if TOUR_RUNNING.swap(true, Ordering::SeqCst) {
+        uis_log("[tour] 已经有一轮在抓会话，跳过这一轮");
+        return;
     }
+    // 函数结束 / 提前 return / panic 都会把互斥标记复位
+    let _guard = TourGuard;
     uis_log("[tour] 开始逐个访问业务站，收集 cookie");
     // 手动点「重新抓取会话」时先走一遍 CAS 入口，把登录页带出来（与 Python 版一致：
-    // 登录页由业务站跳过去，不自己去开 id.fudan 首页）
+    // 登录页由业务站跳过去，不自己去开 id.fudan 首页）。这只是把登录页带出来，
+    // **不是完成判据** —— 真正能不能用由最后的 Canvas 自检说了算。
     if reset_login {
         start_cas_login(window);
     }
@@ -4394,28 +4421,57 @@ fn run_cookie_tour(window: &tauri::WebviewWindow, reset_login: bool) {
             ));
         }
         merged.extend_from(&jar);
+
+        // eLearning 这一站之后：登录往往还没走完（SPA 要加载、可能有短信/扫码），
+        // 光靠「页面跳走了」判断会抓到半路的状态。这里轮询真正的判据 —— Canvas API 200。
+        if label == "eLearning" {
+            for round in 1..=6 {
+                let (status, _) = crate::canvas::probe_status(&merged, crate::canvas::CHECK, None);
+                uis_log(&format!("[tour] eLearning 第 {round} 轮自检：Canvas {status}"));
+                if status == 200 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2500));
+                merged.extend_from(&collect_cookies(window));
+            }
+        }
+    }
+    // 走完再整体收一次：有的站点在跳转末尾才种 cookie
+    merged = collect_cookies(window);
+    if merged.is_empty() {
+        uis_log("[tour] 一圈下来一个 cookie 都没拿到，这次不做判断（也不覆盖库里的旧会话）");
+        return;
+    }
+    let verdict = verify_canvas_session(&merged);
+    uis_log(&format!("[tour] 会话自检：Canvas {}", verdict.status));
+    let store = get_store();
+    // 先把这次结果记下来（界面上的「已验证 / Canvas 401」读它）
+    crate::uis::record_verdict(store, verdict.status, &verdict.body_head);
+    if verdict.status == 200 {
+        let user = store.setting("uis_username").unwrap_or_default();
+        match crate::uis::save_session_with(store, &merged, &user, Some(200)) {
+            Ok(()) => uis_log(&format!(
+                "[tour] 已保存会话：{} 个 cookie，CASTGC={}，Canvas 200",
+                merged.count(),
+                merged.get("CASTGC").is_some()
+            )),
+            Err(exc) => uis_log(&format!("[tour] 保存会话失败：{exc}")),
+        }
+    } else {
+        // 非 200 一个字节都不写库：库里那份还能用的旧会话不能被游客会话覆盖掉
+        let head: String = verdict.body_head.chars().take(80).collect();
+        uis_log(&format!(
+            "[tour] 不保存：Canvas 仍 {} —— {}（旧会话保持不动）",
+            verdict.status, head
+        ));
+        let _ = window.app_handle().emit(
+            "uis:verify",
+            json!({ "status": verdict.status, "body_head": verdict.body_head }),
+        );
     }
     // 把窗口带回业务入口，别把用户留在教务页上
     if let Ok(url) = UIS_ENTRY.parse::<tauri::Url>() {
         let _ = window.navigate(url);
-    }
-    if merged.is_empty() {
-        uis_log("[tour] 一圈下来一个 cookie 都没拿到");
-        return;
-    }
-    // 关键：验证会话是不是真的能用（只访问了首页的话 Canvas 会回 401）
-    let verdict = verify_canvas_session(&merged);
-    uis_log(&format!("[tour] 会话自检：{verdict}"));
-    let store = get_store();
-    let user = store.setting("uis_username").unwrap_or_default();
-    match crate::uis::save_session(store, &merged, &user) {
-        Ok(()) => uis_log(&format!(
-            "[tour] 已保存会话：{} 个 cookie，CASTGC={}，{}",
-            merged.count(),
-            merged.get("CASTGC").is_some(),
-            verdict
-        )),
-        Err(exc) => uis_log(&format!("[tour] 保存会话失败：{exc}")),
     }
 }
 
@@ -4448,17 +4504,22 @@ fn uis_log(message: &str) {    use std::io::Write;
     }
 }
 
-/// 把几个校内域的 cookie 合并成一个 jar（Python 版是直接读整个 WebEngine profile，等价）
+/// 把几个校内域的 cookie 合并成一个 jar（Python 版是直接读整个 WebEngine profile，等价）。
+///
+/// **按域存**：四个校内域都会发同名的 `_normandy_session`，以前用 `jar.set(name, value)`
+/// 按名字覆盖 —— 登录前先收进来的游客会话会一直盖住登录后那份（2026-11-22 的 401）。
 fn collect_cookies(window: &tauri::WebviewWindow) -> crate::uis::Jar {
     let mut jar = crate::uis::Jar::default();
     for raw in COOKIE_HOSTS {
         let Ok(url) = raw.parse::<tauri::Url>() else {
             continue;
         };
+        let host = url.host_str().unwrap_or("").to_string();
         match window.cookies_for_url(url) {
             Ok(list) => {
                 for cookie in &list {
-                    jar.set(cookie.name(), cookie.value());
+                    // 关键：按域存，不同域的同名 cookie 互不干扰
+                    jar.set_for(&host, cookie.name(), cookie.value());
                 }
             }
             Err(exc) => uis_log(&format!("读 {raw} 的 cookie 失败：{exc}")),
@@ -4528,8 +4589,6 @@ const CLICK_TIMETABLE_JS: &str = r#"(function(){
 })()"#;
 
 fn open_uis_window(app: &tauri::AppHandle) -> Result<(), String> {
-    // 每次打开都允许重新走一遍「业务站收 cookie」
-    TOUR_DONE.store(false, std::sync::atomic::Ordering::SeqCst);
     if let Some(win) = app.get_webview_window("uis-login") {
         let _ = win.show();
         let _ = win.set_focus();
@@ -4551,6 +4610,11 @@ fn open_uis_window(app: &tauri::AppHandle) -> Result<(), String> {
     }
     builder
         .on_page_load(|window, payload| {
+            // 只认「加载完成」。`Started` 阶段地址还是业务站，但页面还没来得及跳到统一身份认证，
+            // 这时抓 cookie 只能抓到游客会话 —— 2026-11-22 的 401 就是这么来的。
+            if payload.event() != tauri::webview::PageLoadEvent::Finished {
+                return;
+            }
             let host = payload.url().host_str().unwrap_or("").to_ascii_lowercase();
             // 还在登录页：等用户（或脚本）把登录走完
             if crate::uis_autofill::is_login_host(&host) {
@@ -4560,13 +4624,35 @@ fn open_uis_window(app: &tauri::AppHandle) -> Result<(), String> {
             if !host.ends_with("fudan.edu.cn") {
                 return;
             }
-            // 回到校内业务页 = 登录成功，自动把会话存下来。
+            // 业务入口 `/login`：SSO 还有效时它会立刻弹回 `/`，挡掉这一跳，
+            // 否则抓取流程末尾「带回 UIS_ENTRY」会自己触发自己（已登录但 Canvas 仍 401 时无限循环）。
+            if payload.url().path().starts_with("/login") {
+                return;
+            }
+            // 回到校内业务页 = 可能登录完成了，去抓一次会话看看。
             //
             // **必须放到子线程里做**：`cookies_for_url` 是通过 dispatcher 同步等主线程的，
             // 而 on_page_load 本身就跑在主线程上，直接调用会自锁（表现为界面卡死/看起来像退出）。
             let win = window.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(800));
+                // 读设置在子线程里做，别占主线程
+                let status = crate::uis::verdict(get_store())["status"].as_i64().unwrap_or(0);
+                if status == 200 {
+                    uis_log("[tour] 会话已验证过（Canvas 200），跳过这一轮");
+                    return;
+                }
+                // 兜底防环：自动触发的抓取最多 60 秒一次（手动点「重新抓取会话」不受这条限制）
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|one| one.as_millis() as i64)
+                    .unwrap_or(0);
+                let last = AUTO_TOUR_AT.load(std::sync::atomic::Ordering::SeqCst);
+                if last != 0 && now - last < 60_000 {
+                    uis_log("[tour] 60 秒内自动抓过一次，这次跳过（要立刻重抓请点「重新抓取会话」）");
+                    return;
+                }
+                AUTO_TOUR_AT.store(now, std::sync::atomic::Ordering::SeqCst);
                 run_cookie_tour(&win, false);
             });
         })
@@ -4616,12 +4702,30 @@ async fn uis_grab_profile(app: tauri::AppHandle) -> serde_json::Value {
                 "CASTGC" | "_normandy_session" | "_legacy_normandy_session" | "log_session_id" | "SESS_ID"
             )
         });
-        match crate::uis::save_session(store, &jar, &user) {
+        let has_castgc = jar.get("CASTGC").is_some();
+        crate::uis::record_verdict(store, verdict.status, &verdict.body_head);
+        // 200 才落库：401 写进去等于把还能用的旧会话覆盖掉（2026-11-22 的坑）
+        if verdict.status != 200 {
+            return json!({
+                "ok": false,
+                "cookies": jar.count(),
+                "has_castgc": has_castgc,
+                "has_service_session": has_service,
+                "status": verdict.status,
+                "body_head": verdict.body_head,
+                "error": format!(
+                    "会话抓到了但 Canvas 回 {}，没有保存（旧会话保持不动）：{}",
+                    verdict.status, verdict.body_head
+                ),
+            });
+        }
+        match crate::uis::save_session_with(store, &jar, &user, Some(200)) {
             Ok(()) => json!({
                 "ok": true,
                 "cookies": jar.count(),
                 "has_service_session": has_service,
-                "verdict": verdict,
+                "status": verdict.status,
+                "verdict": "Canvas API 200（会话可用）",
             }),
             Err(exc) => json!({ "ok": false, "error": exc }),
         }
@@ -4647,36 +4751,48 @@ async fn uis_capture(app: tauri::AppHandle) -> serde_json::Value {
     }
 }
 
+/// 手动「重新抓取会话」：跑一轮 tour，然后**只读结果**。
+///
+/// 收集 cookie 与「200 才落库」都在 `run_cookie_tour` 里做（以前这里自己又 collect 一次、
+/// 又 save 一次，等于绕过自检）。这里只把库里的最终状态翻译成界面能显示的字段。
 fn capture_session_now(app: &tauri::AppHandle) -> serde_json::Value {
     let Some(win) = app.get_webview_window("uis-login") else {
         return json!({ "ok": false, "error": "登录窗口没开：先点「打开登录页」" });
     };
-    // 手动点「重新抓取会话」= 用户想刷新会话，允许再走一遍业务站
-    TOUR_DONE.store(false, std::sync::atomic::Ordering::SeqCst);
     run_cookie_tour(&win, true);
-    let jar = collect_cookies(&win);
-    if jar.is_empty() {
-        return json!({ "ok": false, "error": "还没拿到 cookie：请先在窗口里完成登录" });
-    }
-    let saved = crate::uis::load_session(get_store());
-    let verdict = saved
-        .as_ref()
-        .map(verify_canvas_session)
-        .unwrap_or_else(|| "(没存下会话)".to_string());
+    let store = get_store();
+    let verdict = crate::uis::verdict(store);
+    let status = verdict["status"].as_i64().unwrap_or(0);
+    let body = verdict["body_head"].as_str().unwrap_or("").to_string();
+    let jar = crate::uis::load_session(store).unwrap_or_default();
     let has_service = jar.names().iter().any(|name| {
         matches!(
             name.as_str(),
             "CASTGC" | "_normandy_session" | "_legacy_normandy_session" | "log_session_id" | "SESS_ID"
         )
     });
-    json!({
-        "ok": true,
+    let mut out = json!({
+        "ok": status == 200,
         "cookies": jar.count(),
+        "names": jar.names(),
         "has_castgc": jar.get("CASTGC").is_some(),
         "has_service_session": has_service,
-        "verdict": verdict,
-        "names": jar.names(),
-    })
+        "status": status,
+        "body_head": body,
+        "verdict": if status == 200 {
+            "Canvas API 200（会话可用）".to_string()
+        } else {
+            format!("Canvas API {status}（会话不可用）")
+        },
+    });
+    if status != 200 {
+        out["error"] = json!(if status == 0 {
+            "这一轮没拿到可验证的会话（窗口里可能还没登录完）：先在登录窗口里完整登录一次，再点这里".to_string()
+        } else {
+            format!("会话抓到了但 Canvas 仍回 {status}，没有保存（旧会话保持不动）：{body}")
+        });
+    }
+    out
 }
 
 /// 教务诊断。
@@ -5416,6 +5532,11 @@ pub fn run() {
                         .build(app);
                 }
                 if let Some(window) = app.get_webview_window("main") {
+                    // 直接用事件来源的这个窗口来隐藏，不再靠 label 反查。
+                    // 2026-11-23 用户报「× 关不掉」：`prevent_close()` 生效了、窗口却没隐藏。
+                    // 另一个已知坑：Tauri 内部会缓存「窗口是否可见」，缓存和实际状态一旦不一致
+                    // （例如被外部 Win32 调用改过），`hide()` 就会变成空操作 —— 所以再兜底 force_hide。
+                    let main = window.clone();
                     window.on_window_event(move |event| {
                         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                             // 默认缩到托盘；只有用户明确关掉这条设置才真退出
@@ -5425,9 +5546,10 @@ pub fn run() {
                                 .unwrap_or(true);
                             if keep {
                                 api.prevent_close();
-                                if let Some(win) = handle.get_webview_window("main") {
-                                    let _ = win.hide();
+                                if let Err(exc) = main.hide() {
+                                    eprintln!("[window] 缩托盘时隐藏主窗口失败：{exc}");
                                 }
+                                force_hide(&main);
                                 // 看板娘留在桌面上（用户 2026-11-15）：窗口还在就亮一下；
                                 // 不在了（被关过/崩过）就重开一个 —— 开窗口必须离开事件回调线程，
                                 // 在主线程里 build webview 会把消息泵卡住（_待办清单.md「坑」）。

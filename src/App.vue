@@ -330,6 +330,11 @@ const focus = ref<{ active: boolean; remaining: number; label: string; over: boo
 
 // 全屏倒计时（用户 2026-11-15：AI 用工具开了专注之后要能看见计时，且可以全屏）
 const focusFull = ref(false);
+// 「进入即全屏」开关（设置 → 专注，默认关）与结束提示音开关（focus_sound，默认开）
+const focusFullAuto = ref(false);
+const focusSound = ref(true);
+// 用户自己点「结束本轮」时不要播放「结束」提示音 —— 只有自然走完才提示
+let focusStopByUser = false;
 // 选时长的小面板（方案 A）与自定义输入
 const focusPick = ref(false);
 const focusCustom = ref("25");
@@ -338,12 +343,19 @@ const FOCUS_PRESETS = [15, 25, 45, 60];
 async function refreshFocus() {
   try {
     const state = await focusStatus();
+    const wasActive = focus.value.active;
     focus.value = {
       active: state.active,
       remaining: state.remaining,
       label: state.label || "",
       over: state.over,
     };
+    // 自然结束（不是用户手动结束）：提示音 + 系统通知，并收起全屏
+    if (wasActive && !state.active) {
+      const natural = !focusStopByUser && Boolean(state.started_at);
+      if (natural) focusFinished();
+      focusFull.value = false;
+    }
     // 一轮结束后自动退出全屏，别把整屏留在那儿
     if (!state.active) focusFull.value = false;
   } catch {
@@ -351,10 +363,55 @@ async function refreshFocus() {
   }
 }
 
+/** 一轮专注自然走完：提示音 + 系统通知（跟着「结束提示音」开关走） */
+function focusFinished() {
+  if (!focusSound.value) return;
+  playFocusChime();
+  try {
+    if (!("Notification" in window)) return;
+    if (Notification.permission === "granted") {
+      new Notification("这一轮专注结束了", { body: "起来活动一下，喝口水。" });
+    } else if (Notification.permission !== "denied") {
+      void Notification.requestPermission();
+    }
+  } catch {
+    // 有些环境禁用通知，静默跳过（界面上的计时胶囊已经收起）
+  }
+}
+
+/** 两声短提示音（WebAudio，不需要音频文件；没声卡/被浏览器策略挡住就静默） */
+function playFocusChime() {
+  try {
+    const Ctor = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!Ctor) return;
+    const ctx = new Ctor();
+    const base = ctx.currentTime;
+    [880, 1174.66].forEach((freq, index) => {
+      const start = base + index * 0.28;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.18, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.5);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + 0.55);
+    });
+    window.setTimeout(() => void ctx.close(), 1500);
+  } catch {
+    // 没声音不影响专注功能
+  }
+}
+
 async function toggleFocus() {
   if (focus.value.active) {
+    focusStopByUser = true;
     await focusStop();
     await refreshFocus();
+    focusStopByUser = false;
     return;
   }
   // 用户 2026-11-15：点左侧按钮先选时长（方案 A），不再闷着用 25 分钟
@@ -367,6 +424,7 @@ async function startFocus(minutes: number) {
   focusPick.value = false;
   await focusStart(value);
   void settingsSave({ focus_minutes: String(value) });
+  if (focusFullAuto.value) focusFull.value = true;
   await refreshFocus();
 }
 
@@ -378,10 +436,19 @@ function toggleFocusFull() {
 async function loadFocusDefaults() {
   try {
     const all = await settingsAll();
-    const given = Number((all.values || {})["focus_minutes"] || 0);
+    const values = all.values || {};
+    const given = Number(values["focus_minutes"] || 0);
     if (given > 0) focusCustom.value = String(given);
+    // 「进入即全屏」没设过 = 关（避免一开专注就整屏，用户没要求默认全屏）
+    focusFullAuto.value = values["focus_full_auto"] !== undefined && values["focus_full_auto"] !== ""
+      ? String(values["focus_full_auto"]) !== "0"
+      : false;
+    // 「结束提示音」没设过 = 开（设置页那个开关的默认值也是开）
+    focusSound.value = values["focus_sound"] === undefined || values["focus_sound"] === ""
+      ? true
+      : String(values["focus_sound"]) !== "0";
   } catch {
-    // 用默认 25
+    // 用默认 25 / 不全屏 / 有提示音
   }
 }
 
@@ -577,17 +644,26 @@ onUnmounted(() => window.removeEventListener("keydown", onFullscreenKey));
         @open="openAgenda"
       />
     </div>
-<button
+<div
   v-if="focus.active && !focusFull"
   class="focus-chip"
   :title="focus.label || '专注中'"
-  @click="toggleFocus"
 >
-  <span class="fc-dot" :class="{ over: focus.over }" />
-  <span class="fc-time">{{ focusText() }}</span>
-  <span class="fc-label">{{ focus.label || "专注中" }}</span>
-  <span class="fc-full" title="全屏计时" @click.stop="focusFull = true">⛶</span>
-</button>
+  <!-- 计时区是按钮（点一下结束本轮），⛶ 是另一个真 <button>。
+       以前整个胶囊是一个 button、⛶ 是里面的 span，脚本/UIA 点不中（2026-11-22 用户报的）。 -->
+  <button type="button" class="fc-main" @click="toggleFocus">
+    <span class="fc-dot" :class="{ over: focus.over }" />
+    <span class="fc-time">{{ focusText() }}</span>
+    <span class="fc-label">{{ focus.label || "专注中" }}</span>
+  </button>
+  <button
+    type="button"
+    class="fc-full"
+    title="全屏计时"
+    aria-label="全屏计时"
+    @click.stop="focusFull = true"
+  >⛶</button>
+</div>
 <!-- 点左侧「专注模式」先选时长（方案 A：15/25/45/60 + 自定义，选完记进 focus_minutes） -->
 <div v-if="focusPick && !focus.active" class="focus-pick" @click.self="focusPick = false">
   <div class="fp-title">这一轮专注多久？</div>
@@ -778,8 +854,24 @@ onUnmounted(() => window.removeEventListener("keydown", onFullscreenKey));
   white-space: nowrap;
   color: var(--text-soft);
 }
+.focus-chip .fc-main {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
 .focus-chip .fc-full {
   padding: 0 2px;
+  border: 0;
+  background: none;
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
   color: var(--muted);
 }
 .focus-chip .fc-full:hover {

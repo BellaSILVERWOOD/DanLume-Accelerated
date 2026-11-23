@@ -43,7 +43,7 @@ npm run tauri build -- --no-bundle  # 只出 exe，3–10 分钟
 
 ```powershell
 cd DanLume-server
-.\.venv\Scripts\python.exe -m pytest -q     # 76 passed
+.\.venv\Scripts\python.exe -m pytest -q     # 82 passed
 python run-dev.ps1                          # 本地起在 127.0.0.1:8000
 ```
 
@@ -122,7 +122,7 @@ python main.py --smoke-test                 # 用临时数据目录，别碰真�
 ```powershell
 # Rust：必须带 --test-threads=1（测试改进程级 LUMINA_DATA_DIR，并行会互相污染）
 cd DanLume-v2\src-tauri
-cargo test -- --test-threads=1      # 当前：229 passed / 0 failed / 33 ignored
+cargo test -- --test-threads=1      # 当前：241 passed / 0 failed / 37 ignored（2026-11-23）
 
 # 前端类型检查 + 构建
 cd DanLume-v2
@@ -130,7 +130,7 @@ npm run build
 
 # 服务端
 cd DanLume-server
-.\.venv\Scripts\python.exe -m pytest -q     # 76 passed
+.\.venv\Scripts\python.exe -m pytest -q     # 82 passed
 ```
 
 - 铁律：改源码只用编辑工具（不要用 PowerShell 正则批量替换）；`App.vue`、`focus.rs` 历史上被这么改坏过。
@@ -156,9 +156,9 @@ cd DanLume-server
 
 - 空教室 / 教务 / eHall 都依赖复旦内网身份，需要先 UIS 登录；eHall 部分页面有反爬，失败会提示。
 - 微信相关能力只做到「整理内容 + 复制」（不碰个人号自动化）。
-- 服务端公告目前是 **5 秒轮询**。WebSocket 探针已验证可用（`DanLume-v2/docs/experiments/ws_probe/`，能握手 101 并收到实时帧），
-  但主程序还没集成：依赖图里没有 `openssl-sys`（Windows 上 `native-tls` 走 schannel），路线是用
-  `tokio-tungstenite` + `rustls` 且 `default-features = false`，详见 `_待办清单.md` 的 J3-1。
+- 服务端公告已改成 **真 WebSocket（`/api/v1/stream`）**，5 秒轮询保留为兜底（WS 连着时放慢到 60 秒）；
+  断线按 1→2→4…60 秒退避重连，服务器地址 / 令牌变了会立刻重连。依赖是
+  `tokio-tungstenite`（`default-features = false` + rustls）与同步版 `tungstenite`，图里没有 `openssl-sys`。
 - 使用上报（J2-16）已上线：登录账号后每 10 分钟上报一次「今天用了多久、点了多少次」，只判三条
   （当天时长超限 / 同一台设备换账号 / 上报的账号名和令牌对不上），**不限制 AI 接口调用**；没登录时只在本机记账。
 - 手机端只做到「编译通过 + 签名 APK」，没做真机回归。

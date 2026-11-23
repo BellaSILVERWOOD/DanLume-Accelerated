@@ -102,6 +102,29 @@ pub fn citation(paper: &Value) -> String {
 // **没有检索、也没法把检索结果存进来**（J1-2）。这里先补 arXiv + Crossref 两路（都不用 Key）。
 
 /// 从 Atom XML 里抠 `<entry>` 的字段（arXiv 返回的格式很规整，不引 XML 库）
+/// 把「只认 HTTPS 的站点」的 http 链接升到 https。
+///
+/// 2026-11-23 实测：本机访问 `http://arxiv.org/abs/…` 直接超时（20 秒、HTTP 000），
+/// `https://arxiv.org/abs/…` 200；而 arXiv API 的 `<id>` / `<link>` 仍然给 http。
+/// 入库后点「下载链接」弹的内置浏览器就一直黑屏（用户报的那次）。
+/// 只对已知站点升级，别把一个真只走 HTTP 的站搞坏。
+fn prefer_https(url: &str) -> String {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return trimmed.to_string();
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    const HTTPS_ONLY: [&str; 4] = ["arxiv.org", "export.arxiv.org", "biorxiv.org", "medrxiv.org"];
+    if HTTPS_ONLY
+        .iter()
+        .any(|one| host == *one || host.ends_with(&format!(".{one}")))
+    {
+        return format!("https://{}", &trimmed[7..]);
+    }
+    trimmed.to_string()
+}
+
 fn parse_arxiv(xml: &str, limit: usize) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for chunk in xml.split("<entry>").skip(1) {
@@ -161,6 +184,8 @@ fn parse_arxiv(xml: &str, limit: usize) -> Vec<Value> {
             }
             found
         };
+        // arXiv 的 Atom 里还是 http；本机 http 版会超时，统一升到 https
+        let link = prefer_https(&link);
         let doi = take("arxiv:doi");
         out.push(json!({
             "source": "arxiv",
@@ -1051,6 +1076,10 @@ pub fn links_of(store: &Store, id: i64) -> Value {
     let Some((title, url, pdf_url, doi, file_path, source)) = row else {
         return json!({ "ok": false, "error": "没有这篇文献" });
     };
+    // 老数据里存的可能是 `http://arxiv.org/...`（当时 API 给的就是 http）：
+    // 打开前统一升到 https，否则内置浏览器会一直黑屏（2026-11-23 实测 http 版超时）。
+    let url = prefer_https(&url);
+    let pdf_url = prefer_https(&pdf_url);
     let doi_link = if doi.trim().is_empty() {
         String::new()
     } else {
@@ -1119,6 +1148,8 @@ pub fn download_pdf(store: &Store, id: i64) -> Value {
     let Some((title, project, year, pdf_url, doi, file_path)) = row else {
         return json!({ "ok": false, "summary": "没有这篇文献" });
     };
+    // 同 links_of：老数据里的 http://arxiv.org 要先升 https，否则下载会卡到超时
+    let pdf_url = prefer_https(&pdf_url);
     if !file_path.trim().is_empty() && std::path::Path::new(&file_path).exists() {
         return json!({
             "ok": true,
@@ -1424,6 +1455,41 @@ mod tests {
         assert_eq!(one.get("authors").unwrap().as_str().unwrap(), "Doe, John, Roe, Jane");
         assert_eq!(one.get("year").unwrap().as_str().unwrap(), "2024");
         assert!(one.get("pdf_url").unwrap().as_str().unwrap().contains("/pdf/"));
+        // arXiv 的 Atom 给的是 http；入库前必须升到 https（http 版本机超时）
+        assert_eq!(
+            one.get("url").unwrap().as_str().unwrap(),
+            "https://arxiv.org/abs/2401.00001v1"
+        );
+        assert_eq!(
+            one.get("pdf_url").unwrap().as_str().unwrap(),
+            "https://arxiv.org/pdf/2401.00001v1"
+        );
+    }
+
+    #[test]
+    fn prefer_https_upgrades_only_scholarly_hosts() {
+        assert_eq!(
+            prefer_https("http://arxiv.org/abs/1803.07416v1"),
+            "https://arxiv.org/abs/1803.07416v1"
+        );
+        assert_eq!(
+            prefer_https(" http://export.arxiv.org/api/query?x=1 "),
+            "https://export.arxiv.org/api/query?x=1"
+        );
+        assert_eq!(
+            prefer_https("http://www.biorxiv.org/content/x"),
+            "https://www.biorxiv.org/content/x"
+        );
+        // 已经是 https / 别的站：原样
+        assert_eq!(
+            prefer_https("https://arxiv.org/abs/1803.07416v1"),
+            "https://arxiv.org/abs/1803.07416v1"
+        );
+        assert_eq!(
+            prefer_https("http://example.com/a"),
+            "http://example.com/a"
+        );
+        assert_eq!(prefer_https(""), "");
     }
 
     #[test]

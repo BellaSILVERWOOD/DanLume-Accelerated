@@ -75,6 +75,13 @@ const deviceCount = computed(() => {
 const notifyText = computed(() => {
   const one = notify.value;
   if (!one) return "";
+  if (one.ws_connected) {
+    const last = one.ws_last_frame_at || one.last_ok_at;
+    return `公告通道：WebSocket 实时${last ? ` · 最近活动 ${last}` : ""}`;
+  }
+  if (one.ws_last_error) {
+    return `公告通道：WebSocket 未连上（${one.ws_last_error}），每 ${one.interval_secs} 秒轮询兜底`;
+  }
   if (one.unsupported) return "公告通道：服务器还没有 /announcements 接口（会自动重试）";
   if (one.last_error) return `公告通道：${one.last_error}`;
   if (one.last_ok_at) return `公告通道：每 ${one.interval_secs} 秒轮询 · 上次成功 ${one.last_ok_at}`;

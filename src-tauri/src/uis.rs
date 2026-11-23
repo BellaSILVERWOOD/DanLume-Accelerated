@@ -15,6 +15,10 @@ pub const CANVAS_SERVICE: &str = "https%3A%2F%2Felearning.fudan.edu.cn%2Flogin%2
 pub const SESSION_KEY: &str = "uis_session";
 pub const USER_KEY: &str = "uis_username";
 pub const PASS_KEY: &str = "uis_password";
+/// 最近一次自检：HTTP 状态 / 时间 / 返回体前 200 字（界面显示「已验证 / Canvas 401」用）
+pub const VERIFY_STATUS_KEY: &str = "uis_verify_status";
+pub const VERIFY_AT_KEY: &str = "uis_verify_at";
+pub const VERIFY_BODY_KEY: &str = "uis_verify_body";
 
 fn agent(url: &str) -> ureq::Agent {
     crate::net::with_proxy(
@@ -32,79 +36,233 @@ fn agent(url: &str) -> ureq::Agent {
     .build()
 }
 
-/// 简化 cookie jar：只保存 name=value，不处理 Domain/Path/过期（内部站点够用）
+/// 一条 cookie：名字、值，以及它属于哪个域。
+///
+/// `domain` 为 `None` 表示「不知道域」——库里 2026-11-22 之前存的老会话就是这个形状
+/// （只有 `[name, value]` 两元组），发送时按「哪个站都带」处理，老行为不变。
+#[derive(Debug, Clone)]
+pub struct Cookie {
+    pub name: String,
+    pub value: String,
+    pub domain: Option<String>,
+}
+
+/// 简化 cookie jar：按 **(域, 名字)** 存 name=value，不处理 Path / 过期（内部站点够用）。
+///
+/// 2026-11-22 之前只按名字存：`lib.rs` 的 `collect_cookies()` 把四个校内域读出来
+/// 用 `set(name, value)` 互相覆盖，`to_header()` 又把所有域的值发给每个站。
+/// 后果是「登录前那份游客 `_normandy_session` 一旦先收进来，后面就再也换不掉」——
+/// 这是作业同步 401 的一半原因（另一半是登录完成判定，见 `lib.rs` 的 `run_cookie_tour`）。
 #[derive(Debug, Default, Clone)]
 pub struct Jar {
-    pairs: Vec<(String, String)>,
+    items: Vec<Cookie>,
+}
+
+/// 域归一化：去端口、去前导点、转小写（`".Fudan.edu.cn:443"` → `"fudan.edu.cn"`）
+fn norm_host(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('.')
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// 从 URL 里抠主机名（抠不出来就是空串）
+fn host_of(url: &str) -> String {
+    url.split("//")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .map(norm_host)
+        .unwrap_or_default()
+}
+
+/// 这条 cookie 能不能发给 `host`：域未知（老会话）就都发，否则按「同域或父域」判断
+fn domain_matches(domain: Option<&str>, host: &str) -> bool {
+    match domain {
+        None => true,
+        Some(one) => {
+            let one = norm_host(one);
+            !one.is_empty() && (host == one || host.ends_with(&format!(".{one}")))
+        }
+    }
+}
+
+/// 域名越长说明越具体，同名冲突时用它决定留哪条（域未知记 0）
+fn domain_weight(cookie: &Cookie) -> usize {
+    cookie
+        .domain
+        .as_deref()
+        .map(|one| norm_host(one).len())
+        .unwrap_or(0)
 }
 
 impl Jar {
     pub fn from_header(text: &str) -> Self {
         let mut jar = Jar::default();
+        jar.merge_from_header(None, text);
+        jar
+    }
+
+    /// 从 `a=1; b=2` 这样的串里收 cookie；给了域就按域存
+    pub fn merge_from_header(&mut self, domain: Option<&str>, text: &str) {
         for part in text.split(';') {
             let part = part.trim();
             if part.is_empty() {
                 continue;
             }
             if let Some((name, value)) = part.split_once('=') {
-                jar.set(name.trim(), value.trim());
+                match domain {
+                    Some(host) => self.set_for(host, name.trim(), value.trim()),
+                    None => self.set(name.trim(), value.trim()),
+                }
             }
         }
-        jar
     }
 
+    /// 按名字存（域未知，老行为）
     pub fn set(&mut self, name: &str, value: &str) {
-        if let Some(slot) = self.pairs.iter_mut().find(|(key, _)| key == name) {
-            slot.1 = value.to_string();
+        self.set_domain(None, name, value);
+    }
+
+    /// 按域存：同一个域里同名覆盖，不同域互不干扰
+    pub fn set_for(&mut self, domain: &str, name: &str, value: &str) {
+        let host = norm_host(domain);
+        if host.is_empty() {
+            self.set(name, value);
+            return;
+        }
+        self.set_domain(Some(host.as_str()), name, value);
+    }
+
+    fn set_domain(&mut self, domain: Option<&str>, name: &str, value: &str) {
+        if let Some(slot) = self
+            .items
+            .iter_mut()
+            .find(|one| one.name == name && one.domain.as_deref() == domain)
+        {
+            slot.value = value.to_string();
         } else {
-            self.pairs.push((name.to_string(), value.to_string()));
+            self.items.push(Cookie {
+                name: name.to_string(),
+                value: value.to_string(),
+                domain: domain.map(|one| one.to_string()),
+            });
         }
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.pairs
+        self.items
             .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
+            .find(|one| one.name == name)
+            .map(|one| one.value.as_str())
+    }
+
+    /// 只在这个域下找（诊断用）
+    pub fn get_for(&self, host: &str, name: &str) -> Option<&str> {
+        let host = norm_host(host);
+        self.items
+            .iter()
+            .find(|one| one.name == name && domain_matches(one.domain.as_deref(), &host))
+            .map(|one| one.value.as_str())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pairs.is_empty()
+        self.items.is_empty()
     }
 
-    /// 把另一个 jar 并进来（同名以对方为准）。抓会话时按站点分批收集，最后合并成一份。
+    /// 把另一个 jar 并进来（同域同名以对方为准）。抓会话时按站点分批收集，最后合并成一份。
     pub fn extend_from(&mut self, other: &Jar) {
-        for (name, value) in &other.pairs {
-            self.set(name, value);
+        for one in &other.items {
+            self.set_domain(one.domain.as_deref(), &one.name, &one.value);
         }
     }
 
     pub fn count(&self) -> usize {
-        self.pairs.len()
+        self.items.len()
     }
 
     pub fn names(&self) -> Vec<String> {
-        self.pairs.iter().map(|(name, _)| name.clone()).collect()
+        self.items.iter().map(|one| one.name.clone()).collect()
+    }
+
+    /// jar 里出现过哪些域（诊断用；老会话是 `(未知)`）
+    pub fn domains(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for one in &self.items {
+            let key = one
+                .domain
+                .clone()
+                .unwrap_or_else(|| "(未知)".to_string());
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        out
     }
 
     /// 只读浏览（诊断日志用：打印名字和值的前几位）
-    pub fn entries(&self) -> &[(String, String)] {
-        &self.pairs
+    pub fn entries(&self) -> Vec<(String, String)> {
+        self.items
+            .iter()
+            .map(|one| (one.name.clone(), one.value.clone()))
+            .collect()
     }
 
+    /// 全都发（老接口；域已知时请用 `to_header_for`）
     pub fn to_header(&self) -> String {
-        self.pairs
+        self.items
             .iter()
-            .map(|(name, value)| format!("{name}={value}"))
+            .map(|one| format!("{}={}", one.name, one.value))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// 只把这个域能用得上的 cookie 发出去。
+    ///
+    /// 同名冲突时取「域更长（更具体）」的那条 —— 浏览器的行为也是这样：
+    /// `elearning.fudan.edu.cn` 上那份 `_normandy_session` 优先于 `.fudan.edu.cn` 上的。
+    pub fn to_header_for(&self, host: &str) -> String {
+        let host = norm_host(host);
+        let mut chosen: Vec<&Cookie> = Vec::new();
+        for one in &self.items {
+            if !domain_matches(one.domain.as_deref(), &host) {
+                continue;
+            }
+            let at = chosen.iter().position(|item| item.name == one.name);
+            match at {
+                Some(at) => {
+                    if domain_weight(one) >= domain_weight(chosen[at]) {
+                        chosen[at] = one;
+                    }
+                }
+                None => chosen.push(one),
+            }
+        }
+        chosen
+            .iter()
+            .map(|one| format!("{}={}", one.name, one.value))
             .collect::<Vec<_>>()
             .join("; ")
     }
 
     pub fn merge_set_cookie(&mut self, header: &str) {
+        self.merge_set_cookie_for_host(None, header);
+    }
+
+    /// 从某个域回来的 `Set-Cookie`（推荐这条，能把域记下来）
+    pub fn merge_set_cookie_for(&mut self, host: &str, header: &str) {
+        self.merge_set_cookie_for_host(Some(host), header);
+    }
+
+    fn merge_set_cookie_for_host(&mut self, host: Option<&str>, header: &str) {
         // 一条 Set-Cookie 里第一个分号之前才是 name=value
         let first = header.split(';').next().unwrap_or("").trim();
         if let Some((name, value)) = first.split_once('=') {
-            self.set(name.trim(), value.trim());
+            match host {
+                Some(one) => self.set_for(one, name.trim(), value.trim()),
+                None => self.set(name.trim(), value.trim()),
+            }
         }
     }
 }
@@ -154,16 +312,49 @@ pub fn parse_login_form(html: &str) -> Vec<(String, String)> {
 }
 
 // ------------------------------------------------------------------ 会话存取
-pub fn save_session(store: &Store, jar: &Jar, username: &str) -> Result<(), String> {
-    let payload = json!({
-        "cookies": jar.pairs,
+/// 把会话写进库（DPAPI 加密）。
+///
+/// `verify_status` = 落库前那次自检的 HTTP 状态（`Some(200)` = 真的能用）。
+/// **只有 200 才该带 `Some(200)`**：401 的会话存下来等于把能用的旧会话覆盖掉。
+pub fn save_session_with(
+    store: &Store,
+    jar: &Jar,
+    username: &str,
+    verify_status: Option<u16>,
+) -> Result<(), String> {
+    // 新格式：`[[名字, 值, 域], ...]`。第三项空串 = 域未知（`load_session` 认这个）
+    let rows: Vec<Value> = jar
+        .items
+        .iter()
+        .map(|one| {
+            json!([
+                one.name,
+                one.value,
+                one.domain.clone().unwrap_or_default()
+            ])
+        })
+        .collect();
+    let mut payload = json!({
+        "cookies": rows,
         "username": username,
         "at": crate::now_str(),
+        "format": 2,
     });
+    if let Some(status) = verify_status {
+        payload["verify"] = json!({ "status": status, "at": crate::now_str() });
+    }
     let protected = crate::secrets::protect(&payload.to_string())?;
     store
         .set_setting(SESSION_KEY, &protected)
-        .map_err(|exc| format!("存会话失败：{exc}"))
+        .map_err(|exc| format!("存会话失败：{exc}"))?;
+    if let Some(status) = verify_status {
+        record_verdict(store, status, "");
+    }
+    Ok(())
+}
+
+pub fn save_session(store: &Store, jar: &Jar, username: &str) -> Result<(), String> {
+    save_session_with(store, jar, username, None)
 }
 
 pub fn load_session(store: &Store) -> Option<Jar> {
@@ -175,15 +366,50 @@ pub fn load_session(store: &Store) -> Option<Jar> {
     let value: Value = serde_json::from_str(&raw).ok()?;
     let mut jar = Jar::default();
     for row in value.get("cookies")?.as_array()? {
+        // 新格式 `[名字, 值, 域]`；老格式 `[名字, 值]`（第三项缺省 → 域未知）
         let name = row.get(0)?.as_str()?.to_string();
         let value = row.get(1)?.as_str()?.to_string();
-        jar.set(&name, &value);
+        let domain = row
+            .get(2)
+            .and_then(|one| one.as_str())
+            .map(|one| one.trim().to_string())
+            .filter(|one| !one.is_empty());
+        jar.set_domain(domain.as_deref(), &name, &value);
     }
     Some(jar)
 }
 
 pub fn clear_session(store: &Store) {
     let _ = store.set_setting(SESSION_KEY, "");
+    let _ = store.set_setting(VERIFY_STATUS_KEY, "0");
+    let _ = store.set_setting(VERIFY_AT_KEY, "");
+    let _ = store.set_setting(VERIFY_BODY_KEY, "");
+}
+
+/// 最近一次「拿这份会话打一次 Canvas」的自检结果。`status == 0` 表示没验证过。
+///
+/// 界面上的「已验证 / Canvas 401」读的就是它 —— 光看 `has_session` 会把
+/// 登录前的游客会话也显示成成功（2026-11-22 的 401 就是这么藏住的）。
+pub fn verdict(store: &Store) -> Value {
+    let status = store
+        .setting(VERIFY_STATUS_KEY)
+        .and_then(|text| text.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let body = store.setting(VERIFY_BODY_KEY).unwrap_or_default();
+    json!({
+        "status": status,
+        "at": store.setting(VERIFY_AT_KEY).unwrap_or_default(),
+        "body_head": body,
+    })
+}
+
+/// 记下这次自检的结果（200 = 真的能用）
+pub fn record_verdict(store: &Store, status: u16, body_head: &str) {
+    let _ = store.set_setting(VERIFY_STATUS_KEY, &status.to_string());
+    let _ = store.set_setting(VERIFY_AT_KEY, &crate::now_str());
+    // 空串也要写：200 之后不该还留着上一次 401 的返回体
+    let head: String = body_head.chars().take(200).collect();
+    let _ = store.set_setting(VERIFY_BODY_KEY, &head);
 }
 
 pub fn status(store: &Store) -> Value {
@@ -203,10 +429,14 @@ pub fn status(store: &Store) -> Value {
     json!({
         "username": store.setting(USER_KEY).unwrap_or_default(),
         "has_session": jar.is_some(),
-        "cookies": jar.as_ref().map(|one| one.pairs.len()).unwrap_or(0),
+        "cookies": jar.as_ref().map(|one| one.count()).unwrap_or(0),
         "has_castgc": jar.as_ref().and_then(|one| one.get("CASTGC")).is_some(),
         "has_service_session": has_service_session,
         "session_names": names,
+        // cookie 分在哪些域下（老会话是 `(未知)`）
+        "cookie_domains": jar.as_ref().map(|one| one.domains()).unwrap_or_default(),
+        // 最近一次「拿这份会话打 Canvas」的结果：0 = 没验过，200 = 已验证，401 = Canvas 401
+        "verify": verdict(store),
         "remember_password": store
             .setting("uis_autofill")
             .map(|text| text.trim() != "0")
@@ -307,8 +537,8 @@ pub fn login(store: &Store, username: &str, password: &str) -> Result<Value, Str
         }
         Err(exc) => return Err(format!("登录请求失败：{exc}")),
     };
-    // 把返回的所有 Set-Cookie 都收下来
-    for value in current.all("set-cookie") { jar.merge_set_cookie(value); }
+    // 把返回的所有 Set-Cookie 都收下来（按域记，避免各站同名互相覆盖）
+    for value in current.all("set-cookie") { jar.merge_set_cookie_for("uis.fudan.edu.cn", value); }
     // 有些 CAS 会在 302 链上分段种 cookie：手动跟几跳
     while redirects < 5 {
         let Some(location) = current.header("location").map(|v| v.to_string()) else {
@@ -321,6 +551,7 @@ pub fn login(store: &Store, username: &str, password: &str) -> Result<Value, Str
         } else {
             break;
         };
+        let hop_host = host_of(&next_url);
         let follow = agent(&next_url)
             .get(&next_url)
             .set("Cookie", &jar.to_header())
@@ -330,7 +561,9 @@ pub fn login(store: &Store, username: &str, password: &str) -> Result<Value, Str
             Err(ureq::Error::Status(_, res)) => res,
             Err(_) => break,
         };
-        for value in next.all("set-cookie") { jar.merge_set_cookie(value); }
+        for value in next.all("set-cookie") {
+            jar.merge_set_cookie_for(&hop_host, value);
+        }
         current = next;
         redirects += 1;
     }
@@ -343,7 +576,7 @@ pub fn login(store: &Store, username: &str, password: &str) -> Result<Value, Str
     Ok(json!({
         "ok": true,
         "username": username,
-        "cookies": jar.pairs.len(),
+        "cookies": jar.count(),
         "has_castgc": jar.get("CASTGC").is_some(),
         "redirects": redirects,
     }))
@@ -373,13 +606,14 @@ pub fn visit_with_session(store: &Store, url: &str) -> Result<(String, Jar), Str
     let session = load_session(store)
         .ok_or_else(|| "还没有登录会话：先点「打开登录窗口」再「抓取会话」".to_string())?;
     let mut jar = session.clone();
+    let first_host = host_of(url);
     let mut current = agent(url)
         .get(url)
-        .set("Cookie", &jar.to_header())
+        .set("Cookie", &jar.to_header_for(&first_host))
         .call()
         .map_err(|exc| format!("请求失败：{exc}"))?;
     for value in current.all("set-cookie") {
-        jar.merge_set_cookie(value);
+        jar.merge_set_cookie_for(&first_host, value);
     }
     let mut hops = 0;
     let mut final_url = current.get_url().to_string();
@@ -399,9 +633,10 @@ pub fn visit_with_session(store: &Store, url: &str) -> Result<(String, Jar), Str
         } else {
             break;
         };
+        let hop_host = host_of(&next_url);
         let next = match agent(url)
             .get(&next_url)
-            .set("Cookie", &jar.to_header())
+            .set("Cookie", &jar.to_header_for(&hop_host))
             .call()
         {
             Ok(res) => res,
@@ -409,7 +644,7 @@ pub fn visit_with_session(store: &Store, url: &str) -> Result<(String, Jar), Str
             Err(exc) => return Err(format!("跟随跳转失败：{exc}")),
         };
         for value in next.all("set-cookie") {
-            jar.merge_set_cookie(value);
+            jar.merge_set_cookie_for(&hop_host, value);
         }
         final_url = next.get_url().to_string();
         current = next;
@@ -480,6 +715,91 @@ mod tests {
         assert_eq!(jar.get("CASTGC"), Some("TGT-1"));
         assert_eq!(jar.get("JSESSIONID"), Some("abc"));
         assert!(jar.to_header().contains("CASTGC=TGT-1; JSESSIONID=abc"));
+    }
+
+    #[test]
+    fn to_header_for_filters_by_domain() {
+        let mut jar = Jar::default();
+        jar.set_for("id.fudan.edu.cn", "CASTGC", "TGT-1");
+        jar.set_for("elearning.fudan.edu.cn", "_normandy_session", "canvas-login");
+        jar.set_for("ehall.fudan.edu.cn", "SESS_ID", "ehall-1");
+        jar.set("legacy", "no-domain");
+
+        let canvas = jar.to_header_for("elearning.fudan.edu.cn");
+        println!("发给 Canvas 的：{canvas}");
+        assert!(canvas.contains("_normandy_session=canvas-login"));
+        assert!(
+            canvas.contains("legacy=no-domain"),
+            "域未知的老 cookie 要继续发，否则老会话会立刻失效"
+        );
+        assert!(!canvas.contains("CASTGC"), "别的域的票不该发给 Canvas");
+        assert!(!canvas.contains("SESS_ID"));
+
+        // 父域下发的 cookie 要发给子域
+        let mut parent = Jar::default();
+        parent.set_for(".fudan.edu.cn", "shared", "yes");
+        assert!(parent
+            .to_header_for("elearning.fudan.edu.cn")
+            .contains("shared=yes"));
+    }
+
+    #[test]
+    fn same_name_in_two_domains_does_not_overwrite() {
+        let mut jar = Jar::default();
+        jar.set_for("elearning.fudan.edu.cn", "_normandy_session", "guest");
+        jar.set_for("fdjwgl.fudan.edu.cn", "_normandy_session", "jwgl");
+        // 登录后 Canvas 重发了一次：只替换它自己那一份
+        jar.set_for("elearning.fudan.edu.cn", "_normandy_session", "logged-in");
+        println!("domains = {:?}", jar.domains());
+        assert_eq!(
+            jar.get_for("elearning.fudan.edu.cn", "_normandy_session"),
+            Some("logged-in")
+        );
+        assert_eq!(
+            jar.get_for("fdjwgl.fudan.edu.cn", "_normandy_session"),
+            Some("jwgl")
+        );
+        assert_eq!(jar.count(), 2, "同名不同域是两条，不能互相覆盖");
+    }
+
+    #[test]
+    fn load_session_reads_old_two_tuple_format() {
+        // 库里现存的是 2026-11-22 之前存的老格式：`cookies: [[名字, 值], …]`，没有域
+        let store = temp_store("danlume-uis-old-format");
+        let old = json!({
+            "cookies": [
+                ["CASTGC", "TGT-old"],
+                ["_normandy_session", "guest-value"]
+            ],
+            "username": "26303050173",
+            "at": "2026-11-17 11:23"
+        });
+        let protected = crate::secrets::protect(&old.to_string()).unwrap();
+        store.set_setting(SESSION_KEY, &protected).unwrap();
+
+        let jar = load_session(&store).expect("老格式要能读出来");
+        assert_eq!(jar.get("CASTGC"), Some("TGT-old"));
+        assert_eq!(jar.get("_normandy_session"), Some("guest-value"));
+        // 老格式没有域 → 哪个站都发（老行为不变，不至于把用户的老会话弄失效）
+        assert!(jar
+            .to_header_for("elearning.fudan.edu.cn")
+            .contains("CASTGC=TGT-old"));
+        assert_eq!(session_saved_at(&store), "2026-11-17 11:23");
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("danlume-uis-old-format"));
+    }
+
+    #[test]
+    fn verified_session_records_verdict() {
+        let store = temp_store("danlume-uis-verdict");
+        let mut jar = Jar::default();
+        jar.set_for("elearning.fudan.edu.cn", "_normandy_session", "s1");
+        save_session_with(&store, &jar, "26303050173", Some(200)).unwrap();
+        let state = verdict(&store);
+        println!("verdict = {state}");
+        assert_eq!(state["status"], json!(200));
+        clear_session(&store);
+        assert_eq!(verdict(&store)["status"], json!(0), "退出 UIS 后不该还显示已验证");
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("danlume-uis-verdict"));
     }
 
     #[test]

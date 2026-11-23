@@ -156,9 +156,14 @@ async function sync() {
   try {
     const result = await homeworkSync();
     if (!result.ok) {
-      message.value = `同步失败：${result.error}`;
-      // 读不到多半是没登录：直接切到内嵌网页，让人在里面登录（旧版也是这个提示）
-      if (/登录|会话|cookie/i.test(result.error || "")) openElearning();
+      const reason = result.error || "";
+      // 401 = eLearning 会话过期（Canvas 那边不认 cookie 了）。这条以前只认「登录/会话/cookie」，
+      // 而真实报错里只出现「status code 401」，所以窗口从来不弹（2026-11-21 修）
+      const needLogin = /登录|会话|cookie|401|未授权|unauthor/i.test(reason);
+      message.value = needLogin
+        ? `eLearning 会话过期了（${reason}）——正在打开 eLearning 让你重新登录，登录完再点一次「同步」；或去 设置 → 统一身份认证 点「重新抓取会话」`
+        : `同步失败：${reason}`;
+      if (needLogin) openElearning();
       return;
     }
     syncedAt.value = new Date().toLocaleTimeString();

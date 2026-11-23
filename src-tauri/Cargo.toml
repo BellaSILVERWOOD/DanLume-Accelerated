@@ -27,8 +27,29 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 天气 / eHall / eLearning 这些都要发 HTTP 请求，用轻量的 ureq（自带 rustls）
 ureq = { version = "2", features = ["json", "socks-proxy"] }
-# 服务器公告通道：曾尝试 tungstenite 走 WebSocket，但该依赖会让测试二进制
-# 加载失败（STATUS_ENTRYPOINT_NOT_FOUND），已回退为 5 秒轮询（见 notify.rs）。
+# 服务器公告通道：服务端有真 WebSocket（`WS /api/v1/stream`），客户端先验通道再替换轮询。
+# 历史事故：加 tungstenite **默认特性**会让测试二进制报 STATUS_ENTRYPOINT_NOT_FOUND
+# （它又拉了一份原生 TLS）。所以这里 default-features = false，只开 rustls；
+# 2026-11-10 的探针（docs/experiments/ws_probe）已证明这个组合在 Windows 上可用。
+tokio-tungstenite = { version = "0.24", default-features = false, features = [
+  "connect",
+  "rustls-tls-webpki-roots",
+] }
+# 公告 WS 的实际连接跑在专用线程里，用同步 API 最省事（阻塞读 + 读超时）。
+# 版本与 tokio-tungstenite 依赖的是同一个，不会多编译一份；
+# features 与 docs/experiments/ws_probe 完全一致（已在本机验证过 wss 可用）
+tungstenite = { version = "0.24", default-features = false, features = [
+  "handshake",
+  "rustls-tls-webpki-roots",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# rustls 0.23 需要显式装一个加密后端（ring），否则运行时会 panic：CryptoProvider 未安装
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "logging",
+  "std",
+  "tls12",
+] }
 # 收件箱：IMAP 拉信 + MIME 解析（正文 / 内联图片 / 附件）
 imap = "2"
 mail-parser = "0.9"
