@@ -1632,9 +1632,17 @@ export async function ehallOpen(key: string): Promise<{
   ok: boolean;
   error: string;
   url?: string;
+  /** 没有填过来源地址时，打开的是 eHall 首页（用户自己点进对应服务） */
+  default?: boolean;
 }> {
   if (!isTauri) return { ok: false, error: "浏览器预览里不能抓取" };
   return invoke("ehall_open", { key });
+}
+
+/** 打开 eHall 首页（只用来登录，登录一次卡片就能取数） */
+export async function ehallHomeOpen(): Promise<{ ok: boolean; error?: string }> {
+  if (!isTauri) return { ok: false, error: "浏览器预览里不能打开" };
+  return invoke("ehall_home_open");
 }
 
 /* -------------------------------------------------------------- 空教室 */

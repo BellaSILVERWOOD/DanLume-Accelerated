@@ -1305,4 +1305,44 @@ mod stream_tests {
         assert!(is_cancelled("req-test-1"));
         assert!(!is_cancelled("req-test-1"), "取过一次就该清掉，否则下一轮会被误杀");
     }
+
+    /// 长文献综述对比：用 Rust 版 AI 管线跑**一次**请求（默认跳过）。
+    ///
+    /// `cargo test ai::stream_tests::lit_review_bench -- --ignored --nocapture --test-threads=1`
+    ///
+    /// 为了不碰真实库、也为了控制费用：数据来自临时副本，模型强制 `deepseek-chat`
+    /// （原配置是 deepseek-reasoner，更慢更贵）。提示词与 Python 版完全同一份
+    /// （`_lit_review_bench/prompt.json`）。
+    #[test]
+    #[ignore]
+    fn lit_review_bench() {
+        let store = crate::testdata::real_store("lit-bench");
+        let _ = store.set_setting("llm_model_name", "deepseek-chat");
+        let root = std::path::PathBuf::from(
+            r"E:\FIles\Lena‘s Files\Study\大学\AgentGeneral\_lit_review_bench",
+        );
+        let raw = std::fs::read_to_string(root.join("prompt.json")).expect("读不到 prompt.json");
+        let prompt: Value = serde_json::from_str(&raw).expect("prompt.json 不是合法 JSON");
+        let messages = prompt["messages"].as_array().cloned().expect("messages 不是数组");
+
+        let started = std::time::Instant::now();
+        let reply = chat(&store, &messages, Some(0.6)).expect("AI 请求失败");
+        let elapsed = started.elapsed().as_secs_f64();
+
+        std::fs::create_dir_all(root.join("out")).ok();
+        std::fs::write(root.join("out").join("rust.md"), &reply).expect("写 rust.md 失败");
+        let meta = json!({
+            "version": "rust",
+            "model": "deepseek-chat",
+            "chars": reply.chars().count(),
+            "seconds": (elapsed * 100.0).round() / 100.0,
+            "at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        });
+        std::fs::write(
+            root.join("out").join("rust.meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap_or_default(),
+        )
+        .ok();
+        println!("{meta}");
+    }
 }

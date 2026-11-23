@@ -2384,10 +2384,15 @@ async fn classroom_scrape(
 fn open_grab(app: &tauri::AppHandle, key: &str) -> Result<serde_json::Value, String> {
     let store = get_store();
     let source_key = format!("ehall_json_{key}");
-    let url_text = store.setting(&source_key).unwrap_or_default();
-    if url_text.trim().is_empty() {
-        return Ok(json!({ "ok": false, "error": "这张卡还没填数据地址（设置 → 仪表板）" }));
-    }
+    let saved = store.setting(&source_key).unwrap_or_default();
+    // 没填地址也能开：先落到 eHall 首页，用户登录后自己点进对应服务，
+    // 注入脚本会在地址变化时把页面正文送回来（`ehall_grab::grab_script`），
+    // 解析成功还会自动把来源地址记下来。
+    let (url_text, is_default) = if saved.trim().is_empty() {
+        ("https://ehall.fudan.edu.cn/".to_string(), true)
+    } else {
+        (saved, false)
+    };
     let url: tauri::Url = url_text
         .parse()
         .map_err(|err| format!("地址不合法：{err}"))?;
@@ -2395,14 +2400,49 @@ fn open_grab(app: &tauri::AppHandle, key: &str) -> Result<serde_json::Value, Str
     if let Some(existing) = app.get_webview_window(&label) {
         let _ = existing.close();
     }
-    let title = format!("抓取：{key}");
-    tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::External(url))
-        .title(title)
-        .inner_size(1180.0, 860.0)
-        .initialization_script(ehall_grab::grab_script(key))
+    let title = if is_default {
+        format!("抓取：{key}（在 eHall 里点进对应服务）")
+    } else {
+        format!("抓取：{key}")
+    };
+    let autofill = crate::uis_autofill::script(get_store());
+    let mut builder =
+        tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::External(url))
+            .title(title)
+            .inner_size(1180.0, 860.0)
+            .initialization_script(ehall_grab::grab_script(key));
+    if !autofill.is_empty() {
+        builder = builder.initialization_script(autofill);
+    }
+    builder
         .build()
         .map_err(|err| format!("打不开抓取窗口：{err}"))?;
-    Ok(json!({ "ok": true, "error": "", "url": url_text }))
+    Ok(json!({ "ok": true, "error": "", "url": url_text, "default": is_default }))
+}
+
+/// 打开 eHall 首页（只用来登录，不注入抓取脚本）
+#[tauri::command]
+fn ehall_home_open(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    if let Some(existing) = app.get_webview_window("ehall-home") {
+        let _ = existing.show();
+        let _ = existing.set_focus();
+        return Ok(json!({ "ok": true }));
+    }
+    let url: tauri::Url = "https://ehall.fudan.edu.cn/"
+        .parse()
+        .map_err(|err| format!("地址不合法：{err}"))?;
+    let autofill = crate::uis_autofill::script(get_store());
+    let mut builder =
+        tauri::WebviewWindowBuilder::new(&app, "ehall-home", tauri::WebviewUrl::External(url))
+            .title("登录 eHall（登录一次，仪表板的卡片就能取数）")
+            .inner_size(1180.0, 860.0);
+    if !autofill.is_empty() {
+        builder = builder.initialization_script(autofill);
+    }
+    builder
+        .build()
+        .map_err(|err| format!("打不开 eHall：{err}"))?;
+    Ok(json!({ "ok": true }))
 }
 
 /// 内嵌网页：在主窗口里贴一个子 Webview（位置/大小用 CSS 像素）
@@ -2991,7 +3031,7 @@ fn ehall_cards(state: State<'_, AppState>) -> serde_json::Value {
             .setting(&format!("ehall_cache_{key}"))
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
             .unwrap_or_else(|| json!({}));
-        let ok = cache
+        let mut ok = cache
             .get("ok")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
@@ -3011,7 +3051,7 @@ fn ehall_cards(state: State<'_, AppState>) -> serde_json::Value {
                     .collect()
             })
             .unwrap_or_default();
-        let error = cache
+        let mut error = cache
             .get("error")
             .and_then(|value| value.as_str())
             .unwrap_or("")
@@ -3021,11 +3061,17 @@ fn ehall_cards(state: State<'_, AppState>) -> serde_json::Value {
             .and_then(|value| value.as_f64())
             .map(|value| value as u64)
             .unwrap_or(0);
+        // 没有来源地址、且缓存超过 7 天：多半是旧版本/测试留下的示例数据
+        // （用户报过的「图书馆 1234 人 · 393 小时前」就是这种）。别当真实数据展示。
+        if ok && source.is_empty() && (at == 0 || now.saturating_sub(at) > 7 * 86400) {
+            ok = false;
+            error = "这是旧版本留下的示例/旧缓存（没有来源地址）；点这张卡的「抓取」重新取一次".to_string();
+        }
         out.push(json!({
             "key": key,
             "title": title,
             "ok": ok,
-            "value": value_text,
+            "value": if ok { value_text } else { String::new() },
             "lines": lines,
             "error": if !ok && error.is_empty() { "还没同步过".to_string() } else { error },
             "source": source,
@@ -5890,6 +5936,7 @@ pub fn run() {
             embed_select_tab,
             embed_close_tab,
             ehall_open,
+            ehall_home_open,
             ehall_ingest,
             ehall_ingest_pasted,
             latex_pdf,

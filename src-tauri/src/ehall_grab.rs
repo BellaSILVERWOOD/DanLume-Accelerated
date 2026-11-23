@@ -32,21 +32,50 @@ pub fn parse(key: &str, url: &str, text: &str) -> (bool, String, Vec<String>, St
 
     let value = match key {
         "card" => find_money(&compact),
-        "library_people" => find_count(&compact, &["在馆", "人数", "人"]).unwrap_or_default(),
-        "sports" => find_count(&compact, &["次", "里程", "公里"]).unwrap_or_default(),
+        "library_people" => find_count(&compact, &["人"]).unwrap_or_default(),
+        "sports" => find_count(&compact, &["次", "公里", "km"]).unwrap_or_default(),
         _ => String::new(),
     };
-    if value.is_empty() {
-        // 通用兜底：取第一句像「结论」的文字
-        let fallback = preview
-            .iter()
-            .find(|line| line.chars().count() <= 24 && !line.contains("登录"))
-            .cloned()
-            .unwrap_or_else(|| "已抓到页面".to_string());
-        (true, fallback, preview, String::new())
-    } else {
-        (true, value, preview, String::new())
+    // 页面必须「像」这张卡。抓取窗口没填地址时会先落在 eHall 首页，
+    // 那里也有文字甚至数字；不加这道闸，首页会被当成余额/在馆人数写进缓存，
+    // 还会把首页地址记成来源地址（2026-11-23 的卡片就是这么跑偏的）。
+    let label = match key {
+        "card" => "校园卡余额",
+        "bus" => "校车安排",
+        "sports" => "体育刷锻",
+        "library_people" => "图书馆人数",
+        "ehall_todo" => "eHall 通知",
+        "empty_room" => "空教室",
+        _ => key,
+    };
+    let expects: &[&str] = match key {
+        "card" => &["余额", "校园卡", "一卡通"],
+        "bus" => &["校车", "班车", "时刻", "发车"],
+        "sports" => &["刷锻", "锻炼", "跑步", "里程"],
+        "library_people" => &["在馆", "图书馆", "座位"],
+        "ehall_todo" => &["通知", "待办", "消息"],
+        "empty_room" => &["教室", "空闲"],
+        _ => &[],
+    };
+    let matched = expects.is_empty() || expects.iter().any(|word| compact.contains(word));
+    if !value.is_empty() && matched {
+        return (true, value, preview, String::new());
     }
+    if !matched {
+        return (
+            false,
+            String::new(),
+            preview,
+            format!("当前页面不像「{label}」的数据页（没找到关键词）；在窗口里点进对应服务再试"),
+        );
+    }
+    // 通用兜底：取第一句像「结论」的文字（校车 / 通知这类没有固定数值的卡）
+    let fallback = preview
+        .iter()
+        .find(|line| line.chars().count() <= 24 && !line.contains("登录"))
+        .cloned()
+        .unwrap_or_else(|| "已抓到页面".to_string());
+    (true, fallback, preview, String::new())
 }
 
 /// 余额：`¥128.50` / `¥ 128.50` / `128.50 元`
@@ -126,8 +155,37 @@ fn find_count(text: &str, units: &[&str]) -> Option<String> {
 }
 
 /// 写缓存（形状与旧版一致）
+///
+/// 两条规矩（2026-11-23）：
+/// * **解析失败不覆盖已经成功过的缓存**：抓取窗口可能还停在首页 / 登录页，那时的正文
+///   解析不出余额，直接写会把上一次的好数据冲掉；
+/// * **解析成功就记住来源地址**：抓取窗口里用户自己点进服务页后，把最终地址写回
+///   `ehall_json_<key>`，以后「同步 ehall」就能直接会话直连刷新，不用再打开窗口。
 pub fn store_cache(store: &Store, key: &str, url: &str, text: &str) -> Value {
     let (ok, value, lines, error) = parse(key, url, text);
+    let existing_ok = store
+        .setting(&format!("ehall_cache_{key}"))
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|cache| cache.get("ok").and_then(|one| one.as_bool()))
+        .unwrap_or(false);
+    if !ok && existing_ok {
+        return json!({
+            "ok": false,
+            "value": "",
+            "lines": [],
+            "rows": [],
+            "error": error,
+            "url": url,
+            "kept": true,
+        });
+    }
+    if ok && !url.trim().is_empty() {
+        let source_key = format!("ehall_json_{key}");
+        let current = store.setting(&source_key).unwrap_or_default();
+        if current.trim().is_empty() {
+            let _ = store.set_setting(&source_key, url.trim());
+        }
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|dur| dur.as_secs_f64())
@@ -180,6 +238,34 @@ pub fn grab_script(key: &str) -> String {
   setTimeout(send, 3000);
   setTimeout(send, 8000);
   setTimeout(send, 14000);
+  // SPA 里点进某个服务不会重新加载页面：盯着地址变化，变了就再回传一次。
+  // 这样「打开 eHall 首页 → 登录 → 点进校园卡/图书馆…」也能抓到，而不是只在 3/8/14 秒各抓一次。
+  var lastHref = String(location.href);
+  function sendIfChanged() {{
+    var href = String(location.href);
+    if (href === lastHref) {{ return; }}
+    lastHref = href;
+    setTimeout(send, 1500);
+  }}
+  try {{
+    var push = history.pushState;
+    history.pushState = function () {{
+      var out = push.apply(this, arguments);
+      sendIfChanged();
+      return out;
+    }};
+  }} catch (e) {{}}
+  try {{
+    var replace = history.replaceState;
+    history.replaceState = function () {{
+      var out = replace.apply(this, arguments);
+      sendIfChanged();
+      return out;
+    }};
+  }} catch (e) {{}}
+  window.addEventListener("popstate", sendIfChanged);
+  window.addEventListener("hashchange", sendIfChanged);
+  setInterval(sendIfChanged, 2000);
 }})();"#
     )
 }
@@ -229,6 +315,64 @@ mod tests {
         let cached = store.setting("ehall_cache_library_people").unwrap_or_default();
         assert!(cached.contains("1234人"), "缓存没写进去：{cached}");
         assert!(store.setting("ehall_cache_at_library_people").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 抓取窗口还停在首页/登录页时，解析失败不能把上一次的好数据冲掉
+    #[test]
+    fn failed_parse_keeps_previous_good_cache() {
+        let dir = std::env::temp_dir().join(format!("lumina_grab_keep_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("LUMINA_DATA_DIR", &dir);
+        let store = crate::store::Store::open().expect("临时库打不开");
+        let good = store_cache(
+            &store,
+            "library_people",
+            "https://lib.fudan.edu.cn/stat",
+            "图书馆实时在馆 1234 人",
+        );
+        assert_eq!(good["ok"], serde_json::json!(true));
+
+        let bad = store_cache(
+            &store,
+            "library_people",
+            "https://ehall.fudan.edu.cn/",
+            "欢迎使用 eHall 服务大厅",
+        );
+        assert_eq!(bad["ok"], serde_json::json!(false));
+        assert_eq!(bad["kept"], serde_json::json!(true));
+        let cached = store.setting("ehall_cache_library_people").unwrap_or_default();
+        assert!(cached.contains("1234人"), "好缓存被失败结果覆盖了：{cached}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 抓取成功后自动记住来源地址；已经填过的地址不被后来的抓取覆盖
+    #[test]
+    fn successful_grab_learns_source_url() {
+        let dir = std::env::temp_dir().join(format!("lumina_grab_learn_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("LUMINA_DATA_DIR", &dir);
+        let store = crate::store::Store::open().expect("临时库打不开");
+        assert!(store.setting("ehall_json_card").unwrap_or_default().is_empty());
+
+        let payload = store_cache(
+            &store,
+            "card",
+            "https://ecard.fudan.edu.cn/balance",
+            "校园卡余额 ¥ 66.00",
+        );
+        assert_eq!(payload["ok"], serde_json::json!(true));
+        assert_eq!(
+            store.setting("ehall_json_card").unwrap_or_default(),
+            "https://ecard.fudan.edu.cn/balance"
+        );
+
+        store_cache(&store, "card", "https://other.example/card", "校园卡余额 ¥ 1.00");
+        assert_eq!(
+            store.setting("ehall_json_card").unwrap_or_default(),
+            "https://ecard.fudan.edu.cn/balance",
+            "已经填好的来源地址不该被覆盖"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

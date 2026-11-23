@@ -10,6 +10,7 @@ import SoftButton from "../components/SoftButton.vue";
 import Pill from "../components/Pill.vue";
 import {
   ehallCards,
+  ehallHomeOpen,
   ehallIngestPasted,
   ehallOpen,
   ehallRefreshOnline,
@@ -83,7 +84,7 @@ const todayDone = ref(0);
 async function syncEhall() {
   const targets = ehall.value.filter((card) => card.source.trim());
   if (!targets.length) {
-    syncHint.value = "先在 设置 → 仪表板 里填数据地址";
+    syncHint.value = "还没有来源地址：点下面任意一张卡的「抓取」，或去 设置 → 仪表板 填地址";
     return;
   }
   syncHint.value = "正在用会话直连刷新…";
@@ -102,6 +103,33 @@ async function syncEhall() {
     syncHint.value = `已刷新 ${result.refreshed}/${result.total} 张卡`;
   } catch (err) {
     syncHint.value = `刷新出错：${String(err)}`;
+  }
+}
+
+/** 单张卡「抓取」：没填地址就先开 eHall 首页，用户点进对应服务后脚本自动写回并记住地址 */
+async function grabCard(card: EhallCard) {
+  syncHint.value = "";
+  try {
+    const result = await ehallOpen(card.key);
+    if (!result.ok) {
+      syncHint.value = result.error || "打不开抓取窗口";
+      return;
+    }
+    syncHint.value = result.default
+      ? "已打开 eHall：在里面登录后点进对应服务，页面数据会自动写回这张卡（以后「同步 ehall」直接用这个地址）"
+      : "已打开抓取窗口：等页面加载完，数据会自动写回";
+  } catch (err) {
+    syncHint.value = `打不开抓取窗口：${String(err)}`;
+  }
+}
+
+/** 只登录 eHall（不开抓取脚本） */
+async function openEhallHome() {
+  try {
+    const result = await ehallHomeOpen();
+    syncHint.value = result.ok ? "已打开 eHall：登录一次即可" : result.error || "打不开 eHall";
+  } catch (err) {
+    syncHint.value = `打不开 eHall：${String(err)}`;
   }
 }
 
@@ -220,7 +248,7 @@ function cardMeta(card: EhallCard): string {
       </div>
       <div class="spacer" />
       <div class="head-actions">
-        <SoftButton :height="32" :font-size="12.5">登录 eHall</SoftButton>
+        <SoftButton :height="32" :font-size="12.5" @click="openEhallHome">登录 eHall</SoftButton>
         <SoftButton :height="32" :font-size="12.5" glyph="REFRESH" :disabled="busy" @click="syncEhall">
           同步 ehall
         </SoftButton>
@@ -335,6 +363,10 @@ function cardMeta(card: EhallCard): string {
           {{ card.lines.slice(0, 3).join(" · ") }}
         </div>
         <div v-else class="tiny">{{ card.error || "点「同步 ehall」" }}</div>
+        <div class="card-actions">
+          <button class="mini" :disabled="busy" @click="grabCard(card)">抓取</button>
+          <span class="tiny">{{ card.source ? "已记住来源" : "会打开 eHall" }}</span>
+        </div>
       </WidgetCard>
     </div>
 
@@ -416,6 +448,30 @@ function cardMeta(card: EhallCard): string {
   font-size: 17px;
   font-weight: 600;
   color: var(--text-soft);
+}
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: auto;
+}
+.mini {
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-soft);
+  background: var(--card-alt, var(--card));
+  color: var(--text-soft);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.mini:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.mini:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 .fill {
   min-height: 1px;

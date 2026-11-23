@@ -171,6 +171,27 @@ fn ws_url(base: &str, token: &str) -> String {
     format!("{ws}/api/v1/stream?token={token}")
 }
 
+/// WS 握手/读帧错误是不是「令牌过期或无效」这一类（需要续期后重连）。
+fn is_auth_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("403")
+        || lower.contains("401")
+        || lower.contains("forbidden")
+        || lower.contains("unauthorized")
+}
+
+/// 本机的 access token 是不是已经过期（`server_token_expires_at` 早于现在）。
+///
+/// 公告轮询走公开接口，不会自己续期；WS 握手又必须带令牌，所以连之前先看一眼。
+fn token_looks_expired(store: &Store) -> bool {
+    let at = store.setting("server_token_expires_at").unwrap_or_default();
+    let Ok(deadline) = chrono::NaiveDateTime::parse_from_str(at.trim(), "%Y-%m-%d %H:%M:%S")
+    else {
+        return false;
+    };
+    chrono::Local::now().naive_local() >= deadline
+}
+
 /// 给底层 TCP 设读超时（TLS 的话要摸到里面的 `TcpStream`）。
 ///
 /// rustls 的 `StreamOwned` 把套接字放在公开字段 `sock` 里；拿不到就静默跳过
@@ -327,6 +348,13 @@ fn run_ws(app: tauri::AppHandle) {
     let mut active_key = String::new();
     loop {
         let store = crate::get_store();
+        // access token 只有 30 分钟；公告轮询走公开接口不会续期，连之前先自己续一次
+        if token_looks_expired(store) {
+            match account::refresh(store) {
+                Ok(_) => println!("[公告] 启动时令牌已过期，已续期"),
+                Err(err) => println!("[公告] 令牌已过期，续期失败：{}", err.error),
+            }
+        }
         let base = account::server_url(store);
         let token = account::token(store);
         let key = format!("{base}\u{1}{token}");
@@ -354,7 +382,16 @@ fn run_ws(app: tauri::AppHandle) {
             }
             Err(exc) => {
                 println!("[公告] WebSocket 断开：{exc}");
-                update_state(|state| state.ws_last_error = exc);
+                update_state(|state| state.ws_last_error = exc.clone());
+                // 403 / 401 = 访问令牌过期（uvicorn 把 WS 的 4401 表现成握手 403）。
+                // 公告轮询走的是**公开**接口，不会触发令牌续期，所以这里必须自己续一次；
+                // 续期后 token 变了，外层检测到配置变化会立刻重连。
+                if is_auth_error(&exc) {
+                    match account::refresh(crate::get_store()) {
+                        Ok(_) => println!("[公告] 访问令牌已续期，马上重连 WebSocket"),
+                        Err(err) => println!("[公告] 令牌续期失败：{}", err.error),
+                    }
+                }
             }
         }
 
@@ -739,6 +776,31 @@ mod tests {
             }
             other => panic!("第一帧不是文本：{other:?}"),
         }
+    }
+
+    #[test]
+    fn auth_errors_are_detected() {
+        assert!(is_auth_error("握手失败：HTTP error: 403 Forbidden"));
+        assert!(is_auth_error("读帧失败：HTTP error: 401 Unauthorized"));
+        assert!(!is_auth_error("握手失败：URL error: URL scheme not supported"));
+        assert!(!is_auth_error("读超时（90 秒没收到任何帧，当成连接已死）"));
+    }
+
+    #[test]
+    fn expired_token_is_detected() {
+        let store = temp_store("danlume-notify-token-expiry");
+        assert!(
+            !token_looks_expired(&store),
+            "没有过期时间时不要主动续期"
+        );
+        let _ = store.set_setting("server_token_expires_at", "2020-01-01 00:00:00");
+        assert!(token_looks_expired(&store));
+        let future = (chrono::Local::now() + chrono::Duration::hours(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let _ = store.set_setting("server_token_expires_at", &future);
+        assert!(!token_looks_expired(&store));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("danlume-notify-token-expiry"));
     }
 
     #[test]

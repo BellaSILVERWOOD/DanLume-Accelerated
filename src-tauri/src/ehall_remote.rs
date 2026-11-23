@@ -175,4 +175,70 @@ mod tests {
         // 每张卡的地址键名要和旧版/现有 dashboard 一致
         assert!(CARDS.iter().all(|(_, _, source)| source.starts_with("ehall_json_")));
     }
+
+    /// 真联网：用本机真实会话逐个探候选页面，打印最终地址、长度、关键词命中情况。
+    ///
+    /// `cargo test ehall_remote::tests::real_probe_card_sources -- --ignored --nocapture --test-threads=1`
+    ///
+    /// 用途：确认「校园卡 / 校车 / 刷锻 / 图书馆 / ehall 通知」各自该填哪个地址，
+    /// 免得把猜的地址写死进默认值。
+    #[test]
+    #[ignore]
+    fn real_probe_card_sources() {
+        let store = crate::testdata::real_store("ehall-probe");
+        let candidates = [
+            "https://ehall.fudan.edu.cn/",
+            "https://ecard.fudan.edu.cn/",
+            "https://ecard.fudan.edu.cn/epay/",
+            "https://lib.fudan.edu.cn/",
+            "https://hq.fudan.edu.cn/",
+            "https://www.fudan.edu.cn/",
+            "https://tyb.fudan.edu.cn/",
+        ];
+        let keywords = ["校园卡", "余额", "校车", "班车", "刷锻", "图书馆", "在馆", "通知", "待办"];
+        for url in candidates {
+            match uis::visit_with_session(&store, url) {
+                Ok((landed, jar)) => {
+                    let (final_url, text) = match fetch_page(&jar, url) {
+                        Ok(one) => one,
+                        Err(exc) => {
+                            println!("== {url}\n   取页失败：{exc}");
+                            continue;
+                        }
+                    };
+                    let hits: Vec<&str> = keywords
+                        .iter()
+                        .copied()
+                        .filter(|word| text.contains(word))
+                        .collect();
+                    let head: String = text
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(100)
+                        .collect();
+                    println!(
+                        "== {url}\n   落地={}\n   长度={} 关键词={:?}\n   开头={head}",
+                        crate::shorten_url(&final_url),
+                        text.chars().count(),
+                        hits,
+                    );
+                    if url.contains("ehall.fudan.edu.cn") {
+                        // eHall 首页里找 appShow?appId=… 的条目，后面按服务名筛
+                        let mut seen: Vec<String> = Vec::new();
+                        for piece in text.split("appShow?appId=").skip(1) {
+                            let id: String = piece.chars().take_while(|one| one.is_ascii_digit()).collect();
+                            if !id.is_empty() && !seen.contains(&id) {
+                                seen.push(id);
+                            }
+                        }
+                        println!("   appShow ids（前 30）：{:?}", &seen[..seen.len().min(30)]);
+                    }
+                    let _ = landed;
+                }
+                Err(exc) => println!("== {url}\n   会话访问失败：{exc}"),
+            }
+        }
+    }
 }
