@@ -1,6 +1,7 @@
 <script setup lang="ts">
-// 一行图标：就是 Segoe Fluent Icons 里的一个字形
+// 保持既有 IconGlyph 接口不变：只替换底层 Segoe 字体为跨平台 SVG。
 import { computed } from "vue";
+import { CircleHelp } from "lucide-vue-next";
 import { GLYPH, type GlyphName } from "../icons";
 
 const props = withDefaults(
@@ -11,33 +12,28 @@ const props = withDefaults(
   }>(),
   { size: 14, color: "" },
 );
-
-const char = computed(() => {
-  const key = props.name as GlyphName;
-  return (GLYPH as Record<string, string>)[key] || props.name;
-});
+const component = computed(() => GLYPH[props.name as GlyphName] ?? CircleHelp);
 const px = computed(() =>
   typeof props.size === "number" ? `${props.size}px` : props.size,
 );
 </script>
 
 <template>
-  <span
+  <component
+    :is="component"
     class="glyph"
-    :style="{ fontSize: px, color: color || undefined }"
+    :size="Number(props.size) || 14"
+    :color="color || 'currentColor'"
+    :stroke-width="1.9"
     aria-hidden="true"
-    >{{ char }}</span
-  >
+  />
 </template>
 
 <style scoped>
 .glyph {
-  font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif;
-  font-weight: 400;
-  line-height: 1;
   display: inline-block;
   flex: none;
-  -webkit-font-smoothing: antialiased;
+  vertical-align: middle;
   user-select: none;
   pointer-events: none;
 }
