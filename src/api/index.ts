@@ -1509,6 +1509,8 @@ export type Paper = {
   note: string;
   summary_zh: string;
   stars: number;
+  /** 用颜色区分归档（'' = 无颜色）；用户 2026-11-24 */
+  color: string;
   source: string;
   added_at: string;
 };
@@ -1528,7 +1530,7 @@ export async function papersList(
 
 export async function paperUpdate(
   id: number,
-  patch: { stars?: number; note?: string; summary?: string },
+  patch: { stars?: number; note?: string; summary?: string; color?: string },
 ): Promise<boolean> {
   if (!isTauri) return true;
   return invoke<boolean>("paper_update", {
@@ -1536,7 +1538,17 @@ export async function paperUpdate(
     stars: patch.stars ?? null,
     note: patch.note ?? null,
     summary: patch.summary ?? null,
+    color: patch.color ?? null,
   });
+}
+
+/** 给单篇文献生成「概要」（有缓存直接返回；没有就调一次 AI，结果写回 summary_zh） */
+export async function paperSummary(
+  id: number,
+  force = false,
+): Promise<{ ok: boolean; summary: string; cached: boolean; error: string; need_key?: boolean }> {
+  if (!isTauri) return { ok: false, summary: "", cached: false, error: "浏览器预览里不能调用 AI" };
+  return invoke("paper_summary", { id, force });
 }
 
 export async function paperCitation(id: number): Promise<{ ok: boolean; text: string }> {

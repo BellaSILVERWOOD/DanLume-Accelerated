@@ -456,6 +456,20 @@ fn endpoint(store: &Store, path: &str) -> Result<String, ApiError> {
     Ok(format!("{base}{path}"))
 }
 
+/// 给多端同步用的「带账号令牌的 JSON POST」
+pub(crate) fn post_json_auth(
+    store: &Store,
+    path: &str,
+    body: &Value,
+) -> Result<Value, ApiError> {
+    let token = token(store);
+    if token.is_empty() {
+        return Err(ApiError::config("还没登录账号"));
+    }
+    let url = endpoint(store, path)?;
+    request_json("POST", &url, Some(body), Some(&token))
+}
+
 // ---------------------------------------------------------------- token 处理
 
 /// 把 register / login / refresh 返回的 token 存下来，并记下账号信息。

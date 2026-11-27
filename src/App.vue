@@ -27,7 +27,7 @@ import Placeholder from "./pages/Placeholder.vue";
 import { apply as applyTheme, loadFromSettings } from "./theme";
 import { panelFullscreen, setPanelFullscreen } from "./layout/fullscreen";
 import { pendingMascot } from "./lib/mascotBus";
-import { pendingPage } from "./lib/appBus";
+import { pendingAiPrompt, pendingPage } from "./lib/appBus";
 import { accountState, bootInfo, eventsOn, focusStart, focusStatus, focusStop, mailAccountState, mascotOpen, onMascotSend, settingsAll, settingsSave, upcomingEvents, type UpcomingItem } from "./api";
 
 /**
@@ -116,6 +116,14 @@ watch(pendingPage, (value) => {
     void settingsSave({ sidebar_open: "1" });
   }
   pendingPage.value = null;
+});
+// 文献页「发给 AI」：切到 AI 标签，把提问预填进输入框（复用 mascotBus 那条链路）
+watch(pendingAiPrompt, (value) => {
+  if (!value) return;
+  const text = value;
+  pendingAiPrompt.value = "";
+  pendingMascot.value = { text, paths: [] };
+  openAi();
 });
 const middleVisible = ref(true);
 const dockVisible = ref(true);

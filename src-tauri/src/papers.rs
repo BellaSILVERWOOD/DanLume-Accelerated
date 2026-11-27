@@ -19,14 +19,63 @@ fn row_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "note": row.get::<_, String>("note").unwrap_or_default(),
         "summary_zh": row.get::<_, String>("summary_zh").unwrap_or_default(),
         "stars": row.get::<_, i64>("stars").unwrap_or(0),
+        "color": row.get::<_, String>("color").unwrap_or_default(),
         "source": row.get::<_, String>("source").unwrap_or_default(),
         "added_at": row.get::<_, String>("added_at").unwrap_or_default(),
     }))
 }
 
+/// `papers` 表是旧版 Python 建的，Rust 的 SCHEMA 里没有它。这里保证表存在、并给
+/// 老库补上 `color` 列（用颜色区分归档，用户 2026-11-24）。幂等：什么都不缺时只是
+/// 两条 PRAGMA。
+pub fn ensure_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS papers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL DEFAULT '',
+            source_id TEXT NOT NULL DEFAULT '',
+            doi TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            authors TEXT NOT NULL DEFAULT '',
+            year TEXT NOT NULL DEFAULT '',
+            venue TEXT NOT NULL DEFAULT '',
+            abstract TEXT NOT NULL DEFAULT '',
+            url TEXT NOT NULL DEFAULT '',
+            pdf_url TEXT NOT NULL DEFAULT '',
+            project TEXT NOT NULL DEFAULT '',
+            folder TEXT NOT NULL DEFAULT '',
+            file_path TEXT NOT NULL DEFAULT '',
+            added_at TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            summary_zh TEXT NOT NULL DEFAULT '',
+            stars INTEGER NOT NULL DEFAULT 0,
+            color TEXT NOT NULL DEFAULT '',
+            UNIQUE(source, source_id)
+        );",
+    )?;
+    let mut has_color = false;
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(papers)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1).unwrap_or_default() == "color" {
+                has_color = true;
+            }
+        }
+    }
+    if !has_color {
+        conn.execute(
+            "ALTER TABLE papers ADD COLUMN color TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn papers(store: &Store, project: &str, stars_min: i64, keyword: &str)
     -> rusqlite::Result<Vec<Value>> {
     let conn = store.connection();
+    let _ = ensure_schema(&conn);
     let mut sql = String::from("SELECT * FROM papers WHERE stars >= ?1");
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(stars_min)];
     if !project.trim().is_empty() {
@@ -57,6 +106,7 @@ pub fn papers(store: &Store, project: &str, stars_min: i64, keyword: &str)
 
 pub fn projects(store: &Store) -> rusqlite::Result<Vec<(String, i64)>> {
     let conn = store.connection();
+    let _ = ensure_schema(&conn);
     let mut stmt = conn.prepare(
         "SELECT COALESCE(project, '') AS name, COUNT(*) AS total FROM papers
          GROUP BY name ORDER BY total DESC",
@@ -68,8 +118,9 @@ pub fn projects(store: &Store) -> rusqlite::Result<Vec<(String, i64)>> {
 }
 
 pub fn set_meta(store: &Store, id: i64, stars: Option<i64>, note: Option<&str>,
-                summary: Option<&str>) -> rusqlite::Result<bool> {
+                summary: Option<&str>, color: Option<&str>) -> rusqlite::Result<bool> {
     let conn = store.connection();
+    let _ = ensure_schema(&conn);
     if let Some(value) = stars {
         conn.execute("UPDATE papers SET stars = ?1 WHERE id = ?2", rusqlite::params![value, id])?;
     }
@@ -78,6 +129,9 @@ pub fn set_meta(store: &Store, id: i64, stars: Option<i64>, note: Option<&str>,
     }
     if let Some(value) = summary {
         conn.execute("UPDATE papers SET summary_zh = ?1 WHERE id = ?2", rusqlite::params![value, id])?;
+    }
+    if let Some(value) = color {
+        conn.execute("UPDATE papers SET color = ?1 WHERE id = ?2", rusqlite::params![value, id])?;
     }
     Ok(true)
 }
@@ -814,6 +868,7 @@ pub fn add_paper(store: &Store, item: &Value, project: &str) -> Option<i64> {
         return None;
     }
     let conn = store.connection();
+    let _ = ensure_schema(&conn);
     let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let _ = conn.execute(
         "INSERT INTO papers(source, source_id, doi, title, authors, year, venue,
@@ -1573,33 +1628,10 @@ mod tests {
         }
     }
 
-    /// `papers` 表是旧版建的，Rust 的 SCHEMA 里没有——临时库里要自己补一份
+    /// `papers` 表是旧版建的，Rust 的 SCHEMA 里没有——临时库里自己建一份
     fn ensure_papers_table(store: &Store) {
         let conn = store.connection();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS papers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL DEFAULT '',
-                source_id TEXT NOT NULL DEFAULT '',
-                doi TEXT NOT NULL DEFAULT '',
-                title TEXT NOT NULL DEFAULT '',
-                authors TEXT NOT NULL DEFAULT '',
-                year TEXT NOT NULL DEFAULT '',
-                venue TEXT NOT NULL DEFAULT '',
-                abstract TEXT NOT NULL DEFAULT '',
-                url TEXT NOT NULL DEFAULT '',
-                pdf_url TEXT NOT NULL DEFAULT '',
-                project TEXT NOT NULL DEFAULT '',
-                folder TEXT NOT NULL DEFAULT '',
-                file_path TEXT NOT NULL DEFAULT '',
-                added_at TEXT NOT NULL DEFAULT '',
-                note TEXT NOT NULL DEFAULT '',
-                summary_zh TEXT NOT NULL DEFAULT '',
-                stars INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(source, source_id)
-            );",
-        )
-        .expect("建 papers 表");
+        ensure_schema(&conn).expect("建 papers 表");
     }
 
     /// 没有 PDF 地址的文献：给一句人话，不去联网
@@ -1681,6 +1713,53 @@ mod tests {
         let fallback = library_folder("", "");
         let tail = fallback.to_string_lossy().to_string();
         assert!(tail.contains("未分类") && tail.contains("未知年份"), "{tail}");
+        drop(temp);
+    }
+
+    /// 老库（没有 color 列）升级后能用颜色归档：补列 + 写入 + 读回（用户 2026-11-24）
+    #[test]
+    fn color_column_is_added_to_old_library() {
+        let temp = TempData::new("color");
+        let store = Store::open().expect("临时库");
+        {
+            // 先用「旧版」建表：没有 color 列
+            let conn = store.connection();
+            conn.execute_batch(
+                "CREATE TABLE papers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL DEFAULT '',
+                    source_id TEXT NOT NULL DEFAULT '',
+                    doi TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    authors TEXT NOT NULL DEFAULT '',
+                    year TEXT NOT NULL DEFAULT '',
+                    venue TEXT NOT NULL DEFAULT '',
+                    abstract TEXT NOT NULL DEFAULT '',
+                    url TEXT NOT NULL DEFAULT '',
+                    pdf_url TEXT NOT NULL DEFAULT '',
+                    project TEXT NOT NULL DEFAULT '',
+                    folder TEXT NOT NULL DEFAULT '',
+                    file_path TEXT NOT NULL DEFAULT '',
+                    added_at TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT '',
+                    summary_zh TEXT NOT NULL DEFAULT '',
+                    stars INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(source, source_id)
+                );
+                INSERT INTO papers(source, source_id, title) VALUES ('arxiv', '2401.00001', 'A color test');",
+            )
+            .expect("建旧表");
+        }
+        // 升级 + 写颜色
+        set_meta(&store, 1, None, None, None, Some("amber")).expect("写颜色");
+        let rows = papers(&store, "", 0, "").expect("读列表");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["color"], json!("amber"), "{rows:?}");
+        // 再跑一次迁移是幂等的
+        {
+            let conn = store.connection();
+            ensure_schema(&conn).expect("再来一次");
+        }
         drop(temp);
     }
 }

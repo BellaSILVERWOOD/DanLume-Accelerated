@@ -18,7 +18,9 @@ import {
   litFlowGenerate,
   litFlowLoad,
   openPath,
+  openUrl,
   paperCitation,
+  paperSummary,
   paperUpdate,
   papersDatabases,
   papersDownload,
@@ -44,6 +46,7 @@ import {
   type PaperSearchHitWithCoverage,
   type RefEntry,
 } from "../api";
+import { askAi } from "../lib/appBus";
 
 // ---- 在线检索（arXiv + Crossref），旧版 lit.search_all —— Rust 以前没有
 //
@@ -89,6 +92,8 @@ async function searchOnline() {
   }
   searchBusy.value = true;
   searchHits.value = [];
+  selectedHitKeys.value = new Set();
+  hitWorks.value = [];
   searchOffset.value = 0;
   searchMore.value = false;
   searchTotals.value = {};
@@ -171,6 +176,228 @@ async function addHit(hit: PaperSearchHitWithCoverage) {
   const result = await papersAdd(hit, project.value || "");
   searchMsg.value = result.ok ? `已加入文献库：${hit.title.slice(0, 40)}` : `加入失败：${result.error}`;
   if (result.ok) await load();
+}
+
+/* ---- 检索结果：多选 + 上拉加载更多 + 底部操作条（用户 2026-11-24）----
+ *
+ * 需求原文：「点击的话希望直接转到 arxiv 的 pdf 下载页面。那么能不能加一个多选的选项，
+ * 然后当选中的时候页面下方显示『概要』『流程图』『下载 pdf』『加入我的文献库』。」
+ */
+
+/** 一条检索结果的选择键（source + source_id 唯一） */
+function hitKey(hit: PaperSearchHitWithCoverage): string {
+  return `${hit.source}::${hit.source_id}`;
+}
+const selectedHitKeys = ref<Set<string>>(new Set());
+const selectedHits = computed(() =>
+  searchHits.value.filter((hit) => selectedHitKeys.value.has(hitKey(hit))),
+);
+const searchAllSelected = computed(
+  () => searchHits.value.length > 0 && selectedHitKeys.value.size === searchHits.value.length,
+);
+function isHitSelected(hit: PaperSearchHitWithCoverage): boolean {
+  return selectedHitKeys.value.has(hitKey(hit));
+}
+function toggleHit(hit: PaperSearchHitWithCoverage) {
+  // 换成一个新 Set 才会触发 Vue 的响应式更新
+  const next = new Set(selectedHitKeys.value);
+  const key = hitKey(hit);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  selectedHitKeys.value = next;
+}
+function toggleAllHits() {
+  selectedHitKeys.value = searchAllSelected.value
+    ? new Set()
+    : new Set(searchHits.value.map(hitKey));
+}
+
+/** 点检索结果 → 直接在系统浏览器打开 PDF（arXiv 的 pdf_url 已经是 /pdf/ 链接） */
+function openHitPdf(hit: PaperSearchHitWithCoverage) {
+  const target = (hit.pdf_url || hit.url || "").trim();
+  if (!target) {
+    searchMsg.value = "这条没有可打开的链接";
+    return;
+  }
+  void openUrl(target);
+}
+
+/** 检索结果容器滚到底部时自动读下一页（用户：「滚到页面下方继续滚」） */
+const searchCardEl = ref<HTMLElement | null>(null);
+function onSearchCardScroll(event: Event) {
+  const el = event.target as HTMLElement;
+  if (!searchMore.value || searchMoreBusy.value || searchBusy.value) return;
+  // 距底不到 120px 就提前读，滚动时不至于卡一下
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 120) {
+    void searchMoreResults();
+  }
+}
+
+/** 每条选中文献的「概要 / 流程图 / 下载」结果，显示在操作条下面 */
+type HitWork = {
+  key: string;
+  title: string;
+  summary: string;
+  steps: { label: string; detail: string }[];
+  note: string;
+  busy: boolean;
+};
+const hitWorks = ref<HitWork[]>([]);
+const hitsBusy = ref(false);
+function clearHitSelection() {
+  selectedHitKeys.value = new Set();
+  hitWorks.value = [];
+}
+function workOf(hit: PaperSearchHitWithCoverage): HitWork | undefined {
+  return hitWorks.value.find((one) => one.key === hitKey(hit));
+}
+/** 把一条检索结果写进文献库，拿到 id（同来源同 id 会复用已有那条） */
+async function ensureHitInLibrary(hit: PaperSearchHitWithCoverage): Promise<number | null> {
+  try {
+    const result = await papersAdd(hit, project.value || "");
+    return result.ok && typeof result.id === "number" ? result.id : null;
+  } catch {
+    return null;
+  }
+}
+function newWorkRow(hit: PaperSearchHitWithCoverage, note: string): HitWork {
+  return { key: hitKey(hit), title: hit.title, summary: "", steps: [], note, busy: true };
+}
+
+async function addSelectedHits() {
+  if (hitsBusy.value) return;
+  hitsBusy.value = true;
+  hitWorks.value = [];
+  let added = 0;
+  let failed = 0;
+  try {
+    for (const hit of selectedHits.value) {
+      const id = await ensureHitInLibrary(hit);
+      if (id == null) failed += 1;
+      else added += 1;
+    }
+    searchMsg.value = `已加入文献库 ${added} 篇` + (failed ? `，失败 ${failed} 篇` : "");
+    if (added) {
+      selectedHitKeys.value = new Set();
+      await load();
+    }
+  } finally {
+    hitsBusy.value = false;
+  }
+}
+
+async function summarizeSelectedHits() {
+  if (hitsBusy.value || !selectedHits.value.length) return;
+  hitsBusy.value = true;
+  const hits = [...selectedHits.value];
+  hitWorks.value = hits.map((hit) => newWorkRow(hit, "正在加进文献库…"));
+  try {
+    for (const hit of hits) {
+      const work = workOf(hit);
+      if (!work) continue;
+      const id = await ensureHitInLibrary(hit);
+      if (id == null) {
+        work.note = "加入文献库失败";
+        work.busy = false;
+        continue;
+      }
+      work.note = "正在生成概要…";
+      try {
+        const res = await paperSummary(id, true);
+        if (res.ok) {
+          work.summary = res.summary;
+          work.note = "";
+        } else {
+          work.note = res.error || "生成失败";
+        }
+      } catch (err) {
+        work.note = `生成失败：${String(err)}`;
+      }
+      work.busy = false;
+    }
+    await load();
+  } finally {
+    hitsBusy.value = false;
+  }
+}
+
+async function flowSelectedHits() {
+  if (hitsBusy.value || !selectedHits.value.length) return;
+  if (!aiReady.value) {
+    searchMsg.value = "没有可用的模型：去 设置 → AI（API 服务）填好接口地址和 Key 再回来";
+    return;
+  }
+  hitsBusy.value = true;
+  const hits = [...selectedHits.value];
+  hitWorks.value = hits.map((hit) => newWorkRow(hit, "正在加进文献库…"));
+  try {
+    for (const hit of hits) {
+      const work = workOf(hit);
+      if (!work) continue;
+      const id = await ensureHitInLibrary(hit);
+      if (id == null) {
+        work.note = "加入文献库失败";
+        work.busy = false;
+        continue;
+      }
+      work.note = "正在拆流程图…";
+      try {
+        const res = await litFlowGenerate(id, {
+          force: false,
+          title: hit.title,
+          text: hit.abstract || "",
+        });
+        if (res.ok) {
+          work.steps = (res.nodes || []).map((node) => ({
+            label: node.label,
+            detail: node.detail || "",
+          }));
+          work.note = res.fallback ? "模型没按结构回，已用纯文本步骤" : "";
+        } else {
+          work.note = res.need_key ? "先配好 AI 接口和 Key" : res.error || "生成失败";
+        }
+      } catch (err) {
+        work.note = `生成失败：${String(err)}`;
+      }
+      work.busy = false;
+    }
+    await load();
+  } finally {
+    hitsBusy.value = false;
+  }
+}
+
+async function downloadSelectedHits() {
+  if (hitsBusy.value || !selectedHits.value.length) return;
+  hitsBusy.value = true;
+  const hits = [...selectedHits.value];
+  hitWorks.value = hits.map((hit) => newWorkRow(hit, "正在加进文献库…"));
+  try {
+    for (const hit of hits) {
+      const work = workOf(hit);
+      if (!work) continue;
+      const id = await ensureHitInLibrary(hit);
+      if (id == null) {
+        work.note = "加入文献库失败";
+        work.busy = false;
+        continue;
+      }
+      work.note = "正在下载…";
+      try {
+        const res = await papersDownload(id);
+        work.note = res.summary || (res.ok ? "下载完成" : "下载失败");
+        if (!res.ok && LOGIN_HINTS.some((one) => String(res.summary || "").includes(one))) {
+          work.note += "（要机构登录：去文献库详情里点「下载链接」，在内置浏览器里登录后自己下）";
+        }
+      } catch (err) {
+        work.note = `下载失败：${String(err)}`;
+      }
+      work.busy = false;
+    }
+    await load();
+  } finally {
+    hitsBusy.value = false;
+  }
 }
 
 // ---- 参考文献层（旧版 refs.py）
@@ -622,6 +849,104 @@ async function toggleStar(paper: Paper, star: number) {
   paper.stars = next;
 }
 
+/* ---- 我的文献库：颜色归档 + 笔记 + 一键发给 AI 提问（用户 2026-11-24）----
+ *
+ * 需求原文：「加入我的文献库后文献应当可以选择下载和做笔记和标星（0-5 颗星星）
+ * 和使用颜色区分归档，还可以一键发送给 AI 提问。」
+ * 下载 / 标星原来就有；这里补颜色归档、可编辑笔记、发给 AI。
+ */
+
+/** 七种归档颜色（'' = 不标色）；颜色只是分类，不改动文献本身 */
+const COLOR_TAGS: { key: string; label: string; css: string }[] = [
+  { key: "", label: "无", css: "" },
+  { key: "rose", label: "红", css: "#d9536a" },
+  { key: "amber", label: "橙", css: "#d98a2b" },
+  { key: "green", label: "绿", css: "#2f9e6d" },
+  { key: "sky", label: "蓝", css: "#3b86c9" },
+  { key: "violet", label: "紫", css: "#8a63c9" },
+  { key: "slate", label: "灰", css: "#7b8698" },
+];
+function colorCss(key: string): string {
+  return COLOR_TAGS.find((one) => one.key === key)?.css || "";
+}
+function colorLabel(key: string): string {
+  return COLOR_TAGS.find((one) => one.key === key)?.label || "无";
+}
+/** 除「无」以外的颜色，给筛选条用 */
+const colorChoices = COLOR_TAGS.filter((one) => one.key !== "");
+async function setColor(paper: Paper, color: string) {
+  const next = paper.color === color ? "" : color;
+  await paperUpdate(paper.id, { color: next });
+  paper.color = next;
+}
+
+/** 按颜色筛选（'' = 全部）；列表里做客户端过滤，不动后端查询 */
+const colorFilter = ref("");
+const shownItems = computed(() =>
+  colorFilter.value ? items.value.filter((one) => one.color === colorFilter.value) : items.value,
+);
+
+/** 笔记：选中那篇的草稿，点「保存笔记」才写回（避免每次输入都写库） */
+const noteDraft = ref("");
+const noteSaved = ref("");
+watch(
+  selected,
+  (paper) => {
+    noteDraft.value = paper?.note || "";
+    noteSaved.value = "";
+  },
+  { immediate: true },
+);
+async function saveNote() {
+  const paper = selected.value;
+  if (!paper) return;
+  await paperUpdate(paper.id, { note: noteDraft.value });
+  paper.note = noteDraft.value;
+  noteSaved.value = "笔记已保存";
+}
+
+/** 一键把这篇文献（标题 / 摘要 / 笔记 / 链接）发给 AI 提问 */
+function askAboutPaper(paper: Paper) {
+  const meta: string[] = [];
+  if (paper.authors) meta.push(`作者：${paper.authors}`);
+  if (paper.venue || paper.year) meta.push(`出处：${paper.venue || ""}${paper.year ? ` · ${paper.year}` : ""}`);
+  if (paper.doi) meta.push(`DOI：${paper.doi}`);
+  const lines = [
+    "请帮我读这篇论文，并回答我后面的问题：",
+    `标题：${paper.title}`,
+    ...meta,
+    paper.abstract ? `\n摘要：\n${paper.abstract}` : "",
+    paper.summary_zh ? `\n已有中文概述：${paper.summary_zh}` : "",
+    paper.note ? `\n我的笔记：${paper.note}` : "",
+    paper.url || paper.pdf_url ? `\n链接：${paper.url || paper.pdf_url}` : "",
+    "\n",
+  ].filter((line) => line.trim() !== "");
+  askAi(lines.join("\n"));
+}
+
+/** 给当前选中的那篇文献生成 / 重新生成中文概要 */
+const summaryBusy = ref(false);
+const summaryMsg = ref("");
+async function summarizeSelected() {
+  const paper = selected.value;
+  if (!paper || summaryBusy.value) return;
+  summaryBusy.value = true;
+  summaryMsg.value = "";
+  try {
+    const res = await paperSummary(paper.id, true);
+    if (res.ok) {
+      paper.summary_zh = res.summary;
+      summaryMsg.value = "概要已生成";
+    } else {
+      summaryMsg.value = res.need_key ? "先配好 AI 接口和 Key" : res.error || "生成失败";
+    }
+  } catch (err) {
+    summaryMsg.value = `生成失败：${String(err)}`;
+  } finally {
+    summaryBusy.value = false;
+  }
+}
+
 async function copyCitation() {
   if (!selected.value) return;
   const result = await paperCitation(selected.value.id);
@@ -681,7 +1006,11 @@ onMounted(async () => {
     </div>
 
     <!-- 在线检索：arXiv + Crossref（旧版 lit.search_all） -->
-    <div class="refs-card">
+    <div
+      ref="searchCardEl"
+      class="refs-card search-card"
+      @scroll="onSearchCardScroll"
+    >
       <div class="refs-head">
         <b>在线检索</b>
         <input
@@ -703,6 +1032,19 @@ onMounted(async () => {
         >
           {{ semanticBusy ? "思考中…" : "按意思搜" }}
         </SoftButton>
+        <label
+          v-if="searchHits.length"
+          class="select-all"
+          :title="searchAllSelected ? '取消全选' : '全选这一页结果'"
+        >
+          <input
+            type="checkbox"
+            :checked="searchAllSelected"
+            :indeterminate.prop="selectedHitKeys.size > 0 && !searchAllSelected"
+            @change="toggleAllHits"
+          />
+          全选
+        </label>
       </div>
       <div v-if="searchMsg" class="hint">{{ searchMsg }}</div>
       <div v-if="semanticStatus" class="hint">
@@ -731,9 +1073,25 @@ onMounted(async () => {
         <span class="coverage full">相似度 {{ (hit.score * 100).toFixed(0) }}%</span>
         <SoftButton :height="26" :font-size="11.5" @click="selectSemantic(hit)">看这篇</SoftButton>
       </div>
-      <div v-for="hit in searchHits" :key="`${hit.source}-${hit.source_id}`" class="ref-row">
-        <div class="ref-main">
-          <b>{{ hit.title }}</b>
+      <div
+        v-for="hit in searchHits"
+        :key="`${hit.source}-${hit.source_id}`"
+        class="ref-row"
+        :class="{ picked: isHitSelected(hit) }"
+      >
+        <input
+          type="checkbox"
+          class="hit-check"
+          :checked="isHitSelected(hit)"
+          :title="isHitSelected(hit) ? '取消选择' : '选择这篇'"
+          @change="toggleHit(hit)"
+        />
+        <div
+          class="ref-main clickable"
+          title="点开在浏览器里看 PDF"
+          @click="openHitPdf(hit)"
+        >
+          <b class="hit-title">{{ hit.title }}</b>
           <span class="ref-meta">
             {{ hit.authors || "（无作者）" }}{{ hit.year ? ` · ${hit.year}` : "" }}{{
               hit.venue ? ` · ${hit.venue}` : ""
@@ -754,8 +1112,74 @@ onMounted(async () => {
         <span class="ref-doi">{{ hit.source }}</span>
         <SoftButton :height="26" :font-size="11.5" @click="addHit(hit)">加入文献库</SoftButton>
       </div>
+      <!-- 多选后出现的操作条（用户 2026-11-24）：概要 / 流程图 / 下载 PDF / 加入我的文献库 -->
+      <div v-if="selectedHits.length" class="hit-bar">
+        <span class="hit-bar-count">已选 {{ selectedHits.length }} 篇</span>
+        <SoftButton
+          :height="28"
+          :font-size="12"
+          :disabled="hitsBusy"
+          title="给每篇生成 80–120 字的中文概要"
+          @click="summarizeSelectedHits"
+        >
+          概要
+        </SoftButton>
+        <SoftButton
+          :height="28"
+          :font-size="12"
+          :disabled="hitsBusy"
+          title="让模型把每篇拆成方法流程图"
+          @click="flowSelectedHits"
+        >
+          流程图
+        </SoftButton>
+        <SoftButton
+          :height="28"
+          :font-size="12"
+          :disabled="hitsBusy"
+          title="下到文献库目录并入库"
+          @click="downloadSelectedHits"
+        >
+          下载 PDF
+        </SoftButton>
+        <SoftButton
+          variant="primary"
+          :height="28"
+          :font-size="12"
+          :disabled="hitsBusy"
+          @click="addSelectedHits"
+        >
+          加入我的文献库
+        </SoftButton>
+        <SoftButton
+          :height="28"
+          :font-size="12"
+          :disabled="hitsBusy"
+          @click="clearHitSelection"
+        >
+          取消选择
+        </SoftButton>
+      </div>
+      <!-- 概要 / 流程图 / 下载 的结果，直接显示在操作条下面 -->
+      <div v-if="hitWorks.length" class="hit-works">
+        <div v-for="work in hitWorks" :key="work.key" class="hit-work">
+          <div class="hit-work-title">{{ work.title }}</div>
+          <div v-if="work.busy || work.note" class="hit-work-note" :class="{ busy: work.busy }">
+            {{ work.note || "处理中…" }}
+          </div>
+          <div v-if="work.summary" class="hit-work-text">{{ work.summary }}</div>
+          <ol v-if="work.steps.length" class="hit-work-steps">
+            <li v-for="(step, index) in work.steps" :key="index">
+              <b>{{ step.label }}</b><span v-if="step.detail">：{{ step.detail }}</span>
+            </li>
+          </ol>
+        </div>
+      </div>
       <div v-if="searchHits.length" class="search-more">
-        <span class="tiny">{{ searchTotalText ? `库里总量：${searchTotalText}` : "" }}</span>
+        <span class="tiny">
+          {{ searchTotalText ? `库里总量：${searchTotalText}` : "" }}
+          <template v-if="searchMore"> · 往下滚自动加载更多</template>
+        </span>
         <span class="spacer" />
         <SoftButton
           :height="28"
@@ -844,17 +1268,39 @@ onMounted(async () => {
         <option :value="3">3 星以上</option>
         <option :value="5">只看 5 星</option>
       </select>
+      <!-- 颜色归档筛选（用户 2026-11-24）：点一个颜色只看这一类 -->
+      <div class="color-filter" title="按颜色归档筛选">
+        <button class="color-chip" :class="{ on: !colorFilter }" @click="colorFilter = ''">
+          全部颜色
+        </button>
+        <button
+          v-for="tag in colorChoices"
+          :key="tag.key"
+          class="color-chip"
+          :class="{ on: colorFilter === tag.key }"
+          :title="`只看「${tag.label}」类`"
+          @click="colorFilter = colorFilter === tag.key ? '' : tag.key"
+        >
+          <span class="color-dot" :style="{ background: tag.css }" />{{ tag.label }}
+        </button>
+      </div>
     </div>
 
     <div class="body">
       <div class="list">
         <button
-          v-for="paper in items"
+          v-for="paper in shownItems"
           :key="paper.id"
           class="row"
           :class="{ on: selected?.id === paper.id }"
           @click="selectedId = paper.id"
         >
+          <span
+            v-if="paper.color"
+            class="row-color"
+            :style="{ background: colorCss(paper.color) }"
+            :title="`归档颜色：${colorLabel(paper.color)}`"
+          />
           <span class="stars">
             <b v-for="star in stars" :key="star" :class="{ lit: paper.stars >= star }" @click.stop="toggleStar(paper, star)">★</b>
           </span>
@@ -863,11 +1309,14 @@ onMounted(async () => {
             <span class="meta">
               {{ paper.authors.slice(0, 40) }} · {{ paper.venue }} · {{ paper.year || "" }}
             </span>
-            <span v-if="paper.summary_zh" class="summary">{{ paper.summary_zh }}</span>
+            <span v-if="paper.note" class="summary">📝 {{ paper.note }}</span>
+            <span v-else-if="paper.summary_zh" class="summary">{{ paper.summary_zh }}</span>
           </span>
           <span class="project">{{ paper.project || "未分类" }}</span>
         </button>
-        <div v-if="!items.length" class="empty">{{ message }}</div>
+        <div v-if="!shownItems.length" class="empty">
+          {{ items.length ? "这个颜色下还没有文献" : message }}
+        </div>
       </div>
 
       <div class="detail">
@@ -888,10 +1337,51 @@ onMounted(async () => {
             <div class="field">
               <div class="label">中文概述</div>
               <div class="text">{{ selected.summary_zh || "（还没有自动概述）" }}</div>
+              <div class="note-actions">
+                <SoftButton
+                  :height="26"
+                  :font-size="11.5"
+                  :disabled="summaryBusy || !aiReady"
+                  title="让模型写一段 80–120 字的中文概要"
+                  @click="summarizeSelected"
+                >
+                  {{ summaryBusy ? "生成中…" : selected.summary_zh ? "重新生成概要" : "生成概要" }}
+                </SoftButton>
+                <span v-if="summaryMsg" class="tiny">{{ summaryMsg }}</span>
+                <span v-else-if="!aiReady" class="hint">没配 API Key：去 设置 → AI 填好后可用</span>
+              </div>
             </div>
             <div class="field">
-              <div class="label">备注</div>
-              <div class="text">{{ selected.note || "（空）" }}</div>
+              <div class="label">我的笔记</div>
+              <textarea
+                v-model="noteDraft"
+                class="note-edit"
+                rows="3"
+                placeholder="记点什么：读到了什么、和哪篇相关、要不要引用…（Ctrl+Enter 保存）"
+                @keydown.ctrl.enter="saveNote"
+              />
+              <div class="note-actions">
+                <SoftButton :height="26" :font-size="11.5" @click="saveNote">保存笔记</SoftButton>
+                <span v-if="noteSaved" class="tiny">{{ noteSaved }}</span>
+              </div>
+            </div>
+            <!-- 颜色归档（用户 2026-11-24）：用颜色区分、按颜色筛选 -->
+            <div class="field">
+              <div class="label">归档颜色</div>
+              <div class="color-picker">
+                <button
+                  v-for="tag in COLOR_TAGS"
+                  :key="tag.key"
+                  class="color-chip"
+                  :class="{ on: selected.color === tag.key }"
+                  :title="tag.key ? `标成「${tag.label}」` : '去掉颜色'"
+                  @click="setColor(selected, tag.key)"
+                >
+                  <span v-if="tag.key" class="color-dot" :style="{ background: tag.css }" />{{
+                    tag.label
+                  }}
+                </button>
+              </div>
             </div>
             <!-- 下载链接（M4）：点了弹内置浏览器；需要机构登录就在里面登录 -->
             <div class="field">
@@ -915,6 +1405,16 @@ onMounted(async () => {
           <div class="detail-foot">
             <Pill :text="`${selected.stars} 星`" :font-size="11.5" />
             <SoftButton :height="28" :font-size="12" @click="copyCitation">复制引用</SoftButton>
+            <!-- 一键发给 AI：标题 / 摘要 / 笔记塞进 AI 面板输入框（用户 2026-11-24） -->
+            <SoftButton
+              variant="primary"
+              :height="28"
+              :font-size="12"
+              title="把这篇的标题 / 摘要 / 笔记发给 AI 提问（会切到 AI 面板）"
+              @click="askAboutPaper(selected)"
+            >
+              发给 AI
+            </SoftButton>
             <!-- 下载到文献库：library/<项目>/<年份>/<标题>.pdf（旧版 lit.download_pdf） -->
             <SoftButton
               :height="28"
@@ -1715,5 +2215,165 @@ onMounted(async () => {
 }
 .ref-del:hover {
   color: var(--danger);
+}
+
+/* ---- 检索结果：多选 / 上拉加载 / 操作条（用户 2026-11-24）---- */
+.search-card {
+  /* 结果多一点时方便往下滚；滚到底会自动加载下一页（写在 .refs-card 之后覆盖 320px） */
+  max-height: 56vh;
+}
+.select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.hit-check {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin-top: 3px;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+.ref-row.picked {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--card));
+}
+.ref-main.clickable {
+  cursor: pointer;
+}
+.ref-main.clickable:hover .hit-title {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.hit-title {
+  transition: color 0.12s;
+}
+.hit-bar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 8px 0 2px;
+  margin-top: 4px;
+  border-top: 1px solid var(--accent);
+  background: var(--card);
+  z-index: 2;
+}
+.hit-bar-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-right: 2px;
+}
+.hit-works {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0;
+}
+.hit-work {
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--card) 70%, transparent);
+}
+.hit-work-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.hit-work-note {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-top: 3px;
+}
+.hit-work-note.busy {
+  color: var(--accent);
+}
+.hit-work-text {
+  font-size: 12.5px;
+  line-height: 1.7;
+  margin-top: 5px;
+  user-select: text;
+  overflow-wrap: anywhere;
+}
+.hit-work-steps {
+  margin: 6px 0 0;
+  padding-left: 20px;
+  font-size: 12px;
+  line-height: 1.65;
+  user-select: text;
+}
+
+/* ---- 我的文献库：颜色归档 / 笔记（用户 2026-11-24）---- */
+.color-filter,
+.color-picker {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.color-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-soft);
+  background: var(--card);
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.color-chip.on {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.color-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+  display: inline-block;
+}
+.row-color {
+  flex: none;
+  width: 4px;
+  align-self: stretch;
+  border-radius: 3px;
+  margin-right: 2px;
+}
+.note-edit {
+  width: 100%;
+  resize: vertical;
+  min-height: 54px;
+  border-radius: 8px;
+  border: 1px solid var(--border-soft);
+  background: var(--card);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.6;
+  padding: 7px 9px;
+}
+.note-edit:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.note-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 5px;
 }
 </style>

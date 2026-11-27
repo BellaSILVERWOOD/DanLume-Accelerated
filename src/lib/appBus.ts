@@ -12,6 +12,19 @@ export const pendingPage = ref<string | null>(null);
 /** 请求用内置浏览器打开哪个地址（消费后置空） */
 export const pendingEmbedUrl = ref("");
 
+/**
+ * 请求把一段提问预填进 AI 面板的输入框（消费后置空）。
+ * 文献页「发给 AI 提问」用：App.vue 看到就切到 AI 标签，走 mascotBus 的老链路填进草稿。
+ */
+export const pendingAiPrompt = ref("");
+
+/** 让 AI 面板带着这段提问打开（文献页用） */
+export function askAi(prompt: string): void {
+  const text = (prompt || "").trim();
+  if (!text) return;
+  pendingAiPrompt.value = text;
+}
+
 /** 切到「作业」页，并用内置浏览器打开这个地址 */
 export function openInAppBrowser(url: string): void {
   const text = (url || "").trim();

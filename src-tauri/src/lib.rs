@@ -41,6 +41,7 @@ mod sandbox;
 mod secrets;
 mod semantic;
 mod store;
+mod sync;
 mod student;
 mod summary;
 #[cfg(test)]
@@ -55,7 +56,7 @@ mod zipx;
 
 use std::sync::OnceLock;
 
-use chrono::{Duration, Local, NaiveTime};
+use chrono::{Duration, Local, NaiveTime, Utc};
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager, State};
 
@@ -70,6 +71,11 @@ fn get_store() -> &'static Store {
 /// 当前时间字符串（旧版 now_str 的格式）
 pub fn now_str() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// UTC ISO（多端同步的 updated_at：服务器按字典序比较，必须是 UTC）
+pub fn now_iso() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 pub fn today_str() -> String {
@@ -186,6 +192,13 @@ fn update_event(
 fn delete_event(id: i64, state: State<'_, AppState>) -> Result<bool, String> {
     let _ = &state;
     get_store().delete_event(id).map_err(|err| err.to_string())
+}
+
+/// 多端同步一次：推本地改动、拉别的设备的改动（需要登录 + 服务器）
+#[tauri::command]
+fn sync_events_now(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let _ = &state;
+    sync::sync_now()
 }
 
 /// 标记完成 / 取消完成。`occurrence_date` 给的是「哪一天的那一次」，
@@ -2112,6 +2125,7 @@ fn paper_update(
     stars: Option<i64>,
     note: Option<String>,
     summary: Option<String>,
+    color: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
     let _ = &state;
@@ -2121,8 +2135,29 @@ fn paper_update(
         stars,
         note.as_deref(),
         summary.as_deref(),
+        color.as_deref(),
     )
     .map_err(|err| err.to_string())
+}
+
+/// 给单篇文献生成「概要」（用户 2026-11-24）：有缓存就直接返回，否则调一次 AI。
+/// 要联网，所以 async + spawn_blocking。
+#[tauri::command]
+async fn paper_summary(
+    id: i64,
+    force: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        crate::summary::summarize_one(get_store(), id, force.unwrap_or(false))
+    })
+    .await;
+    match handle {
+        Ok(value) => Ok(value),
+        Err(exc) => Ok(json!({
+            "ok": false, "summary": "", "cached": false,
+            "error": format!("生成任务没跑起来：{exc}"),
+        })),
+    }
 }
 
 #[tauri::command]
@@ -5767,6 +5802,7 @@ pub fn run() {
             update_event,
             delete_event,
             event_set_done,
+            sync_events_now,
             get_settings,
             set_setting,
             recent_notices,
@@ -5858,6 +5894,7 @@ pub fn run() {
             endnote_open,
             paper_update,
             paper_citation,
+            paper_summary,
             settings_all,
             ai_state,
             ai_profiles,

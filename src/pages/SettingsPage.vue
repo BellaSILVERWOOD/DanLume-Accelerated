@@ -4,6 +4,7 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import Card from "../components/Card.vue";
 import SoftButton from "../components/SoftButton.vue";
+import { invoke } from "@tauri-apps/api/core";
 import IconBadge from "../components/IconBadge.vue";
 import AdminPanel from "../components/AdminPanel.vue";
 import AccountPanel from "../components/AccountPanel.vue";
@@ -410,6 +411,26 @@ const migrate = reactive({
   relaunchMsg: "",
   error: "",
 });
+
+/** 云端同步（多端数据同步）：推本地改动、拉别的设备的改动 */
+const cloudSync = reactive({ busy: false, message: "", error: "" });
+
+async function doCloudSync() {
+  if (cloudSync.busy) return;
+  cloudSync.busy = true;
+  cloudSync.message = "";
+  cloudSync.error = "";
+  try {
+    const result = await invoke<{ ok: boolean; pushed: number; applied: number }>(
+      "sync_events_now",
+    );
+    cloudSync.message = `已上传 ${result.pushed} 条，合并 ${result.applied} 条`;
+  } catch (err) {
+    cloudSync.error = String(err);
+  } finally {
+    cloudSync.busy = false;
+  }
+}
 
 /** 字节数 → 人类看得懂的大小 */
 function formatBytes(bytes: number): string {
@@ -1617,6 +1638,26 @@ async function refreshAdminFlag() {
                 导入不会直接覆盖正在用的库：先自动备份到 data/backups/pre-import-时间.db，
                 再把包里的库解成 data/lumina.db.imported，重新打开应用时才换库。
                 口令类设置（SMTP / IMAP 授权码、AI Key、UIS 口令、服务器登录）导入后要重新填。
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="label">云端同步（多端）</div>
+              <div class="row-actions">
+                <SoftButton
+                  :height="30"
+                  :font-size="12.5"
+                  :disabled="cloudSync.busy"
+                  @click="doCloudSync"
+                >
+                  {{ cloudSync.busy ? "同步中…" : "立即同步" }}
+                </SoftButton>
+              </div>
+              <div v-if="cloudSync.message" class="hint">{{ cloudSync.message }}</div>
+              <div v-if="cloudSync.error" class="err">{{ cloudSync.error }}</div>
+              <div class="hint">
+                把本机改过的日程和删除记录推到服务器，同时拉回别的设备（手机端）的改动；
+                后写胜出，删除也同步。需要先登录账号、并且服务器已经部署同步接口。
               </div>
             </div>
           </template>

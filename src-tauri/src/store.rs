@@ -163,6 +163,21 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if !has("group_id") {
         conn.execute("ALTER TABLE events ADD COLUMN group_id INTEGER", [])?;
     }
+    // 多端同步：稳定 uid + 墓碑表（删除也同步）
+    if !has("uid") {
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN uid TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    conn.execute(
+        "UPDATE events SET uid = 'e_' || lower(hex(randomblob(8))) WHERE uid IS NULL OR uid = ''",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sync_tombstones (uid TEXT PRIMARY KEY, deleted_at TEXT NOT NULL)",
+        [],
+    )?;
     // 历史 bug 修复：以前「标记完成」「过期自动完成」直接写母事件的 done，
     // 于是整条重复系列（含以后每一次）全变成已完成。这里把那次完成挪到它自己
     // 那一天，母事件复位；之后再标记完成只会记进 done_dates，不再带坏整条系列。
@@ -276,6 +291,49 @@ pub fn recurrence_days(start_date: &str, repeat: &str, start: &str, end: &str) -
         }
     }
     days
+}
+
+/// 同步用的一行日程（不带 id，只带稳定 uid 和 UTC ISO 的 updated_at）
+pub struct SyncRow {
+    pub uid: String,
+    pub title: String,
+    pub description: String,
+    pub date: String,
+    pub start_time: String,
+    pub end_time: String,
+    pub remind_minutes: Option<i64>,
+    pub color: String,
+    pub done: bool,
+    pub updated_at: String,
+}
+
+fn text_of(payload: &serde_json::Value, key: &str) -> String {
+    payload
+        .get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 本地时间串（`YYYY-mm-dd HH:MM:SS`）→ UTC ISO；已经是 ISO 就原样返回。
+/// 桌面版的 `updated_at` 一直写的是本地时间，同步出去前必须换成 UTC。
+fn to_iso(text: &str) -> String {
+    if text.ends_with('Z') {
+        return text.to_string();
+    }
+    let parsed = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S");
+    let naive = match parsed {
+        Ok(value) => value,
+        Err(_) => return text.to_string(),
+    };
+    let local = chrono::TimeZone::from_local_datetime(&chrono::Local, &naive).single();
+    match local {
+        Some(value) => value
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string(),
+        None => text.to_string(),
+    }
 }
 
 /// 一条日程（字段名与旧版一致，前端直接用）
@@ -521,8 +579,9 @@ impl Store {
         conn.execute(
             "INSERT INTO events(title, description, date, start_time, end_time,
               remind_minutes, remind_at, notified, done, color, repeat, done_dates,
-              created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?12)",
+              created_at, updated_at, uid)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?12,
+                     'e_' || lower(hex(randomblob(8))))",
             params![
                 title.trim(),
                 input.description.clone().unwrap_or_default(),
@@ -731,8 +790,137 @@ impl Store {
 
     pub fn delete_event(&self, id: i64) -> rusqlite::Result<bool> {
         let conn = self.lock();
+        let uid: Option<String> = conn
+            .query_row("SELECT uid FROM events WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })
+            .ok();
         let changed = conn.execute("DELETE FROM events WHERE id = ?1", params![id])?;
+        if let Some(uid) = uid {
+            if !uid.is_empty() {
+                conn.execute(
+                    "INSERT INTO sync_tombstones(uid, deleted_at) VALUES(?1, ?2)
+                     ON CONFLICT(uid) DO UPDATE SET deleted_at = excluded.deleted_at",
+                    params![uid, crate::now_iso()],
+                )?;
+            }
+        }
         Ok(changed > 0)
+    }
+
+    // ---------------------------------------------------------- 多端同步
+    /// 本端比 `since` 新的日程（给 /api/v1/sync 推上去）
+    pub fn sync_events_since(&self, since: &str) -> rusqlite::Result<Vec<SyncRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT uid, title, description, date, start_time, end_time, remind_minutes, color, done, updated_at
+             FROM events ORDER BY updated_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SyncRow {
+                uid: row.get(0)?,
+                title: row.get(1)?,
+                description: row.get(2)?,
+                date: row.get(3)?,
+                start_time: row.get(4)?,
+                end_time: row.get(5)?,
+                remind_minutes: row.get(6)?,
+                color: row.get(7)?,
+                done: row.get::<_, i64>(8)? == 1,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let mut row = row?;
+            row.updated_at = to_iso(&row.updated_at);
+            if row.updated_at.as_str() > since {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
+    /// 删除墓碑（uid, deleted_at）
+    pub fn sync_tombstones_since(&self, since: &str) -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT uid, deleted_at FROM sync_tombstones WHERE deleted_at > ?1")?;
+        let rows = stmt.query_map(params![since], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 合并服务器上的一条（后写胜出；deleted=true 就删本地）
+    pub fn sync_apply_event(
+        &self,
+        uid: &str,
+        payload: &serde_json::Value,
+        updated_at: &str,
+        deleted: bool,
+    ) -> rusqlite::Result<()> {
+        if uid.is_empty() {
+            return Ok(());
+        }
+        let conn = self.lock();
+        let existing: Option<String> = conn
+            .query_row("SELECT updated_at FROM events WHERE uid = ?1", params![uid], |row| {
+                row.get(0)
+            })
+            .ok();
+        if let Some(local) = existing {
+            if to_iso(&local).as_str() >= updated_at {
+                return Ok(());
+            }
+            if deleted {
+                conn.execute("DELETE FROM events WHERE uid = ?1", params![uid])?;
+                return Ok(());
+            }
+            conn.execute(
+                "UPDATE events SET title=?2, description=?3, date=?4, start_time=?5, end_time=?6,
+                   remind_minutes=?7, color=?8, done=?9, updated_at=?10 WHERE uid=?1",
+                params![
+                    uid,
+                    text_of(payload, "title"),
+                    text_of(payload, "description"),
+                    text_of(payload, "date"),
+                    text_of(payload, "start_time"),
+                    text_of(payload, "end_time"),
+                    payload.get("remind_minutes").and_then(|v| v.as_i64()),
+                    text_of(payload, "color"),
+                    payload.get("done").and_then(|v| v.as_bool()).unwrap_or(false) as i64,
+                    updated_at
+                ],
+            )?;
+            return Ok(());
+        }
+        if deleted {
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT INTO events(title, description, date, start_time, end_time, remind_minutes,
+               color, done, created_at, updated_at, uid)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                text_of(payload, "title"),
+                text_of(payload, "description"),
+                text_of(payload, "date"),
+                text_of(payload, "start_time"),
+                text_of(payload, "end_time"),
+                payload.get("remind_minutes").and_then(|v| v.as_i64()),
+                text_of(payload, "color"),
+                payload.get("done").and_then(|v| v.as_bool()).unwrap_or(false) as i64,
+                crate::now_str(),
+                updated_at,
+                uid
+            ],
+        )?;
+        Ok(())
     }
 
     // ---------------------------------------------------------- 设置
